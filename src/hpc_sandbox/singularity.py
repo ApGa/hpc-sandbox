@@ -75,7 +75,7 @@ KEEPALIVE_STARTSCRIPT = """\
 #!/bin/sh
 # Written by hpc-sandbox: keep the instance alive; commands run through exec.
 command -v sleep >/dev/null 2>&1 || exit 127
-trap 'exit 0' HUP INT TERM
+trap 'kill $! 2>/dev/null; exit 0' HUP INT TERM
 while :; do
     sleep 86400 &
     wait $!

@@ -284,3 +284,30 @@ async def test_stopping_the_sandbox_fails_commands_still_running(provider, sif):
     await sandbox.stop()
     with pytest.raises(SandboxError, match="stopped while the command ran"):
         await task
+
+
+def test_keepalive_startscript_stops_with_its_sleep_child(tmp_path):
+    # `instance stop` signals the instance and waits up to its grace for every process to
+    # exit. A sleep left behind by the trap held each stop for the full 10 s grace, under
+    # the node-wide control lock that every sandbox start and stop takes.
+    import subprocess
+    import time
+
+    from hpc_sandbox.singularity import KEEPALIVE_STARTSCRIPT
+
+    script = tmp_path / "startscript"
+    script.write_text(KEEPALIVE_STARTSCRIPT)
+    shell = subprocess.Popen(["/bin/sh", str(script)])
+    children = Path(f"/proc/{shell.pid}/task/{shell.pid}/children")
+    deadline = time.monotonic() + 5
+    while not children.read_text().split() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    (sleep_pid,) = map(int, children.read_text().split())
+
+    shell.send_signal(signal.SIGTERM)
+
+    assert shell.wait(timeout=5) == 0
+    deadline = time.monotonic() + 5
+    while owned_live_start_time(sleep_pid) is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert owned_live_start_time(sleep_pid) is None
