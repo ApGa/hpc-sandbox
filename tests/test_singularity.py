@@ -275,3 +275,12 @@ async def test_runtime_environment_drops_implicit_binds(provider, monkeypatch):
     assert "SINGULARITY_CONFIGDIR" not in env
     assert env["SINGULARITY_TMPDIR"] == str(provider.scratch_root / "runtime-tmp")
     assert env["APPTAINER_CACHEDIR"] == str(provider.scratch_root / "runtime-cache")
+
+
+async def test_stopping_the_sandbox_fails_commands_still_running(provider, sif):
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    task = asyncio.create_task(sandbox.exec("sleep 30"))
+    await asyncio.sleep(0.5)
+    await sandbox.stop()
+    with pytest.raises(SandboxError, match="stopped while the command ran"):
+        await task

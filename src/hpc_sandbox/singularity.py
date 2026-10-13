@@ -673,6 +673,8 @@ class SingularitySandbox:
         finally:
             for pid in roots:
                 self._execs.pop(pid, None)
+        if self._stop_task is not None:
+            raise SandboxError(f"sandbox {self.id} was stopped while the command ran")
         stdout = result.stdout.decode(errors="replace")
         stderr = result.stderr.decode(errors="replace")
         if result.timed_out:
