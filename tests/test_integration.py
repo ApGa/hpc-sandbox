@@ -140,8 +140,12 @@ async def test_janitor_recovers_an_abandoned_instance(provider, scratch):
 )
 async def test_network_none_has_only_loopback(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, network="none"))
-    result = await sandbox.exec("ls /sys/class/net")
-    assert result.stdout.split() == ["lo"]
+    # /proc/net/dev lists exactly the namespace's interfaces. /sys/class/net also holds plain
+    # files, e.g. bonding_masters wherever the bonding driver is loaded (ABCI compute nodes).
+    result = await sandbox.exec("cat /proc/net/dev")
+    assert result.exit_code == 0, result.stderr
+    interfaces = [line.split(":", 1)[0].strip() for line in result.stdout.splitlines()[2:] if ":" in line]
+    assert interfaces == ["lo"]
 
 
 def test_doctor_smoke_test_passes():
