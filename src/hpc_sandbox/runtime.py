@@ -50,11 +50,6 @@ class ContainerRuntime:
                 raise SandboxError(f"container runtime {wanted} is not an executable on PATH")
         return self._path
 
-    @property
-    def flavor(self) -> str:
-        """``"apptainer"`` or ``"singularity"``, from the binary's name."""
-        return "apptainer" if Path(self.path).name.startswith("apptainer") else "singularity"
-
     def environment(self) -> dict[str, str]:
         """The caller's environment minus everything that would add implicit binds.
 
