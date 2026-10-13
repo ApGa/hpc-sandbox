@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hpc-sandbox"
+version = "0.1.0"
+description = "Rootless HPC sandboxes on Singularity/Apptainer instances"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+hpc-sandbox = "hpc_sandbox.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hpc_sandbox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs a real Singularity/Apptainer runtime (set HPC_SANDBOX_INTEGRATION=1)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
