@@ -1,6 +1,6 @@
 """Rootless HPC sandboxes on Singularity/Apptainer instances."""
 
-from .images import ImageStore, ResolvedImage
+from .images import ImageFormat, ImageStore, ResolvedImage, SifImages
 from .runtime import ContainerRuntime
 from .sessions import JanitorReport
 from .singularity import SingularityProvider, SingularitySandbox
@@ -21,6 +21,7 @@ __version__ = "0.1.0"
 __all__ = [
     "ContainerRuntime",
     "ExecResult",
+    "ImageFormat",
     "ImageStore",
     "JanitorReport",
     "Mount",
@@ -32,6 +33,7 @@ __all__ = [
     "SandboxSnapshot",
     "SandboxSpec",
     "SandboxStartError",
+    "SifImages",
     "SingularityProvider",
     "SingularitySandbox",
 ]

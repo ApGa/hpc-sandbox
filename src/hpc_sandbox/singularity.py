@@ -37,7 +37,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from . import procfs
-from .images import ImageStore, ResolvedImage
+from .images import ImageStore, ResolvedImage, SifImages
 from .locks import locked
 from .paths import default_image_cache, should_stage
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult
@@ -121,7 +121,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         if stage_images is None:
             stage_images = should_stage(cache, self.scratch_root)
         self.images = ImageStore(
-            self.runtime,
+            SifImages(self.runtime),
             cache,
             stage_dir=self.scratch_root / "images" if stage_images else None,
             pull_timeout_s=start_timeout_s,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hpc_sandbox import ContainerRuntime, ImageStore, SandboxError
+from hpc_sandbox import ContainerRuntime, ImageStore, SandboxError, SifImages
 from hpc_sandbox.images import is_local, pull_uri
 
 DIGEST = "ab" * 32
@@ -16,7 +16,7 @@ DIGEST = "ab" * 32
 
 def store(tmp_path: Path, **options) -> ImageStore:
     options.setdefault("pull_retry_delay_s", 0.0)
-    return ImageStore(ContainerRuntime(), tmp_path / "cache", **options)
+    return ImageStore(SifImages(ContainerRuntime()), tmp_path / "cache", **options)
 
 
 def sha256(path: Path) -> str:

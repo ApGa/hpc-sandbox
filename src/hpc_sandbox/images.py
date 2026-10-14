@@ -1,20 +1,21 @@
-"""Image resolution: local SIF files, and OCI references pulled once into a cache.
+"""Image resolution: local image files, and remote references pulled once into a cache.
 
-:meth:`ImageStore.resolve` accepts
+An :class:`ImageStore` serves one :class:`ImageFormat` (SIF files for
+Singularity and Apptainer, squashfs files for enroot) and accepts
 
-- a local SIF path (``/x/task.sif``, ``./task.sif``, ``file:///x/task.sif``),
+- a local image path (``/x/task.sif``, ``./task.sif``, ``file:///x/task.sif``),
   optionally pinned to the file's SHA-256 with an ``@sha256:<hex>`` suffix;
-- an OCI or ORAS reference (``docker://repo:tag``, ``docker://repo@sha256:<hex>``,
-  ``oras://...``, ``library://...``, or a bare ``repo:tag``), pulled once into the
-  image cache under a file lock. Digest-pinned references are cached under
-  their manifest digest, tag references under a hash of the URI; pin
-  references by digest for reproducible runs.
+- a remote reference (``docker://repo:tag``, a bare ``repo:tag`` and whatever
+  else the format's runtime can pull), pulled once into the image cache under a
+  file lock. Digest-pinned references are cached under their manifest digest,
+  tag references under a hash of the URI; pin references by digest for
+  reproducible runs where the runtime supports it.
 
-A pulled SIF is validated with ``sif list`` before it is atomically published
-read-only, next to a sidecar recording its own SHA-256. With a stage directory
-(node-local scratch), the SIF is then copied there, verified against that
-digest and used from there, so many sandbox starts read local NVMe instead of
-shared storage.
+A pulled image is validated before it is atomically published read-only, next
+to a sidecar recording its own SHA-256. With a stage directory (node-local
+scratch), the image is then copied there, verified against that digest and
+used from there, so many sandbox starts read local disk instead of shared
+storage.
 """
 
 from __future__ import annotations
@@ -28,8 +29,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from .locks import locked
+from .process import ProcessResult
 from .runtime import ContainerRuntime
 from .types import SandboxError
 
@@ -42,10 +45,65 @@ _LOCAL_PREFIXES = ("/", "./", "../", "~", "file://")
 class ResolvedImage:
     reference: str
     path: Path
-    sha256: str | None  # SHA-256 of the SIF file, when known
+    sha256: str | None  # SHA-256 of the image file, when known
+
+
+class ImageFormat(Protocol):
+    """How one kind of image file is recognized, validated and pulled."""
+
+    name: str  # for messages, e.g. "SIF"
+    suffix: str  # of cached and staged files, e.g. ".sif"
+
+    @property
+    def tool(self) -> str:
+        """The program that pulls images, recorded in each image's sidecar."""
+        ...
+
+    def is_local(self, reference: str) -> bool:
+        """Whether ``reference`` names a local file rather than a remote image."""
+        ...
+
+    def pull_uri(self, reference: str) -> str:
+        """The URI to pull ``reference`` from; raise ValueError if it cannot be pulled."""
+        ...
+
+    async def validate(self, path: Path) -> bool: ...
+
+    async def pull(self, uri: str, target: Path, *, timeout_s: float) -> ProcessResult:
+        """Write the image at ``uri`` to the new file ``target``."""
+        ...
+
+
+class SifImages:
+    """SIF images, validated with ``sif list`` and pulled by Singularity or Apptainer."""
+
+    name = "SIF"
+    suffix = ".sif"
+
+    def __init__(self, runtime: ContainerRuntime, *, validate_timeout_s: float = 120.0) -> None:
+        self.runtime = runtime
+        self.validate_timeout_s = validate_timeout_s
+
+    @property
+    def tool(self) -> str:
+        return self.runtime.path
+
+    def is_local(self, reference: str) -> bool:
+        return is_local(reference)
+
+    def pull_uri(self, reference: str) -> str:
+        return pull_uri(reference)
+
+    async def validate(self, path: Path) -> bool:
+        result = await self.runtime.run("sif", "list", str(path), timeout_s=self.validate_timeout_s)
+        return result.returncode == 0 and not result.timed_out
+
+    async def pull(self, uri: str, target: Path, *, timeout_s: float) -> ProcessResult:
+        return await self.runtime.run("pull", "--force", str(target), uri, timeout_s=timeout_s)
 
 
 def is_local(reference: str) -> bool:
+    """Whether a SIF reference names a local file."""
     return reference.startswith(_LOCAL_PREFIXES) or _DIGEST.sub("", reference).endswith(".sif")
 
 
@@ -87,28 +145,26 @@ def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
 class ImageStore:
     def __init__(
         self,
-        runtime: ContainerRuntime,
+        image_format: ImageFormat,
         cache_dir: Path,
         *,
         stage_dir: Path | None = None,
         pull_attempts: int = 3,
         pull_retry_delay_s: float = 2.0,
         pull_timeout_s: float = 1800.0,
-        validate_timeout_s: float = 120.0,
     ) -> None:
-        self.runtime = runtime
+        self.format = image_format
         self.cache_dir = cache_dir
         self.stage_dir = stage_dir
         self.pull_attempts = max(1, pull_attempts)
         self.pull_retry_delay_s = pull_retry_delay_s
         self.pull_timeout_s = pull_timeout_s
-        self.validate_timeout_s = validate_timeout_s
         # Files validated (or hashed) by this process, keyed by their stat identity.
         self._valid: set[tuple[int, int, int, int]] = set()
         self._digests: dict[tuple[int, int, int, int], str] = {}
 
     async def resolve(self, reference: str) -> ResolvedImage:
-        if is_local(reference):
+        if self.format.is_local(reference):
             path, sha256 = await self._local(reference)
         else:
             path, sha256 = await self._pulled(reference)
@@ -131,8 +187,7 @@ class ImageStore:
             return False
         if key in self._valid:
             return True
-        result = await self.runtime.run("sif", "list", str(path), timeout_s=self.validate_timeout_s)
-        if result.returncode != 0 or result.timed_out:
+        if not await self.format.validate(path):
             return False
         self._valid.add(key)
         return True
@@ -143,20 +198,20 @@ class ImageStore:
         if not path.is_file():
             raise SandboxError(f"image {reference!r} is not a file")
         if not await self._is_valid(path):
-            raise SandboxError(f"image {path} is not a valid SIF")
+            raise SandboxError(f"image {path} is not a valid {self.format.name}")
         if pinned is not None and (actual := await self.digest(path)) != pinned:
             raise SandboxError(f"image {path} has SHA-256 {actual}, expected {pinned}")
         return path, pinned
 
     async def _pulled(self, reference: str) -> tuple[Path, str | None]:
-        uri = pull_uri(reference)
+        uri = self.format.pull_uri(reference)
         match = _DIGEST.search(uri)
         key = (
             f"oci-{match.group(1)}"
             if match
             else f"uri-{hashlib.sha256(uri.encode()).hexdigest()[:40]}"
         )
-        target = self.cache_dir / f"{key}.sif"
+        target = self.cache_dir / f"{key}{self.format.suffix}"
         if _stat_key(target) not in self._valid:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             async with locked(self.cache_dir / f"{key}.lock", private=False):
@@ -166,14 +221,13 @@ class ImageStore:
 
     async def _pull(self, uri: str, target: Path) -> None:
         target.unlink(missing_ok=True)
-        partial = target.with_name(f".{target.stem}.{os.getpid()}.{uuid.uuid4().hex}.sif")
+        suffix = self.format.suffix
+        partial = target.with_name(f".{target.stem}.{os.getpid()}.{uuid.uuid4().hex}{suffix}")
         errors: list[str] = []
         try:
             for attempt in range(1, self.pull_attempts + 1):
                 partial.unlink(missing_ok=True)
-                result = await self.runtime.run(
-                    "pull", "--force", str(partial), uri, timeout_s=self.pull_timeout_s
-                )
+                result = await self.format.pull(uri, partial, timeout_s=self.pull_timeout_s)
                 if result.returncode == 0 and await self._is_valid(partial):
                     # chmod and rename keep the stat identity, so the file stays
                     # known-valid (and its digest memoized) under its final name.
@@ -186,12 +240,13 @@ class ImageStore:
                             "source": uri,
                             "sha256": digest,
                             "pulled_at": time.time(),
-                            "runtime": self.runtime.path,
+                            "runtime": self.format.tool,
                         },
                     )
                     return
                 status = "timed out" if result.timed_out else f"exited {result.returncode}"
-                errors.append(f"attempt {attempt}: {status}: {result.detail() or 'invalid SIF'}")
+                detail = result.detail() or f"invalid {self.format.name}"
+                errors.append(f"attempt {attempt}: {status}: {detail}")
                 if attempt < self.pull_attempts:
                     await asyncio.sleep(self.pull_retry_delay_s)
         finally:
@@ -214,13 +269,14 @@ class ImageStore:
         return digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) else None
 
     async def _stage(self, source: Path, sha256: str) -> Path:
-        """Copy ``source`` to node-local scratch as ``sha256-<digest>.sif``, verified.
+        """Copy ``source`` to node-local scratch as ``sha256-<digest><suffix>``, verified.
 
         A staged file is verified once, when it is written; later processes
         trust a read-only, same-size copy under the digest name.
         """
         assert self.stage_dir is not None
-        staged = self.stage_dir / f"sha256-{sha256}.sif"
+        suffix = self.format.suffix
+        staged = self.stage_dir / f"sha256-{sha256}{suffix}"
         if _stat_key(staged) in self._valid:
             return staged
         self.stage_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -228,7 +284,9 @@ class ImageStore:
             info = staged.stat() if staged.is_file() else None
             if info is None or info.st_size != source.stat().st_size or info.st_mode & 0o222:
                 staged.unlink(missing_ok=True)
-                partial = staged.with_name(f".{staged.stem}.{os.getpid()}.{uuid.uuid4().hex}.sif")
+                partial = staged.with_name(
+                    f".{staged.stem}.{os.getpid()}.{uuid.uuid4().hex}{suffix}"
+                )
                 try:
                     copied = await asyncio.to_thread(copy_and_hash, source, partial)
                     if copied != sha256:
