@@ -219,3 +219,7 @@ integration tests need a compute node (never run instances on a login node);
 - the Harbor `BaseEnvironment` and OpenReward `SandboxBackend` faces from the
   platoon design;
 - memory snapshots, and per-node PID namespaces inside one shared sandbox.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
