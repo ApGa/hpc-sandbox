@@ -346,8 +346,10 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     ``image_cache`` may be shared storage that supports ``flock``. Sandboxes
     run as root inside (``remap_root``, enroot's ``--root``), which is your
     uid outside; set ``remap_root=False`` to run as your own uid. ``gpus``
-    (``"all"`` or a device list such as ``"0,1"``) enables enroot's NVIDIA
-    hook. Sandboxes are killed when the process that started them exits.
+    enables enroot's NVIDIA hook: ``"all"`` passes every GPU this process may
+    use (inside a Slurm allocation, the allocated ones), a list such as
+    ``"0,1"`` selects GPUs numbered as this process sees them. Sandboxes are
+    killed when the process that started them exits.
     """
 
     name = "enroot"

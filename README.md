@@ -217,7 +217,7 @@ Options both providers take:
 | Option | Default | Meaning |
 |---|---|---|
 | `remap_root` | True | Run as root inside the sandbox (`enroot start --root`); False runs as your uid. |
-| `gpus` | None | `"all"` or a device list such as `"0,1"`, handed to enroot's NVIDIA hook as `NVIDIA_VISIBLE_DEVICES`; adds the `gpu` capability. |
+| `gpus` | None | Handed to enroot's NVIDIA hook as `NVIDIA_VISIBLE_DEVICES`: `"all"` for every GPU the process may use (inside a Slurm allocation, the allocated ones), or a list such as `"0,1"` numbered as the job sees its GPUs (like `CUDA_VISIBLE_DEVICES`, not the host indices in `SLURM_STEP_GPUS`). Adds the `gpu` capability. |
 
 Default scratch root: `$HPC_SANDBOX_SCRATCH`, else `$PBS_LOCALDIR/hpc-sandbox`,
 else `/local/$PBS_JOBID/hpc-sandbox` when it exists, else

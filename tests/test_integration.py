@@ -10,7 +10,9 @@ or ``auto``: the first of singularity, apptainer and enroot on PATH).
 any image with /bin/sh, sleep, tail and cp works, including a local .sif or
 .sqsh). Scratch defaults to the job-local directory, as in real runs; with
 Singularity, set ``HPC_SANDBOX_TEST_NETWORK_NONE=1`` where the site allows
-network namespaces.
+network namespaces. On a GPU node, ``HPC_SANDBOX_TEST_GPUS`` (``all`` with
+enroot, ``nv`` or ``rocm`` with Singularity) checks GPU passthrough with an
+image that has ``nvidia-smi`` or ``rocm-smi`` available through the runtime.
 """
 
 from __future__ import annotations
@@ -123,7 +125,9 @@ async def test_snapshot_and_restore(provider):
 
 async def test_memory_watchdog_kills_the_hog_and_keeps_the_sandbox(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=128))
-    hog = "tail -c 600000000 /dev/zero"  # never sees EOF: holds 600 MB until killed
+    # tail buffers its last 600 MB and never sees EOF; reading a pipe keeps GNU tail from
+    # seeking /dev/zero. The hog is killed first, then cat by SIGPIPE.
+    hog = "cat /dev/zero | tail -c 600000000"
     result = await sandbox.exec(hog, timeout_s=120)
     assert result.exit_code == 137, (result.stdout, result.stderr)
     assert "memory limit exceeded" in result.stderr
@@ -210,6 +214,19 @@ async def test_enroot_loopback_works_without_a_network(provider):
     await asyncio.sleep(0.3)
     assert (await sandbox.exec("cat /tmp/received")).stdout == "hello\n"
     assert (await sandbox.exec("wget -qO- -T 3 http://1.1.1.1/")).exit_code != 0
+
+
+@pytest.mark.skipif(not os.environ.get("HPC_SANDBOX_TEST_GPUS"), reason="set HPC_SANDBOX_TEST_GPUS")
+async def test_gpus_are_passed_through(scratch):
+    gpus = os.environ["HPC_SANDBOX_TEST_GPUS"]
+    if RUNTIME == "enroot":
+        provider = EnrootProvider(scratch_root=scratch, gpus=gpus)
+    else:
+        provider = SingularityProvider(scratch_root=scratch, gpu=gpus)  # type: ignore[arg-type]
+    assert "gpu" in provider.capabilities
+    async with await provider.start(SandboxSpec(image=IMAGE)) as sandbox:
+        result = await sandbox.exec("nvidia-smi -L 2>/dev/null || rocm-smi --showid")
+    assert result.exit_code == 0 and "GPU" in result.stdout, (result.stdout, result.stderr)
 
 
 def test_doctor_smoke_test_passes():
