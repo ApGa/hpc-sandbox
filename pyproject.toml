@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hpc-sandbox"
 version = "0.1.0"
-description = "Rootless HPC sandboxes on Singularity/Apptainer instances"
+description = "Rootless HPC sandboxes on Singularity/Apptainer instances and enroot containers"
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
@@ -27,7 +27,7 @@ pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
-    "integration: needs a real Singularity/Apptainer runtime (set HPC_SANDBOX_INTEGRATION=1)",
+    "integration: needs a real container runtime on a compute node (set HPC_SANDBOX_INTEGRATION=1)",
 ]
 
 [tool.ruff]

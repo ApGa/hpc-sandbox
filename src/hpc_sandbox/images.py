@@ -36,9 +36,9 @@ from .process import ProcessResult
 from .runtime import ContainerRuntime
 from .types import SandboxError
 
-_DIGEST = re.compile(r"@sha256:([0-9a-f]{64})$")
+DIGEST = re.compile(r"@sha256:([0-9a-f]{64})$")
 _REMOTE_SCHEMES = ("docker://", "oras://", "library://", "shub://", "http://", "https://")
-_LOCAL_PREFIXES = ("/", "./", "../", "~", "file://")
+LOCAL_PREFIXES = ("/", "./", "../", "~", "file://")
 
 
 @dataclass(frozen=True)
@@ -104,7 +104,7 @@ class SifImages:
 
 def is_local(reference: str) -> bool:
     """Whether a SIF reference names a local file."""
-    return reference.startswith(_LOCAL_PREFIXES) or _DIGEST.sub("", reference).endswith(".sif")
+    return reference.startswith(LOCAL_PREFIXES) or DIGEST.sub("", reference).endswith(".sif")
 
 
 def pull_uri(reference: str) -> str:
@@ -193,8 +193,8 @@ class ImageStore:
         return True
 
     async def _local(self, reference: str) -> tuple[Path, str | None]:
-        pinned = match.group(1) if (match := _DIGEST.search(reference)) else None
-        path = Path(_DIGEST.sub("", reference).removeprefix("file://")).expanduser().resolve()
+        pinned = match.group(1) if (match := DIGEST.search(reference)) else None
+        path = Path(DIGEST.sub("", reference).removeprefix("file://")).expanduser().resolve()
         if not path.is_file():
             raise SandboxError(f"image {reference!r} is not a file")
         if not await self._is_valid(path):
@@ -205,7 +205,7 @@ class ImageStore:
 
     async def _pulled(self, reference: str) -> tuple[Path, str | None]:
         uri = self.format.pull_uri(reference)
-        match = _DIGEST.search(uri)
+        match = DIGEST.search(uri)
         key = (
             f"oci-{match.group(1)}"
             if match

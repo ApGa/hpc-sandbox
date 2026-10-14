@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import suppress
@@ -10,10 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from hpc_sandbox import SingularityProvider
+from hpc_sandbox import EnrootProvider, SingularityProvider
+from hpc_sandbox.enroot import ANCHOR_SCRIPT
 
 FAKE = Path(__file__).with_name("fake_singularity.py")
+FAKE_ENROOT = Path(__file__).with_name("fake_enroot.py")
 MAGIC = b"FAKESIF\n"
+SQUASHFS_MAGIC = b"hsqs"
 _ISOLATED_ENV = (
     "PBS_JOBID",
     "PBS_LOCALDIR",
@@ -27,6 +33,11 @@ _ISOLATED_ENV = (
     "FAKE_SINGULARITY_PULL_FAILURES",
     "FAKE_SINGULARITY_PULL_DELAY",
     "FAKE_SINGULARITY_INSTANCE_EXITS",
+    "ENROOT_CACHE_PATH",
+    "ENROOT_TEMP_PATH",
+    "ENROOT_DATA_PATH",
+    "ENROOT_RUNTIME_PATH",
+    "ENROOT_CONFIG_PATH",
 )
 
 
@@ -97,6 +108,90 @@ def make_provider(tmp_path: Path, **options: object) -> SingularityProvider:
 @pytest.fixture
 async def provider(tmp_path: Path, fake_runtime: FakeRuntime) -> AsyncIterator[SingularityProvider]:
     provider = make_provider(tmp_path)
+    yield provider
+    for sandbox in provider.sandboxes:
+        await sandbox.stop()
+
+
+@functools.cache
+def namespaces_unavailable() -> str | None:
+    """Why sandbox namespaces cannot be created on this host, or None if they can."""
+    if shutil.which("nsenter") is None:
+        return "nsenter is not installed"
+    probe = subprocess.run(
+        [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid()), "none", "--", "true"],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return f"unprivileged user namespaces are unavailable: {probe.stderr.decode().strip()}"
+    return None
+
+
+class FakeEnroot:
+    """Handle on the fake ``enroot`` installed first on PATH."""
+
+    def __init__(self, state: Path) -> None:
+        self.state = state
+
+    def set(self, knob: str, value: str) -> None:
+        (self.state / knob).write_text(value)
+
+    def calls(self, *prefix: str) -> list[dict]:
+        path = self.state / "calls.jsonl"
+        calls = (
+            [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        )
+        return [call for call in calls if call["argv"][: len(prefix)] == list(prefix)]
+
+    @staticmethod
+    def make_sqsh(path: Path, files: dict[str, str] | None = None) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(SQUASHFS_MAGIC + json.dumps({"files": files or {}}).encode())
+        return path
+
+
+@pytest.fixture
+def fake_enroot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeEnroot:
+    if reason := namespaces_unavailable():
+        pytest.skip(reason)
+    bin_dir = tmp_path / "enroot-bin"
+    bin_dir.mkdir()
+    state = tmp_path / "fake-enroot-state"
+    state.mkdir()
+    wrapper = bin_dir / "enroot"
+    wrapper.write_text(
+        f'#!/bin/sh\nFAKE_ENROOT_STATE="{state}" exec "{sys.executable}" "{FAKE_ENROOT}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    for name in _ISOLATED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    return FakeEnroot(state)
+
+
+@pytest.fixture
+def sqsh(tmp_path: Path, fake_enroot: FakeEnroot) -> Path:
+    return fake_enroot.make_sqsh(tmp_path / "images" / "task.sqsh", {"app/hello.txt": "hello\n"})
+
+
+def make_enroot_provider(tmp_path: Path, **options: object) -> EnrootProvider:
+    settings: dict[str, object] = {
+        "scratch_root": tmp_path / "scratch",
+        "image_cache": tmp_path / "cache",
+        "stage_images": False,
+        "default_timeout_s": 30.0,
+        "start_timeout_s": 60.0,
+        "memory_poll_s": 0.1,
+    }
+    settings.update(options)
+    return EnrootProvider(**settings)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+async def enroot_provider(tmp_path: Path, fake_enroot: FakeEnroot) -> AsyncIterator[EnrootProvider]:
+    provider = make_enroot_provider(tmp_path)
     yield provider
     for sandbox in provider.sandboxes:
         await sandbox.stop()

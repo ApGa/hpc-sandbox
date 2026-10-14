@@ -65,6 +65,36 @@ def instance_start_time(pid: int, name: str) -> str | None:
     return owned_live_start_time(pid)
 
 
+def cmdline(pid: int) -> str | None:
+    """The command line of ``pid`` with arguments joined by spaces."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return raw.replace(b"\0", b" ").decode(errors="replace")
+
+
+def environ(pid: int) -> dict[str, str] | None:
+    """The environment ``pid`` was started with (it must belong to this uid)."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    entries = (item.decode(errors="replace").partition("=") for item in raw.split(b"\0") if item)
+    return {key: value for key, separator, value in entries if separator and key}
+
+
+def namespace_pid(pid: int) -> int | None:
+    """The PID of ``pid`` inside its innermost PID namespace (1 for an init)."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("NSpid:"):
+                return int(line.split()[-1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def children(pid: int) -> list[int]:
     """Direct children of every thread of ``pid``."""
     result: list[int] = []

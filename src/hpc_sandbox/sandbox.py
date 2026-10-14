@@ -372,6 +372,7 @@ class SessionSandbox:
         session = self._session
         assert session is not None
         await self._run(["/bin/sh", "-c", "sync"], cwd="/", env={}, stdin=None, timeout_s=60.0)
+        await asyncio.to_thread(self._prepare_snapshot)
         snapshot_id = f"snap-{uuid.uuid4().hex}"
         target = self._provider.snapshot_root / snapshot_id
         target.mkdir(mode=0o700)
@@ -448,6 +449,9 @@ class SessionSandbox:
     def _identity(self) -> dict[str, Any]:
         """Fields of the owner record that identify the container's processes."""
         raise NotImplementedError
+
+    def _prepare_snapshot(self) -> None:
+        """Make the rootfs copyable before a snapshot; runs in a worker thread."""
 
     def _watch_root(self) -> int | None:
         """Host PID whose process tree the memory watchdog charges to the sandbox.

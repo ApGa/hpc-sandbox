@@ -1,5 +1,6 @@
-"""Rootless HPC sandboxes on Singularity/Apptainer instances."""
+"""Rootless HPC sandboxes on Singularity/Apptainer instances and enroot containers."""
 
+from .enroot import EnrootProvider, EnrootRuntime, EnrootSandbox, SquashfsImages
 from .images import ImageFormat, ImageStore, ResolvedImage, SifImages
 from .runtime import ContainerRuntime
 from .sessions import JanitorReport
@@ -20,6 +21,9 @@ __version__ = "0.1.0"
 
 __all__ = [
     "ContainerRuntime",
+    "EnrootProvider",
+    "EnrootRuntime",
+    "EnrootSandbox",
     "ExecResult",
     "ImageFormat",
     "ImageStore",
@@ -36,4 +40,5 @@ __all__ = [
     "SifImages",
     "SingularityProvider",
     "SingularitySandbox",
+    "SquashfsImages",
 ]
