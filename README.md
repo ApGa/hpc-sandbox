@@ -74,11 +74,13 @@ the runtime underneath.
 
 | Command | What it does |
 |---|---|
-| `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the site settings that matter (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices), the scratch and cache filesystems, free space, staging and reflink support; with `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
+| `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the scratch and cache filesystems, free space, staging and reflink support, and what matters for the runtime: for Singularity/Apptainer the site settings (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices); for enroot whether namespaces can be created, whether imports can convert layer whiteouts, whether this process runs inside a container, and the site's `enroot.conf` and hooks. With `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
 | `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
 | `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Use it in job epilogues. |
 
-All commands take `--binary`, `--scratch-root` and `--image-cache`.
+All commands take `--runtime auto|singularity|enroot` (default
+`$HPC_SANDBOX_RUNTIME`, else the first of `singularity`, `apptainer` and
+`enroot` found on `PATH`), `--binary`, `--scratch-root` and `--image-cache`.
 
 ## How a sandbox is built
 

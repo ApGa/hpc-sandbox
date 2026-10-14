@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,9 +14,13 @@ import time
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
+from .enroot import ANCHOR_SCRIPT, EnrootProvider
 from .paths import in_batch_job
-from .runtime import ContainerRuntime
+from .process import run_process
+from .runtime import RUNTIME_CANDIDATES, ContainerRuntime
+from .sandbox import SessionProvider
 from .singularity import SingularityProvider
 from .types import Mount, SandboxError, SandboxSpec
 
@@ -29,7 +34,18 @@ _SITE_KEYS = (
     "enable underlay",
     "mount home",
 )
+# enroot.conf settings worth showing; the enroot provider overrides them per sandbox.
+_ENROOT_KEYS = (
+    "ENROOT_MOUNT_HOME",
+    "ENROOT_REMAP_ROOT",
+    "ENROOT_RESTRICT_DEV",
+    "ENROOT_ROOTFS_WRITABLE",
+    "ENROOT_DATA_PATH",
+    "ENROOT_CACHE_PATH",
+    "ENROOT_TEMP_PATH",
+)
 _SHARED_FILESYSTEMS = {"lustre", "nfs", "nfs4", "gpfs", "beegfs", "cifs", "fuse.sshfs"}
+RUNTIMES = ("auto", "singularity", "enroot")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -47,13 +63,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--binary", help="singularity or apptainer executable (default: detect)")
+    common.add_argument(
+        "--runtime",
+        choices=RUNTIMES,
+        default=os.environ.get("HPC_SANDBOX_RUNTIME", "auto"),
+        help="container runtime (default: $HPC_SANDBOX_RUNTIME, else the first of "
+        "singularity, apptainer and enroot on PATH)",
+    )
+    common.add_argument("--binary", help="runtime executable (default: detect)")
     common.add_argument("--scratch-root", help="node-local scratch (default: job-local dir)")
     common.add_argument("--image-cache", help="SIF cache directory")
 
     parser = argparse.ArgumentParser(
         prog="python -m hpc_sandbox",
-        description="Rootless HPC sandboxes on Singularity/Apptainer instances.",
+        description="Rootless HPC sandboxes on Singularity/Apptainer instances or enroot.",
     )
     commands = parser.add_subparsers(required=True, metavar="COMMAND")
 
@@ -70,7 +93,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--bind", action="append", default=[], metavar="SRC:DST[:ro|rw]")
     run.add_argument("--label", action="append", default=[], metavar="KEY=VALUE")
     run.add_argument("--network", choices=("host", "none"), default="host")
-    run.add_argument("--allow-network-none", action="store_true")
+    run.add_argument(
+        "--allow-network-none",
+        action="store_true",
+        help="let Singularity use --network none (enroot always can)",
+    )
     run.add_argument("--memory-mb", type=int)
     run.add_argument("--timeout", type=float, default=600.0, help="seconds (default 600)")
     run.set_defaults(handler=_run)
@@ -83,13 +110,28 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _provider(args: argparse.Namespace, **options: object) -> SingularityProvider:
-    return SingularityProvider(
-        binary=args.binary,
-        scratch_root=args.scratch_root,
-        image_cache=args.image_cache,
-        **options,  # type: ignore[arg-type]
-    )
+def resolve_runtime(choice: str, binary: str | None = None) -> str:
+    """``singularity`` or ``enroot``: the explicit choice, else what ``binary`` or PATH has."""
+    if choice != "auto":
+        return choice
+    if binary:
+        return "enroot" if Path(binary).name.startswith("enroot") else "singularity"
+    if any(shutil.which(candidate) for candidate in RUNTIME_CANDIDATES):
+        return "singularity"
+    return "enroot" if shutil.which("enroot") else "singularity"
+
+
+def _provider(
+    args: argparse.Namespace, *, allow_network_none: bool = False
+) -> SessionProvider[Any]:
+    common: dict[str, Any] = {
+        "binary": args.binary,
+        "scratch_root": args.scratch_root,
+        "image_cache": args.image_cache,
+    }
+    if resolve_runtime(args.runtime, args.binary) == "enroot":
+        return EnrootProvider(**common)
+    return SingularityProvider(**common, allow_network_none=allow_network_none)
 
 
 def _pairs(values: list[str], what: str) -> dict[str, str]:
@@ -159,12 +201,18 @@ async def _doctor(args: argparse.Namespace) -> int:
     except SandboxError as error:
         report.line("FAIL", "runtime", str(error))
         return 1
-    for key, value in (await site_config(runtime)).items():
-        risky = (key == "allow setuid" and value == "no") or (
-            key == "sessiondir max size" and value.isdigit() and int(value) < 1024
-        )
-        note = " (never use --writable-tmpfs here)" if key == "sessiondir max size" else ""
-        report.line("warn" if risky else "info", f"site: {key}", value + (note if risky else ""))
+    if isinstance(provider, EnrootProvider):
+        await _enroot_checks(report, provider)
+    else:
+        assert isinstance(runtime, ContainerRuntime)
+        for key, value in (await site_config(runtime)).items():
+            risky = (key == "allow setuid" and value == "no") or (
+                key == "sessiondir max size" and value.isdigit() and int(value) < 1024
+            )
+            note = " (never use --writable-tmpfs here)" if key == "sessiondir max size" else ""
+            report.line(
+                "warn" if risky else "info", f"site: {key}", value + (note if risky else "")
+            )
     job = os.environ.get("PBS_JOBID") or os.environ.get("SLURM_JOB_ID")
     report.line("info", "batch job", job or "none (login node or laptop)")
     for name, path in (
@@ -184,6 +232,90 @@ async def _doctor(args: argparse.Namespace) -> int:
     if args.image:
         await _smoke(report, provider, args.image)
     return 1 if report.failures else 0
+
+
+async def _enroot_checks(report: _Report, provider: EnrootProvider) -> None:
+    try:
+        report.line("ok", "nsenter", provider.nsenter)
+    except SandboxError as error:
+        report.line("FAIL", "nsenter", str(error))
+    probe = await run_process(
+        [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid()), "none", "--", "true"],
+        timeout_s=60,
+    )
+    if probe.returncode == 0:
+        report.line("ok", "namespaces", "user, mount, PID, IPC and network namespaces")
+    else:
+        report.line("FAIL", "namespaces", probe.detail() or f"exit {probe.returncode}")
+    if not outside_user_namespaces():
+        report.line(
+            "warn",
+            "user namespace",
+            "this process runs inside a container's user namespace: enroot import cannot "
+            "use its file capabilities here; run on the host or pass .sqsh images",
+        )
+    report.line(*_whiteout_check(provider.runtime.temp_dir))
+    for key, value in enroot_site_config().items():
+        report.line("info", f"site: {key}", f"{value} (overridden per sandbox)")
+    hooks = sorted(path.name for path in _enroot_sysconf().joinpath("hooks.d").glob("*.sh"))
+    report.line("info", "site hooks", ", ".join(hooks) or "none")
+
+
+def _whiteout_check(temp_dir: Path) -> tuple[str, str, str]:
+    """Whether ``enroot-aufs2ovlfs`` can convert layer whiteouts (needed by imports)."""
+    name = "image imports"
+    converter = shutil.which("enroot-aufs2ovlfs")
+    if converter is None:
+        return "warn", name, "enroot-aufs2ovlfs is not on PATH; only local .sqsh images work"
+    temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temp_dir) as scratch:
+        layer = Path(scratch)
+        (layer / "opaque").mkdir()
+        (layer / "opaque" / ".wh..wh..opq").touch()
+        (layer / ".wh.deleted").touch()
+        result = subprocess.run(
+            [converter, str(layer)], capture_output=True, timeout=60, check=False
+        )
+        converted = (
+            result.returncode == 0
+            and not (layer / "opaque" / ".wh..wh..opq").exists()
+            and not (layer / ".wh.deleted").exists()
+            and (layer / "deleted").exists()
+        )
+    if converted:
+        return "ok", name, f"{converter} converts whiteouts"
+    detail = result.stderr.decode(errors="replace").strip() or f"exit {result.returncode}"
+    advice = "install enroot's +caps package, run outside nested user namespaces, or pass .sqsh"
+    return "warn", name, f"{converter} cannot convert whiteouts ({detail}); {advice} images"
+
+
+def outside_user_namespaces() -> bool:
+    """Whether this process runs in the initial user namespace (not inside a container)."""
+    try:
+        mapping = Path("/proc/self/uid_map").read_text().split()
+    except OSError:
+        return True
+    return mapping[:3] == ["0", "0", "4294967295"]
+
+
+def _enroot_sysconf() -> Path:
+    return Path(os.environ.get("ENROOT_SYSCONF_PATH", "/etc/enroot"))
+
+
+def enroot_site_config() -> dict[str, str]:
+    """The provider-relevant settings of the site's enroot.conf and its drop-ins."""
+    sysconf = _enroot_sysconf()
+    values = {}
+    for path in [sysconf / "enroot.conf", *sorted(sysconf.glob("enroot.conf.d/*.conf"))]:
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, _, value = line.strip().partition(" ")
+            if key in _ENROOT_KEYS:
+                values[key] = value.strip()
+    return values
 
 
 def _check_directory(report: _Report, name: str, path: Path, *, local: bool) -> None:
@@ -218,7 +350,7 @@ def _reflink_works(directory: Path) -> bool:
     return result.returncode == 0
 
 
-async def _smoke(report: _Report, provider: SingularityProvider, image: str) -> None:
+async def _smoke(report: _Report, provider: SessionProvider[Any], image: str) -> None:
     started = time.monotonic()
     try:
         sandbox = await provider.start(SandboxSpec(image=image, labels={"hpc-sandbox": "doctor"}))

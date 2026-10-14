@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
-from hpc_sandbox.cli import main
+from hpc_sandbox.cli import main, resolve_runtime
 
 
 def common(tmp_path: Path) -> list[str]:
@@ -59,3 +60,29 @@ def test_janitor_prints_a_json_report(tmp_path, fake_runtime, capsys):
     assert main(["janitor", *common(tmp_path), "--label", "rollout_id=x"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report == {"stopped": [], "removed": [], "live": [], "errors": []}
+
+
+def test_run_uses_enroot_when_asked(tmp_path, sqsh, fake_enroot, capsys):
+    command = ["/bin/sh", "-c", "id -u; exit 5"]
+    assert main(["run", str(sqsh), "--runtime", "enroot", *common(tmp_path), "--", *command]) == 5
+    assert capsys.readouterr().out == "0\n"
+    assert fake_enroot.calls("start")
+
+
+def test_doctor_checks_enroot_and_smoke_tests_an_image(tmp_path, sqsh, fake_enroot, capsys):
+    arguments = ["doctor", "--runtime", "enroot", *common(tmp_path), "--image", str(sqsh)]
+    assert main(arguments) == 0
+    output = capsys.readouterr().out
+    assert "3.5.0-fake" in output and "[  ok] namespaces" in output
+    for check in ("sandbox start", "exec", "upload/download", "sandbox stop"):
+        assert f"[  ok] {check}" in output
+
+
+def test_runtime_resolution(monkeypatch):
+    assert resolve_runtime("enroot") == "enroot"
+    assert resolve_runtime("auto", "/opt/enroot/bin/enroot") == "enroot"
+    assert resolve_runtime("auto", "apptainer") == "singularity"
+    monkeypatch.setattr(shutil, "which", lambda name, *_: "/bin/x" if name == "enroot" else None)
+    assert resolve_runtime("auto") == "enroot"
+    monkeypatch.setattr(shutil, "which", lambda name, *_: "/bin/x")
+    assert resolve_runtime("auto") == "singularity"
