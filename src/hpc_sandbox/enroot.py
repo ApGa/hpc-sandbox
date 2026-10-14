@@ -248,7 +248,7 @@ class EnrootRuntime:
         real = shutil.which("enroot-aufs2ovlfs", path=env.get("PATH"))
         if real is not None and Path(real).resolve() != wrapper.resolve():
             self.tools_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if not wrapper.exists():
+            if not wrapper.is_file() or wrapper.read_text() != AUFS2OVLFS_WRAPPER:
                 temporary = wrapper.with_name(f".{wrapper.name}.{os.getpid()}")
                 temporary.write_text(AUFS2OVLFS_WRAPPER)
                 temporary.chmod(0o700)
