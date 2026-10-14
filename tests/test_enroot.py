@@ -493,3 +493,10 @@ def test_provider_capabilities_follow_the_options(tmp_path, fake_enroot):
     environment = provider.runtime.container_environment(session, remap_root=True, gpus="all")
     assert environment["NVIDIA_VISIBLE_DEVICES"] == "all"
     assert "compute" in environment["NVIDIA_DRIVER_CAPABILITIES"]
+
+
+async def test_async_with_stops_the_sandbox(enroot_provider, sqsh):
+    async with await enroot_provider.start(SandboxSpec(image=str(sqsh))) as sandbox:
+        owner = json.loads((sandbox.session_dir / "owner.json").read_text())
+    assert owned_live_start_time(owner["init_pid"]) != owner["init_start_time"]
+    assert not enroot_provider.sandboxes

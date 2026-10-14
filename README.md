@@ -33,18 +33,15 @@ spec = SandboxSpec(
     memory_mb=4096,                             # PSS watchdog
     labels={"run": "exp1", "rollout_id": "r42"},
 )
-sandbox = await provider.start(spec)
-try:
+async with await provider.start(spec) as sandbox:  # stopped when the block exits
     result = await sandbox.exec("python -c 'print(6 * 7)'", timeout_s=60)
     print(result.exit_code, result.stdout, result.stderr, result.timed_out)
     await sandbox.upload("solution.py", "/app/solution.py")
     await sandbox.download("/app/out", "./out")  # files and directories
     snapshot = await sandbox.snapshot()           # files, not processes
     clone = await provider.restore(snapshot, spec)
-    await clone.stop()
+    await clone.stop()                            # idempotent
     await provider.delete_snapshot(snapshot)
-finally:
-    await sandbox.stop()                          # idempotent
 
 await provider.reap({"rollout_id": "r42"})        # stop leftovers by label
 ```

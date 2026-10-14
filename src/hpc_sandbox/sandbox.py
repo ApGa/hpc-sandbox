@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Self, TypeVar
 
 from . import memory
 from .images import ImageStore, ResolvedImage
@@ -269,6 +269,9 @@ class SessionProvider(Generic[S]):
 class SessionSandbox:
     """One running container whose files live in a session directory.
 
+    ``async with await provider.start(spec) as sandbox:`` stops the sandbox
+    when the block exits, however it exits.
+
     Subclasses implement :meth:`_prepare_rootfs`, :meth:`_start_container`,
     :meth:`_spawn`, :meth:`_container_alive`, :meth:`_stop_container` and
     :meth:`_identity`, and may override :meth:`_watch_root`.
@@ -291,6 +294,12 @@ class SessionSandbox:
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.id!r}, image={self.spec.image!r})"
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.stop()
 
     @property
     def session_dir(self) -> Path | None:

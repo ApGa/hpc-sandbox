@@ -311,3 +311,15 @@ def test_keepalive_startscript_stops_with_its_sleep_child(tmp_path):
     while owned_live_start_time(sleep_pid) is not None and time.monotonic() < deadline:
         time.sleep(0.01)
     assert owned_live_start_time(sleep_pid) is None
+
+
+async def test_async_with_stops_the_sandbox(provider, sif):
+    async with await provider.start(SandboxSpec(image=str(sif))) as sandbox:
+        assert (await sandbox.exec("echo inside")).stdout == "inside\n"
+        session = sandbox.session_dir
+    assert session is not None and not session.exists()
+    assert sandbox not in provider.sandboxes
+    with pytest.raises(RuntimeError, match="boom"):
+        async with await provider.start(SandboxSpec(image=str(sif))) as failing:
+            raise RuntimeError("boom")
+    assert not failing.session_dir and not provider.sandboxes
