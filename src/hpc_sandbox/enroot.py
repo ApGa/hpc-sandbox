@@ -1,7 +1,7 @@
 """Enroot provider: a documented stub (NVIDIA Slurm sites with pyxis).
 
 Not implemented yet; :meth:`EnrootProvider.start` raises ``NotImplementedError``.
-The design to port is the production SWE-rebench ``EnrootSandbox``:
+The intended design:
 
 - **Images.** ``enroot import --output <cache>/<sha256(uri)>.sqsh <uri>`` under
   an exclusive ``flock``, published with an atomic rename and retried. Enroot

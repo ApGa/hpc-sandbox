@@ -56,9 +56,9 @@ class ContainerRuntime:
         Environment-driven binds would defeat ``--no-mount bind-paths`` (never
         inherit a launcher's bind of datasets or home), and ``*ENV_`` variables
         would leak host settings past ``--cleanenv``. CONFIGDIR is dropped too:
-        Singularity CE 4.4.1 publishes unprivileged instance metadata below the
-        passwd home regardless, and a CONFIGDIR makes ``instance list`` look in
-        an empty directory.
+        unprivileged instance metadata is published below the passwd home
+        regardless (Singularity CE 4.x), and a CONFIGDIR makes
+        ``instance list`` look in an empty directory.
         """
         env = dict(os.environ)
         for flavor in ("APPTAINER", "SINGULARITY"):

@@ -11,9 +11,10 @@ def default_scratch_root() -> Path:
     """Node-local scratch for sessions, snapshots and staged images.
 
     ``HPC_SANDBOX_SCRATCH`` wins. Inside a PBS job it is the job's local
-    directory (``$PBS_LOCALDIR``, else ``/local/$PBS_JOBID`` as on ABCI);
-    otherwise ``$TMPDIR`` (Slurm sites usually point it at local disk).
-    Never the Singularity session directory, which ABCI caps at 64 MiB.
+    directory (``$PBS_LOCALDIR``, else ``/local/$PBS_JOBID`` where that
+    exists); otherwise ``$TMPDIR`` (Slurm sites usually point it at local
+    disk). Never the runtime's session directory, which sites often cap at a
+    few tens of MiB.
     """
     if configured := os.environ.get("HPC_SANDBOX_SCRATCH"):
         return Path(configured)

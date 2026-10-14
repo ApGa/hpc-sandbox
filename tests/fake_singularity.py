@@ -127,7 +127,7 @@ def build(args: list[str]) -> int:
 def instance_start(args: list[str]) -> int:
     options, (rootfs, name) = parse(args)
     if "--writable-tmpfs" in options or "--fakeroot" in options:
-        return fail("--writable-tmpfs and --fakeroot break on ABCI", 98)
+        return fail("hpc-sandbox must not use --writable-tmpfs or --fakeroot", 98)
     root = Path(rootfs)
     if "--writable" not in options or not root.is_dir():
         return fail("expected --writable with a sandbox directory")

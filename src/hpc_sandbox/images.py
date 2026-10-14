@@ -7,8 +7,8 @@
 - an OCI or ORAS reference (``docker://repo:tag``, ``docker://repo@sha256:<hex>``,
   ``oras://...``, ``library://...``, or a bare ``repo:tag``), pulled once into the
   image cache under a file lock. Digest-pinned references are cached under
-  their manifest digest, tag references under a hash of the URI; production
-  references should be digest-pinned.
+  their manifest digest, tag references under a hash of the URI; pin
+  references by digest for reproducible runs.
 
 A pulled SIF is validated with ``sif list`` before it is atomically published
 read-only, next to a sidecar recording its own SHA-256. With a stage directory

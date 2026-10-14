@@ -5,11 +5,12 @@ instances. One sandbox is one persistent instance with its own writable root
 filesystem on node-local disk; you run commands in it, copy files in and out,
 snapshot it and restore copies of it.
 
-It is extracted from the sandbox backend that ran the SWE-rebench and
-Frontier-CS environments in production on ABCI (setup p50 2.2 s, p99 23 s over
-792 sessions at 384-way concurrency), and implements the sandbox contract of
-platoon (`SandboxSpec`, `Sandbox`, `SandboxProvider`; PLAN-v1 section 4.2)
-without depending on platoon. Python 3.11+, standard library only.
+It is meant for workloads that run many short-lived tasks inside a batch
+job — agent rollouts, code evaluation, benchmark harnesses — on
+clusters where Docker is not available and users have no root. It needs no
+daemon and no privileges beyond what the site's container runtime grants, and
+it cleans up after itself even when the process that started the sandboxes is
+killed. Python 3.11+, standard library only.
 
 ## Quick start
 
@@ -27,7 +28,7 @@ spec = SandboxSpec(
     image="docker://python:3.12-slim",          # or a local .sif path
     workdir="/app",
     env={"PYTHONUNBUFFERED": "1"},
-    mounts=[Mount("/groups/data", "/data")],    # read-only by default
+    mounts=[Mount("/shared/data", "/data")],    # read-only by default
     memory_mb=4096,                             # PSS watchdog
     labels={"run": "exp1", "rollout_id": "r42"},
 )
@@ -52,8 +53,12 @@ per-call `timeout_s`, `env`, `cwd` and `stdin` bytes. Every call has a timeout
 (`default_timeout_s`, 600 s, when none is given); on expiry the command's
 process tree is killed and the result has `timed_out=True` and exit code 124.
 Infrastructure failures raise `SandboxError` (`SandboxStartError` when a
-sandbox cannot start, `SandboxLostError` when its instance died) instead of
+sandbox cannot start, `SandboxLostError` when its container died) instead of
 masquerading as command failures.
+
+The provider and sandbox classes satisfy the `SandboxProvider` and `Sandbox`
+protocols in `hpc_sandbox.types`, so code written against the protocols does
+not depend on the runtime underneath.
 
 ## Command line
 
@@ -70,11 +75,11 @@ All commands take `--binary`, `--scratch-root` and `--image-cache`.
 1. **Image.** `docker://repo:tag`, `docker://repo@sha256:...`, `oras://`,
    `library://` or a bare `repo:tag` is pulled once into the image cache under
    a file lock, validated with `sif list` and published read-only, keyed by the
-   manifest digest when the reference has one (pin production images by
-   digest). A local SIF path may carry an `@sha256:<hex>` suffix to pin the
-   file's content. Inside a batch job whose image cache is on another
-   filesystem (Lustre), the SIF is staged to node-local scratch as
-   `sha256-<digest>.sif`, verified while copying.
+   manifest digest when the reference has one (pin images by digest for
+   reproducible runs). A local SIF path may carry an `@sha256:<hex>` suffix to
+   pin the file's content. Inside a batch job whose image cache is on another
+   filesystem (for example Lustre or NFS), the SIF is staged to node-local
+   scratch as `sha256-<digest>.sif`, verified while copying.
 2. **Session.** A private directory `sessions/hpcsb-<uuid>` (mode 0700) on
    node-local scratch, leased with `flock` and holding an owner record: owner
    PID and start time, instance PID and start time, hostname and labels.
@@ -88,9 +93,9 @@ All commands take `--binary`, `--scratch-root` and `--image-cache`.
    --no-mount home,cwd,bind-paths --writable --pid-file ...` with
    session-private `/tmp` and `/var/tmp` binds, `/etc/resolv.conf` read-only
    (host networking), the spec's mounts and an exact name `hpcsb-<uuid>`.
-   Setuid mode without `--fakeroot`: the sandbox runs as your uid. Startup
-   checks that the runtime's PID, the PID file and the process start time
-   agree, then probes that the rootfs and `workdir` are writable.
+   No `--fakeroot`: the sandbox runs as your uid. Startup checks that the
+   runtime's PID, the PID file and the process start time agree, then probes
+   that the rootfs and `workdir` are writable.
 5. **Commands.** `exec --cleanenv --cwd ... instance://hpcsb-<uuid>`. The
    host environment never reaches the sandbox; `SandboxSpec.env`, per-call
    `env` and `HOME=/root` are exported by a tiny `sh` prologue with POSIX
@@ -154,50 +159,39 @@ enabled. Isolation means private PID/IPC namespaces, root filesystem, `/tmp`
 and environment; it is not a security boundary against code running as your
 uid with host networking.
 
-## ABCI notes
+## Site notes
 
-What the production backend learned on ABCI (SingularityCE 4.4.1, setuid):
+Run `python -m hpc_sandbox doctor --image IMAGE` on a compute node of a new
+site first. What tends to differ between sites:
 
-- **No fakeroot.** `--fakeroot` with overlays forces squashfuse, whose
-  `allow_other` mount the site rejects; Singularity then silently falls back to
-  a read-only rootfs. OCI-mode fakeroot has no instances. Startup probes
-  writability and fails loudly if this regresses.
-- **No `--writable-tmpfs`.** `sessiondir max size = 64` (MiB) caps it; package
-  installs and builds exceed that at once. Harbor's stock Singularity provider
-  uses `--writable-tmpfs --fakeroot` and does not work here.
-- **Writable directories, not overlays.** A per-session directory on
-  `/local/$PBS_JOBID` (about 14 TB NVMe) needs no loop devices; `/tmp` is only
-  8 GB.
-- **Instance metadata lives in the passwd home**, ignoring
-  `SINGULARITY_CONFIGDIR` and `HOME`, so listings cannot be scoped per job.
-  Hence exact UUID names, `--pid-file`, PID start times and leases, and never
-  `instance stop --all`, which would stop other jobs' instances.
-- **No cgroups for users**, hence the PSS watchdog. The setuid starter is not
-  dumpable; its RSS is charged instead of PSS.
-- **Host networking.** `allow net networks` is unset, so `--network none` is
-  reserved for root in setuid mode; leave `allow_network_none` off unless
-  `doctor`/the integration test shows it works.
-- **Paths.** Keep the image cache on `/groups` (Lustre, supports `flock`) and
-  let staging copy SIFs to `/local`. `pbsdsh` tasks start with a minimal
-  environment: pass `PBS_JOBID`/`PBS_LOCALDIR` through, and run
+- **Setuid or user-namespace mode.** Both work. In setuid mode, network
+  namespaces (`--network none`) are usually reserved for root, so leave
+  `allow_network_none` off unless `doctor` or the integration tests show it
+  works; in unprivileged user-namespace mode (common with Apptainer) it
+  normally does (verify with `HPC_SANDBOX_TEST_NETWORK_NONE=1`).
+- **No `--fakeroot`, no `--writable-tmpfs`.** Some sites force squashfuse for
+  fakeroot overlays and the runtime then silently falls back to a read-only
+  rootfs; `sessiondir max size` often caps writable tmpfs at a few tens of
+  MiB. Writable rootfs directories on scratch avoid both, and startup probes
+  writability so a regression fails loudly.
+- **Instance metadata is per user, not per job.** Unprivileged instance
+  records live below the passwd home and ignore `SINGULARITY_CONFIGDIR`, so
+  every job of a user on a node sees the same instance list. Hence exact UUID
+  names, PID files and start-time identities, and never `instance stop --all`,
+  which would stop other jobs' instances.
+- **Cgroups.** Most sites give users none, hence the PSS watchdog. Where
+  Apptainer has rootless cgroups v2 (systemd user delegation),
+  `cgroup_limits=True` turns `cpus`/`memory_mb` into real limits. The setuid
+  starter is not dumpable; its RSS is charged instead of its PSS.
+- **Paths.** Keep the image cache on shared storage that supports `flock` and
+  let staging copy SIFs to node-local disk. Point `HPC_SANDBOX_SCRATCH` at
+  job-local disk when `$TMPDIR` is small or shared (for example
+  `/local/$SLURM_JOB_ID`). Tasks launched with `pbsdsh` or `srun` may start
+  with a minimal environment: pass the variables the defaults rely on
+  (`PBS_JOBID`, `PBS_LOCALDIR`, `SLURM_JOB_ID`, `TMPDIR`) through, and run
   `python -m hpc_sandbox janitor` in the job epilogue.
-
-## Slurm and AMD notes
-
-- **Apptainer.** Pass `binary="apptainer"` (or let detection find it). The
-  same CLI is used; in unprivileged user-namespace mode the writable
-  directory, binds, `--containall` and `--net --network none` normally work
-  without setuid, so `allow_network_none=True` is often fine there (verify with
-  `HPC_SANDBOX_TEST_NETWORK_NONE=1`).
-- **Scratch.** Slurm sites usually point `$TMPDIR` at job-local disk; otherwise
-  set `HPC_SANDBOX_SCRATCH` (for example to `/local/$SLURM_JOB_ID`). Staging
-  turns on automatically inside `SLURM_JOB_ID` jobs when the cache is on another
-  filesystem.
 - **GPUs.** `gpu="nv"` for NVIDIA (`--nv`), `gpu="rocm"` for AMD (`--rocm`).
-- **Hard limits.** Where Apptainer has rootless cgroups v2 (systemd user
-  delegation), `cgroup_limits=True` turns `cpus`/`memory_mb` into real limits.
-- **enroot (NVIDIA Slurm with pyxis).** Not implemented yet;
-  `hpc_sandbox.enroot.EnrootProvider` documents the design to port.
+- **enroot.** Not implemented yet; see `hpc_sandbox.enroot`.
 
 ## Tests
 
@@ -215,9 +209,7 @@ integration tests need a compute node (never run instances on a login node);
 
 ## Not yet
 
-- ext3 overlay mode (the production backend's alternative to directory mode);
-- the Harbor `BaseEnvironment` and OpenReward `SandboxBackend` faces from the
-  platoon design;
+- an ext3 overlay mode as an alternative to rootfs directories;
 - memory snapshots, and per-node PID namespaces inside one shared sandbox.
 
 ## License

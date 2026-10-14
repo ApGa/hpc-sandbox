@@ -1,8 +1,8 @@
-"""Public data types, mirroring platoon's sandbox contract (PLAN-v1 section 4.2).
+"""Public data types: the sandbox contract every provider implements.
 
-hpc-sandbox never imports platoon. platoon's ``singularity`` provider adapts
-these classes to its own identically named ones, so the field names and method
-signatures here must stay in step with ``platoon/sandbox/base.py``.
+:class:`SandboxProvider` and :class:`Sandbox` are structural protocols, so
+callers can type against them without depending on a particular runtime, and
+adapters to other sandbox interfaces only need these field and method names.
 """
 
 from __future__ import annotations

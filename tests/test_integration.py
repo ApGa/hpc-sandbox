@@ -6,7 +6,7 @@ Run on a compute node (never a login node) with::
 
 ``HPC_SANDBOX_TEST_IMAGE`` picks the image (default ``docker://alpine:3.20``;
 any image with /bin/sh, sleep, tail and cp works, including a local .sif).
-Scratch defaults to the job-local directory, as in production; set
+Scratch defaults to the job-local directory, as in real runs; set
 ``HPC_SANDBOX_TEST_NETWORK_NONE=1`` where the site allows network namespaces.
 """
 
@@ -141,7 +141,7 @@ async def test_janitor_recovers_an_abandoned_instance(provider, scratch):
 async def test_network_none_has_only_loopback(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, network="none"))
     # /proc/net/dev lists exactly the namespace's interfaces. /sys/class/net also holds plain
-    # files, e.g. bonding_masters wherever the bonding driver is loaded (ABCI compute nodes).
+    # files, e.g. bonding_masters wherever the bonding driver is loaded.
     result = await sandbox.exec("cat /proc/net/dev")
     assert result.exit_code == 0, result.stderr
     interfaces = [line.split(":", 1)[0].strip() for line in result.stdout.splitlines()[2:] if ":" in line]

@@ -9,9 +9,9 @@ Every sandbox owns one private directory below the node-local session root::
         rootfs/                      the writable root filesystem
         tmp/  var-tmp/               bound to /tmp and /var/tmp
 
-ABCI's Singularity CE keeps unprivileged instance metadata below the passwd
-home and ignores ``SINGULARITY_CONFIGDIR``, so instance listings cannot be
-scoped to a session root. Teardown therefore acts on one exact UUID name, and
+Singularity CE and Apptainer keep unprivileged instance metadata below the
+passwd home and ignore ``SINGULARITY_CONFIGDIR``, so instance listings cannot
+be scoped to a session root. Teardown therefore acts on one exact UUID name, and
 only when the runtime's PID, the PID file, the recorded PID and the Linux start
 time agree; it fails closed on any ambiguity. Nothing here uses wildcards or
 ``instance stop --all``.

@@ -38,7 +38,7 @@ async def test_provider_and_sandbox_satisfy_the_protocols(provider, sif):
     assert isinstance(sandbox, Sandbox)
 
 
-async def test_start_uses_the_abci_safe_instance_flags(provider, sif, fake_runtime):
+async def test_start_uses_rootless_writable_instance_flags(provider, sif, fake_runtime):
     sandbox = await provider.start(SandboxSpec(image=str(sif), labels={"rollout_id": "r1"}))
     assert re.fullmatch(r"hpcsb-[0-9a-f]{32}", sandbox.id)
     (start,) = fake_runtime.calls("instance", "start")
@@ -267,7 +267,7 @@ def test_provider_defaults_follow_the_pbs_job(monkeypatch, tmp_path, fake_runtim
 
 
 async def test_runtime_environment_drops_implicit_binds(provider, monkeypatch):
-    monkeypatch.setenv("SINGULARITY_BIND", "/groups")
+    monkeypatch.setenv("SINGULARITY_BIND", "/shared")
     monkeypatch.setenv("APPTAINERENV_SECRET", "x")
     monkeypatch.setenv("SINGULARITY_CONFIGDIR", "/elsewhere")
     env = provider.runtime.environment()

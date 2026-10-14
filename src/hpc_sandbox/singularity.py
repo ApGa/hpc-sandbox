@@ -1,25 +1,27 @@
 """Rootless sandboxes as Singularity CE / Apptainer instances.
 
-What made the production SWE-rebench and Frontier-CS sandboxes work on ABCI,
-and is kept here:
+Each sandbox is one persistent instance started from a private, writable root
+filesystem directory:
 
-- setuid mode without ``--fakeroot`` (ABCI forces squashfuse for fakeroot with
-  overlays and silently falls back to a read-only rootfs);
-- a private writable rootfs *directory* per sandbox, extracted with
-  ``build --sandbox --fix-perms`` onto node-local scratch: no loop devices and
-  never ``--writable-tmpfs`` (ABCI caps the session tmpfs at 64 MiB);
-- ``--cleanenv --containall --no-home --no-mount home,cwd,bind-paths`` with
-  session-private ``/tmp`` and ``/var/tmp`` binds;
-- exact UUID instance names, a ``--pid-file``, PID start-time identities and
-  leased session directories, so janitors stop only what they can prove is
-  theirs, never ``instance stop --all``;
-- a timeout on every runtime call, host networking by default, and a PSS
-  memory watchdog instead of cgroups.
+- the image is extracted with ``build --sandbox --fix-perms`` into the
+  sandbox's session directory on node-local scratch, so no loop devices,
+  overlays or ``--fakeroot`` are needed and the size of the writable layer is
+  bounded only by the scratch filesystem (unlike ``--writable-tmpfs``, which
+  many sites cap at a few tens of MiB);
+- the instance runs with ``--cleanenv --containall --no-home --no-eval
+  --no-mount home,cwd,bind-paths`` and session-private ``/tmp`` and
+  ``/var/tmp`` binds, as the calling user;
+- instances have exact UUID names, a ``--pid-file`` and PID start-time
+  identities, and session directories are leased, so teardown and janitors
+  stop only what they can prove is theirs and never use
+  ``instance stop --all``. Unprivileged instance metadata is kept per user,
+  not per job, so this matters on shared nodes;
+- every runtime call has a timeout, networking is the host's by default, and
+  memory is guarded by a PSS watchdog because users rarely get cgroups.
 
 OCI-derived images ship an empty ``%startscript``, and an instance whose
-startscript exits is removed at once. The production backend built an adapter
-SIF with ``build --fakeroot``; with a writable rootfs directory the keep-alive
-startscript is simply written into the extracted rootfs instead.
+startscript exits is removed at once, so a keep-alive startscript is written
+into the extracted rootfs.
 """
 
 from __future__ import annotations
@@ -114,7 +116,7 @@ T = TypeVar("T")
 
 
 class SingularityProvider:
-    """Start, restore and reap sandboxes; implements platoon's ``SandboxProvider``.
+    """Start, restore and reap sandboxes backed by Singularity CE / Apptainer instances.
 
     ``scratch_root`` must be node-local (it holds every writable rootfs);
     ``image_cache`` may be shared storage that supports ``flock``. Set
@@ -637,8 +639,9 @@ class SingularitySandbox:
         if result.exit_code != 0:
             raise SandboxStartError(
                 f"the sandbox rootfs or workdir {self.spec.workdir} is not writable "
-                f"(exit {result.exit_code}): {result.stderr.strip()}. Never use --fakeroot "
-                "on ABCI: it falls back to a read-only rootfs."
+                f"(exit {result.exit_code}): {result.stderr.strip()}. A runtime that falls "
+                "back to a read-only rootfs (for example --fakeroot where the site forces "
+                "squashfuse) causes this."
             )
 
     async def _run(
