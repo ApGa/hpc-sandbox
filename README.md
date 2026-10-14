@@ -309,8 +309,9 @@ fake enroot builds containers from real user and mount namespaces, binds and
 are skipped where unprivileged user namespaces are unavailable). Identity
 checks, the janitor, the watchdog, timeouts and cancellation are exercised
 with real processes. The integration tests need a compute node (never run
-containers on a login node); `HPC_SANDBOX_TEST_IMAGE` selects the image
-(default `docker://alpine:3.20`).
+containers on a login node); `HPC_SANDBOX_TEST_RUNTIME` selects the runtime
+(`singularity`, `enroot`, or `auto` as on the command line) and
+`HPC_SANDBOX_TEST_IMAGE` the image (default `docker://alpine:3.20`).
 
 ## Not yet
 
