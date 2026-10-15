@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from conftest import make_enroot_provider
+from test_safefs import make_deep_tree
 
 from hpc_sandbox import (
     EnrootProvider,
@@ -512,6 +514,34 @@ async def test_sessions_record_their_provider_and_user(enroot_provider, sqsh):
     await enroot_provider.delete_snapshot(snapshot)
 
 
+async def test_downloads_do_not_need_to_preserve_unmapped_owners(enroot_provider, sqsh, tmp_path):
+    shared = Path("/usr/share")  # root-owned on the host: an unmapped owner in the sandbox
+    sandbox = await enroot_provider.start(
+        SandboxSpec(image=str(sqsh), mounts=[Mount(str(shared), "/mnt/shared")])
+    )
+    owner = (await sandbox.exec("stat -c %u /mnt/shared")).stdout.strip()
+    assert owner != "0"  # not mapped, so not root inside
+    source = next(
+        path for path in sorted(shared.iterdir()) if path.is_file() and os.access(path, os.R_OK)
+    )
+    await sandbox.download(f"/mnt/shared/{source.name}", tmp_path / "copy")
+    assert (tmp_path / "copy").read_bytes() == source.read_bytes()
+
+
+async def test_downloads_of_unreadable_files_and_special_files(enroot_provider, sqsh, tmp_path):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    await sandbox.exec(
+        "mkdir -p out/locked && echo secret > out/locked/f && chmod 000 out/locked/f out/locked"
+        " && echo private > zero && chmod 000 zero && mkfifo pipe"
+    )
+    await sandbox.download("/app/zero", tmp_path / "zero")
+    assert (tmp_path / "zero").read_text() == "private\n"
+    await sandbox.download("/app/out", tmp_path / "out")
+    assert (tmp_path / "out" / "locked" / "f").read_text() == "secret\n"
+    with pytest.raises(SandboxError, match="pipe"):
+        await sandbox.download("/app/pipe", tmp_path / "pipe")
+
+
 async def test_extra_start_args_that_remap_root_are_recorded(tmp_path, sqsh):
     provider = make_enroot_provider(tmp_path, remap_root=False, extra_start_args=["--root"])
     sandbox = await provider.start(SandboxSpec(image=str(sqsh)))
@@ -557,3 +587,108 @@ async def test_enroot_sessions_of_earlier_versions_are_swept(
     )
     assert not report.errors and (legacy / names[1]).is_dir()
     assert (legacy / unknown).is_dir() == singularity_installed
+
+
+async def test_transfers_never_follow_what_the_sandbox_plants(enroot_provider, sqsh, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    planted = await sandbox.exec(
+        f"rm -rf /tmp/.hpc-sandbox-transfer && ln -s {outside} /tmp/.hpc-sandbox-transfer"
+    )
+    assert planted.exit_code == 0, planted.stderr
+    source = tmp_path / "in.txt"
+    source.write_text("payload\n")
+    await sandbox.upload(source, "/app/in.txt")
+    await sandbox.download("/app/in.txt", tmp_path / "back.txt")
+    assert (tmp_path / "back.txt").read_text() == "payload\n"
+    assert not any(outside.iterdir())
+
+
+async def test_snapshots_of_a_busy_sandbox_fail_cleanly_if_at_all(enroot_provider, sqsh):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    churn = asyncio.create_task(
+        sandbox.exec(
+            "i=0; while [ $i -lt 4000 ]; do : > /app/f$i; rm -f /app/f$i; i=$((i+1)); done"
+        )
+    )
+    for _ in range(3):
+        try:
+            snapshot = await sandbox.snapshot()
+        except SandboxError:
+            continue  # a file vanished under the copy; take snapshots while quiescent
+        await enroot_provider.delete_snapshot(snapshot)
+    await churn
+
+
+def test_descriptor_helpers_never_follow_symlinks(tmp_path):
+    from hpc_sandbox import safefs
+
+    outside = tmp_path / "outside"
+    (outside / "secret").parent.mkdir()
+    (outside / "secret").write_text("host\n")
+    (outside / "secret").chmod(0o600)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "dir-link").symlink_to(outside, target_is_directory=True)
+    (tree / "file-link").symlink_to(outside / "secret")
+    with safefs.opened_dir(tree) as fd:
+        assert safefs.set_mode("file-link", fd, exact=0o000) is None
+        with pytest.raises(NotADirectoryError):
+            safefs.open_dir("dir-link", fd)
+        safefs.copy_out("dir-link", fd, tmp_path / "copy")
+        safefs.remove("dir-link", fd)
+    assert (tmp_path / "copy").is_symlink() and (outside / "secret").read_text() == "host\n"
+    assert stat.S_IMODE((outside / "secret").stat().st_mode) == 0o600
+
+
+def test_snapshot_preparation_opens_only_enroots_placeholders(tmp_path):
+    from hpc_sandbox import safefs
+    from hpc_sandbox.enroot import make_placeholders_readable
+
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "mnt" / "target").mkdir(parents=True)
+    (rootfs / "etc").mkdir()
+    (rootfs / "etc" / "resolv.conf").touch()
+    (rootfs / "private").mkdir()
+    (rootfs / "notes").write_text("x")
+    (rootfs / "deep").mkdir()
+    make_deep_tree(rootfs / "deep", 3 * sys.getrecursionlimit())
+    modes = {
+        rootfs / "mnt" / "target": (0, 0o500),
+        rootfs / "etc" / "resolv.conf": (0, 0o400),
+        rootfs / "private": (0o300, 0o300),  # the sandbox's own choice
+        rootfs / "notes": (0, 0),  # not empty: not enroot's
+    }
+    for path, (before, _) in modes.items():
+        path.chmod(before)
+    try:
+        make_placeholders_readable(rootfs)
+        for path, (_, after) in modes.items():
+            assert stat.S_IMODE(path.lstat().st_mode) == after, path
+    finally:
+        with safefs.opened_dir(tmp_path) as fd:
+            safefs.remove("rootfs", fd)  # too deep for pytest's recursive cleanup
+
+
+async def test_host_side_transfer_errors_stay_os_errors(enroot_provider, sqsh, tmp_path):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    unreadable = tmp_path / "unreadable"
+    unreadable.write_text("x")
+    unreadable.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            await sandbox.download("/app/hello.txt", locked / "hello.txt")
+        with pytest.raises(PermissionError):
+            await sandbox.upload(unreadable, "/app/unreadable")
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        with pytest.raises(shutil.SpecialFileError):
+            await sandbox.upload(fifo, "/app/fifo")
+        await sandbox.upload("/dev/null", "/app/empty")
+        assert (await sandbox.exec("wc -c < /app/empty")).stdout.strip() == "0"
+    finally:
+        locked.chmod(0o700)
+        unreadable.chmod(0o600)

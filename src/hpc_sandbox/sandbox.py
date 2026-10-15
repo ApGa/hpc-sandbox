@@ -17,18 +17,18 @@ import json
 import logging
 import os
 import re
-import shutil
 import stat
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Generic, Self, TypeVar
 
-from . import memory
+from . import memory, safefs
 from .images import ImageStore, ResolvedImage
 from .paths import default_scratch_root
 from .process import TIMEOUT_EXIT_CODE, ProcessResult, kill_tree, run_process
@@ -56,6 +56,9 @@ log = logging.getLogger(__name__)
 SNAPSHOT_FORMAT = "hpc-sandbox/rootfs-v1"
 RESERVED_TARGETS = ("/tmp", "/var/tmp")
 TRANSFER_DIR = ".hpc-sandbox-transfer"
+# How long removing a transfer's files may take: code in the sandbox can keep
+# refilling them, and the session's removal takes care of what is left.
+_TRANSFER_CLEANUP_S = 60.0
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROBE_SCRIPT = """\
 set -e
@@ -72,12 +75,18 @@ mkdir -p -- "$(dirname -- "$2")" && cp -p -- "$1" "$2"
 """
 _UPLOAD_DIR = 'mkdir -p -- "$2" && cp -pR -- "$1/." "$2/"\n'
 _MISSING_SOURCE = 66
+# Ownership is not copied out: root in a user namespace cannot give the copy an
+# owner the namespace does not map (files on host mounts), and GNU cp -p then
+# fails where busybox cp -p only warns. Busybox has no --preserve=LIST.
 _DOWNLOAD = f"""\
 if [ ! -e "$1" ]; then
     echo "hpc-sandbox: no such file or directory: $1" >&2
     exit {_MISSING_SOURCE}
 fi
-cp -pRH -- "$1" "$2"
+case "$(cp --help 2>&1)" in
+    *--preserve*) exec cp -RH --preserve=mode,timestamps -- "$1" "$2" ;;
+    *) exec cp -pRH -- "$1" "$2" ;;
+esac
 """
 _PROBE_TIMEOUT_S = 120.0
 
@@ -355,12 +364,8 @@ class SessionSandbox:
         source = Path(src)
         if not source.exists():
             raise FileNotFoundError(f"no such file or directory: {source}")
-        async with self._transfer() as (host_dir, container_dir):
-            payload = host_dir / "payload"
-            if source.is_dir():
-                await asyncio.to_thread(shutil.copytree, source, payload, symlinks=True)
-            else:
-                await asyncio.to_thread(shutil.copy2, source, payload)
+        async with self._transfer() as (staging, container_dir):
+            await _in_thread(partial(safefs.copy_in, source, "payload", staging))
             script = _UPLOAD_DIR if source.is_dir() else _UPLOAD_FILE
             result = await self._transfer_exec(script, f"{container_dir}/payload", dst)
             if result.exit_code != 0:
@@ -370,22 +375,17 @@ class SessionSandbox:
         """Copy sandbox file ``src`` to host path ``dst``, or a directory to ``dst``."""
         self._require_running()
         target = Path(dst)
-        async with self._transfer() as (host_dir, container_dir):
+        async with self._transfer() as (staging, container_dir):
             result = await self._transfer_exec(_DOWNLOAD, src, f"{container_dir}/payload")
             if result.exit_code == _MISSING_SOURCE:
                 raise FileNotFoundError(f"no such file or directory in the sandbox: {src}")
             if result.exit_code != 0:
                 raise SandboxError(f"download of {src} failed: {result.stderr.strip()}")
-            payload = host_dir / "payload"
-            if payload.is_dir() and not payload.is_symlink():
-                await asyncio.to_thread(
-                    shutil.copytree, payload, target, symlinks=True, dirs_exist_ok=True
-                )
-            elif target.is_dir():
-                raise IsADirectoryError(f"download target is a directory: {target}")
-            else:
+            try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(shutil.copy2, payload, target, follow_symlinks=False)
+                await _in_thread(partial(safefs.copy_out, "payload", staging, target))
+            except SandboxError as error:  # what the sandbox left there cannot be copied
+                raise SandboxError(f"download of {src} to {target} failed: {error}") from error
 
     async def snapshot(self) -> SandboxSnapshot:
         """Copy the writable rootfs and private tmp dirs; processes are not captured.
@@ -397,7 +397,12 @@ class SessionSandbox:
         session = self._session
         assert session is not None
         await self._run(["/bin/sh", "-c", "sync"], cwd="/", env={}, stdin=None, timeout_s=60.0)
-        await asyncio.to_thread(self._prepare_snapshot)
+        try:
+            await asyncio.to_thread(self._prepare_snapshot)
+        except OSError as error:
+            raise SandboxError(
+                f"could not prepare sandbox {self.id} for a snapshot: {error}"
+            ) from error
         snapshot_id = f"snap-{uuid.uuid4().hex}"
         target = self._provider.snapshot_root / snapshot_id
         target.mkdir(mode=0o700)
@@ -588,16 +593,34 @@ class SessionSandbox:
         return ExecResult(result.returncode, stdout, stderr)
 
     @asynccontextmanager
-    async def _transfer(self) -> AsyncIterator[tuple[Path, str]]:
-        """A fresh directory visible on the host and, through /tmp, in the sandbox."""
+    async def _transfer(self) -> AsyncIterator[tuple[int, str]]:
+        """A fresh directory in the sandbox's /tmp: a host descriptor and its path inside.
+
+        Code in the sandbox can replace anything below its /tmp at any time,
+        so the host side only works through descriptors (see :mod:`safefs`).
+        """
         assert self._session is not None
-        token = uuid.uuid4().hex
-        host_dir = self._session.tmp / TRANSFER_DIR / token
-        host_dir.mkdir(mode=0o700, parents=True)
+        tmp, token = self._session.tmp, uuid.uuid4().hex
         try:
-            yield host_dir, f"/tmp/{TRANSFER_DIR}/{token}"
+            root, staging = await _in_thread(
+                lambda _: _open_staging(tmp, token),
+                abandon=lambda fds: [os.close(fd) for fd in fds],
+            )
+        except OSError as error:
+            raise SandboxError(
+                f"sandbox {self.id}: could not prepare a transfer: {error}"
+            ) from error
+        try:
+            yield staging, f"/tmp/{TRANSFER_DIR}/{token}"
         finally:
-            await asyncio.to_thread(remove_tree, host_dir)
+            os.close(staging)
+            try:
+                deadline = time.monotonic() + _TRANSFER_CLEANUP_S
+                await _in_thread(partial(safefs.remove, token, root, deadline=deadline))
+            except Exception as error:  # noqa: BLE001 - the transfer itself is what matters
+                log.warning("sandbox %s: could not remove transfer files: %s", self.id, error)
+            finally:
+                os.close(root)
 
     async def _transfer_exec(self, script: str, *args: str) -> ExecResult:
         return await self._run(
@@ -635,6 +658,47 @@ class SessionSandbox:
         await self._stop_container(session)
         await asyncio.to_thread(remove_session, session)
         self._session = None
+
+
+async def _in_thread(
+    func: Callable[[threading.Event], T], *, abandon: Callable[[T], object] | None = None
+) -> T:
+    """``func(stop)`` in a worker thread that never outlives the call.
+
+    Transfers hand the thread descriptors that the caller closes right after,
+    so cancelling the caller sets ``stop`` and still waits for the thread. A
+    result that arrives anyway is passed to ``abandon``.
+    """
+    stop = threading.Event()
+    task = asyncio.ensure_future(asyncio.to_thread(func, stop))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        stop.set()
+        while not task.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait({task})
+        if not task.cancelled() and task.exception() is None and abandon is not None:
+            abandon(task.result())
+        raise
+
+
+def _open_staging(tmp: Path, token: str) -> tuple[int, int]:
+    """Descriptors of the transfer root below ``tmp`` and of a new ``token`` directory in it.
+
+    Code in the sandbox may have taken the owner's access to either directory
+    away; it is given back.
+    """
+    with safefs.opened_dir(tmp) as tmp_fd:
+        safefs.open_up(tmp_fd)
+        root = safefs.make_dir(TRANSFER_DIR, tmp_fd)
+    try:
+        safefs.open_up(root)
+        os.mkdir(token, 0o700, dir_fd=root)
+        return root, safefs.open_dir(token, root)
+    except BaseException:
+        os.close(root)
+        raise
 
 
 def check_env(env: Mapping[str, str]) -> None:

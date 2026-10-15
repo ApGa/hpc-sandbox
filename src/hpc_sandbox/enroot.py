@@ -42,11 +42,11 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from . import procfs
+from . import procfs, safefs
 from .images import (
     DIGEST,
     LOCAL_PREFIXES,
@@ -680,17 +680,56 @@ def make_placeholders_readable(rootfs: Path) -> None:
     Enroot creates missing bind targets (``/etc/resolv.conf``, mount targets,
     ...) as empty files and directories with mode 0, which a copy as this uid
     cannot open. Inside the container they stay hidden below their mounts.
+    The rootfs is live, so entries may vanish or turn into symlinks meanwhile:
+    those are skipped, and modes are only ever changed on what was checked.
+    Other unreadable directories are left as they are (the copy reports
+    them), and so is anything more than :data:`safefs.MAX_DEPTH` levels down.
     """
-    for directory, directories, files in os.walk(rootfs):
-        for name in directories + files:
-            path = Path(directory, name)
-            info = path.lstat()
-            if stat.S_IMODE(info.st_mode) or info.st_uid != os.getuid():
+    # Depth-first with one open descriptor per level.
+    stack: list[tuple[int, Iterator[str]]] = []
+    try:
+        fd = os.open(rootfs, safefs.DIRECTORY)
+        stack.append((fd, iter(safefs.listing(fd))))
+        while stack:
+            fd, names = stack[-1]
+            name = next(names, None)
+            if name is None:
+                os.close(stack.pop()[0])
                 continue
-            if stat.S_ISDIR(info.st_mode):
-                path.chmod(0o500)
-            elif stat.S_ISREG(info.st_mode) and info.st_size == 0:
-                path.chmod(0o400)
+            if not _open_placeholder(name, fd) or len(stack) >= safefs.MAX_DEPTH:
+                continue
+            try:
+                child = os.open(name, safefs.DIRECTORY, dir_fd=fd)
+            except OSError:
+                continue  # gone, replaced, or unreadable
+            try:
+                stack.append((child, iter(safefs.listing(child))))
+            except OSError:
+                os.close(child)
+    finally:
+        for fd, _ in stack:
+            os.close(fd)
+
+
+def _open_placeholder(name: str, dir_fd: int) -> bool:
+    """Make ``name`` readable if it is a placeholder; return whether it is a directory."""
+    try:
+        item = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return False
+    try:
+        info = os.fstat(item)
+        directory = stat.S_ISDIR(info.st_mode)
+        placeholder = (
+            stat.S_IMODE(info.st_mode) == 0
+            and info.st_uid == os.getuid()
+            and (directory or (stat.S_ISREG(info.st_mode) and info.st_size == 0))
+        )
+        if placeholder:
+            os.chmod(f"/proc/self/fd/{item}", 0o500 if directory else 0o400)
+        return directory
+    finally:
+        os.close(item)
 
 
 def kill_exact(processes: list[tuple[int, str]], name: str) -> bool:

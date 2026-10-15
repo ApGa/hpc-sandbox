@@ -238,3 +238,19 @@ def test_doctor_smoke_test_passes():
         )
     )
     assert result.returncode == 0, result.detail()
+
+
+async def test_transfers_ignore_symlinks_the_sandbox_plants(provider, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sandbox = await provider.start(SandboxSpec(image=IMAGE))
+    planted = await sandbox.exec(
+        f"rm -rf /tmp/.hpc-sandbox-transfer && ln -s {outside} /tmp/.hpc-sandbox-transfer"
+    )
+    assert planted.exit_code == 0, planted.stderr
+    source = tmp_path / "in.txt"
+    source.write_text("payload\n")
+    await sandbox.upload(source, "/app/in.txt")
+    await sandbox.download("/app/in.txt", tmp_path / "back.txt")
+    assert (tmp_path / "back.txt").read_text() == "payload\n"
+    assert not any(outside.iterdir())
