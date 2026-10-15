@@ -273,6 +273,18 @@ class SingularitySandbox(SessionSandbox):
                 args += ["--memory", str(self.spec.memory_mb * 1024 * 1024)]
         return [*args, *provider.extra_start_args, str(session.rootfs), self.id]
 
+    def _start_environment(self) -> dict[str, str]:
+        """Variables ``instance start`` needs beyond the runtime's environment.
+
+        Where the site sets ``use nvidia-container-cli = yes``, ``--nv`` with
+        ``--containall`` exposes only the GPUs ``NVIDIA_VISIBLE_DEVICES`` names
+        and none when it is unset, so default it to every GPU this process
+        may use (inside a Slurm allocation, the allocated ones).
+        """
+        if self._provider.gpu == "nv" and "NVIDIA_VISIBLE_DEVICES" not in os.environ:
+            return {"NVIDIA_VISIBLE_DEVICES": "all"}
+        return {}
+
     async def _start_container(self) -> None:
         assert self._session is not None
         session, provider = self._session, self._provider
@@ -282,7 +294,10 @@ class SingularitySandbox(SessionSandbox):
             # before its result reaches us, so cleanup must assume it exists.
             self._instance_may_exist = True
             result = await self._runtime.run(
-                *self._start_args(), timeout_s=provider.start_timeout_s
+                *self._start_args(),
+                timeout_s=provider.start_timeout_s,
+                extra_env=self._start_environment(),
+                container=True,
             )
             if result.returncode != 0 or result.timed_out:
                 raise SandboxStartError(f"instance start failed: {result.detail()}")
@@ -323,6 +338,7 @@ class SingularitySandbox(SessionSandbox):
             stdin=stdin,
             output_limit=self._output_limit,
             on_start=on_start,
+            container=True,
         )
 
     def _container_alive(self) -> bool:

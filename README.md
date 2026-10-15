@@ -346,6 +346,15 @@ Singularity CE / Apptainer:
   `cgroup_limits=True` turns `cpus`/`memory_mb` into real limits. The setuid
   starter is not dumpable; its RSS is charged instead of its PSS.
 - **GPUs.** `gpu="nv"` for NVIDIA (`--nv`), `gpu="rocm"` for AMD (`--rocm`).
+  Where `singularity.conf` sets `use nvidia-container-cli = yes`, `--nv` with
+  `--containall` exposes only the GPUs `NVIDIA_VISIBLE_DEVICES` names, so the
+  provider sets it to `all` (inside a Slurm allocation, the allocated GPUs)
+  unless it is already set.
+- **Variables passed despite `--cleanenv`.** The runtime passes `TERM` and the
+  proxy variables into containers regardless (proxy URLs may hold
+  credentials), so the provider removes them from its environment for
+  `instance start` and `exec`; pass them in `SandboxSpec.env` if a sandbox
+  needs them.
 
 enroot:
 

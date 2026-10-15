@@ -26,6 +26,11 @@ import time
 from pathlib import Path
 
 STATE = Path(os.environ["FAKE_SINGULARITY_STATE"])
+ALWAYS_PASSED = {
+    "TERM",
+    *(f"{name}_proxy" for name in ("http", "https", "ftp", "all", "no")),
+    *(f"{name}_PROXY" for name in ("HTTP", "HTTPS", "FTP", "ALL", "NO")),
+}
 INSTANCES = STATE / "instances"
 MAGIC = b"FAKESIF\n"
 SYSTEM_DIRS = {"bin", "sbin", "usr", "lib", "lib64", "proc", "sys", "dev"}
@@ -45,6 +50,7 @@ VALUED = {
     "--workdir",
     "-W",
 }
+RECORDED_ENV = ("NVIDIA_VISIBLE_DEVICES",)
 INSTANCE_LOOP = """\
 import signal, sys, time
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -230,6 +236,8 @@ def exec_(args: list[str]) -> int:
         for index, arg in enumerate(command)
     ]
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C"}
+    # Like Singularity CE and Apptainer, --cleanenv still passes these on.
+    env.update({key: value for key, value in os.environ.items() if key in ALWAYS_PASSED})
     if "--cleanenv" not in options:
         env = dict(os.environ)
     os.execvpe(command[0], command, env)
@@ -239,6 +247,9 @@ def exec_(args: list[str]) -> int:
 def main(argv: list[str]) -> int:
     with (STATE / "calls.jsonl").open("a") as calls:
         calls.write(json.dumps(argv) + "\n")
+    with (STATE / "environments.jsonl").open("a") as environments:
+        recorded = {key: os.environ.get(key) for key in RECORDED_ENV}
+        environments.write(json.dumps({"argv": argv, "env": recorded}) + "\n")
     if argv == ["--version"]:
         print("singularity-ce version 4.4.1-fake")
         return 0

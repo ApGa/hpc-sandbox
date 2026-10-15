@@ -350,6 +350,20 @@ async def test_squashfs_images_are_refused_before_anything_is_created(tmp_path, 
     assert not provider.scratch_root.exists()
 
 
+async def test_nv_instances_see_every_gpu_unless_told_otherwise(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    monkeypatch.delenv("NVIDIA_VISIBLE_DEVICES", raising=False)
+    provider = make_provider(tmp_path, gpu="nv")
+    async with await provider.start(SandboxSpec(image=str(sif))):
+        pass
+    monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "1")
+    async with await provider.start(SandboxSpec(image=str(sif))):
+        pass
+    starts = fake_runtime.environments("instance", "start")
+    assert [env["NVIDIA_VISIBLE_DEVICES"] for env in starts] == ["all", "1"]
+
+
 def test_unknown_schemes_and_bare_squashfs_names_are_refused(tmp_path, fake_runtime):
     check = make_provider(tmp_path).images.format.check
     for reference in (
@@ -370,6 +384,17 @@ def test_records_say_when_fakeroot_makes_commands_run_as_root(tmp_path, fake_run
     provider = make_provider(tmp_path, extra_start_args=["--fakeroot"])
     sandbox = SingularitySandbox(provider, SandboxSpec(image="x.sif"))
     assert sandbox._user() == {"remap_root": True, "container_uid": 0}
+
+
+async def test_commands_get_none_of_the_variables_singularity_passes_despite_cleanenv(
+    provider, sif, monkeypatch
+):
+    monkeypatch.setenv("TERM", "xterm-host")
+    monkeypatch.setenv("https_proxy", "http://user:secret@proxy:3128")
+    sandbox = await provider.start(SandboxSpec(image=str(sif), env={"FROM_SPEC": "1"}))
+    environment = (await sandbox.exec("env")).stdout
+    assert "FROM_SPEC=1" in environment
+    assert "xterm-host" not in environment and "secret" not in environment
 
 
 async def test_stderr_up_to_the_limit_is_not_truncated(tmp_path, sif, fake_runtime):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,15 @@ from .types import SandboxError
 
 RUNTIME_CANDIDATES = ("singularity", "apptainer")
 QUERY_TIMEOUT_S = 30.0
+# Singularity and Apptainer pass these from the host into containers even with
+# --cleanenv; proxy URLs may hold credentials.
+PASSED_DESPITE_CLEANENV = frozenset(
+    {
+        "TERM",
+        *(f"{name}_proxy" for name in ("http", "https", "ftp", "all", "no")),
+        *(f"{name}_PROXY" for name in ("HTTP", "HTTPS", "FTP", "ALL", "NO")),
+    }
+)
 
 
 class ContainerRuntime:
@@ -82,13 +91,20 @@ class ContainerRuntime:
         stdin: bytes | None = None,
         output_limit: int = DEFAULT_OUTPUT_LIMIT,
         on_start: Callable[[int], None] | None = None,
+        extra_env: Mapping[str, str] | None = None,
+        container: bool = False,
     ) -> ProcessResult:
+        """Run the runtime with ``args``; ``container`` for commands that enter a container,
+        which then gets none of the variables the runtime passes despite ``--cleanenv``."""
+        env = {**self.environment(), **(extra_env or {})}
+        if container:
+            env = {key: value for key, value in env.items() if key not in PASSED_DESPITE_CLEANENV}
         try:
             return await run_process(
                 [self.path, *args],
                 timeout_s=timeout_s,
                 stdin=stdin,
-                env=self.environment(),
+                env=env,
                 output_limit=output_limit,
                 on_start=on_start,
             )

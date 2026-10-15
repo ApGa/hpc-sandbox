@@ -54,6 +54,14 @@ class FakeRuntime:
         )
         return [call for call in calls if call[: len(prefix)] == list(prefix)]
 
+    def environments(self, *prefix: str) -> list[dict[str, str | None]]:
+        """The recorded variables of each call whose argv starts with ``prefix``."""
+        path = self.state / "environments.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        return [
+            record["env"] for record in records if record["argv"][: len(prefix)] == list(prefix)
+        ]
+
     def instance_pid(self, name: str) -> int:
         return json.loads((self.state / "instances" / f"{name}.json").read_text())["pid"]
 
