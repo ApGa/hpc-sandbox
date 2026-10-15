@@ -199,6 +199,10 @@ class SingularitySandbox(SessionSandbox):
             "instance_start_time": self._instance_start_time,
         }
 
+    def _user(self) -> dict[str, Any]:
+        fakeroot = any(arg in ("--fakeroot", "-f") for arg in self._provider.extra_start_args)
+        return {"remap_root": fakeroot, "container_uid": 0 if fakeroot else os.getuid()}
+
     def _watch_root(self) -> int | None:
         return self._instance_pid
 

@@ -21,6 +21,7 @@ from .paths import in_batch_job
 from .process import run_process
 from .runtime import RUNTIME_CANDIDATES, ContainerRuntime
 from .sandbox import SessionProvider
+from .sessions import JanitorReport
 from .singularity import SingularityProvider
 from .types import Mount, SandboxError, SandboxSpec
 
@@ -178,9 +179,29 @@ async def _run(args: argparse.Namespace) -> int:
 
 async def _janitor(args: argparse.Namespace) -> int:
     labels = _pairs(args.label, "--label") or None
-    report = await _provider(args).reap(labels)
+    report = JanitorReport()
+    for runtime in _janitor_runtimes(args):
+        args.runtime = runtime
+        swept = await _provider(args).reap(labels)
+        report.stopped += swept.stopped
+        report.removed += swept.removed
+        report.live += swept.live
+        report.errors += swept.errors
     print(json.dumps(asdict(report), indent=2))
     return 1 if report.errors else 0
+
+
+def _janitor_runtimes(args: argparse.Namespace) -> list[str]:
+    """The runtimes whose sessions a janitor sweeps, unless one is chosen.
+
+    Singularity's when it is installed (stopping its instances needs it), and
+    always enroot's: its sandboxes die with their owners, so sweeping them
+    needs no enroot binary.
+    """
+    if args.runtime != "auto" or args.binary:
+        return [resolve_runtime(args.runtime, args.binary)]
+    singularity = any(shutil.which(binary) for binary in RUNTIME_CANDIDATES)
+    return [*(["singularity"] if singularity else []), "enroot"]
 
 
 class _Report:

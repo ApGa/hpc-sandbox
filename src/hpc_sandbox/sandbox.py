@@ -97,6 +97,8 @@ class SessionProvider(Generic[S]):
     images: ImageStore
     sandbox_type: type[S]
     network_none_hint = "network 'none' is not supported by this provider"
+    # Each provider keeps its sessions apart: janitors only know their own runtime.
+    sessions_directory = "sessions"
 
     def __init__(
         self,
@@ -119,7 +121,7 @@ class SessionProvider(Generic[S]):
 
     @property
     def session_root(self) -> Path:
-        return self.scratch_root / "sessions"
+        return self.scratch_root / self.sessions_directory
 
     @property
     def snapshot_root(self) -> Path:
@@ -170,12 +172,23 @@ class SessionProvider(Generic[S]):
                 else:
                     report.stopped.append(sandbox.id)
                     report.removed.append(sandbox.id)
-        swept = await sweep(self.session_root, self._stop_abandoned, labels=labels)
-        report.stopped += swept.stopped
-        report.removed += swept.removed
-        report.live += swept.live
-        report.errors += swept.errors
+        for root, claim_unknown in self._session_roots():
+            swept = await sweep(
+                root,
+                self._stop_abandoned,
+                labels=labels,
+                provider=self.name,
+                claim_unknown=claim_unknown,
+            )
+            report.stopped += swept.stopped
+            report.removed += swept.removed
+            report.live += swept.live
+            report.errors += swept.errors
         return report
+
+    def _session_roots(self) -> list[tuple[Path, bool]]:
+        """Directories janitors sweep, and whether they claim sessions of no known provider."""
+        return [(self.session_root, True)]
 
     async def copy_tree(self, source: Path, target: Path) -> None:
         """``cp -a --reflink=auto``: near-free on reflink filesystems, a full copy otherwise."""
@@ -245,9 +258,12 @@ class SessionProvider(Generic[S]):
 
     async def _sweep_abandoned(self) -> None:
         """Recover sessions left by crashed processes, once per provider."""
-        report = await sweep(self.session_root, self._stop_abandoned)
-        for error in report.errors:
-            log.warning("hpc-sandbox janitor: %s", error)
+        for root, claim_unknown in self._session_roots():
+            report = await sweep(
+                root, self._stop_abandoned, provider=self.name, claim_unknown=claim_unknown
+            )
+            for error in report.errors:
+                log.warning("hpc-sandbox janitor: %s", error)
 
     async def _copy_snapshot(self, source: Path, session: Session) -> None:
         for name, target in (
@@ -404,6 +420,7 @@ class SessionSandbox:
                     "source_sandbox": self.id,
                     "workdir": self.spec.workdir,
                     "labels": dict(self.spec.labels),
+                    **self._user(),
                 },
             )
             (target / "snapshot.json").write_text(json.dumps(asdict(snapshot), indent=2) + "\n")
@@ -459,6 +476,14 @@ class SessionSandbox:
         """Fields of the owner record that identify the container's processes."""
         raise NotImplementedError
 
+    def _user(self) -> dict[str, Any]:
+        """Who commands run as, recorded in the owner record and snapshot metadata.
+
+        ``container_uid`` is the uid inside the sandbox; files it writes belong
+        to the calling user on the host either way.
+        """
+        return {"remap_root": False, "container_uid": os.getuid()}
+
     def _prepare_snapshot(self) -> None:
         """Make the rootfs copyable before a snapshot; runs in a worker thread."""
 
@@ -506,7 +531,11 @@ class SessionSandbox:
     def _record(self) -> None:
         assert self._session is not None
         self._session.write_owner_record(
-            labels=dict(self.spec.labels), image=self.spec.image, **self._identity()
+            provider=self._provider.name,
+            labels=dict(self.spec.labels),
+            image=self.spec.image,
+            **self._user(),
+            **self._identity(),
         )
 
     async def _probe(self) -> None:

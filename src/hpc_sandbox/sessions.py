@@ -170,6 +170,22 @@ def _read_owner_record(path: Path) -> dict[str, Any] | None:
     return record if isinstance(record, dict) else None
 
 
+def record_provider(record: dict[str, Any] | None) -> str | None:
+    """The provider an owner record belongs to, or None if it cannot tell.
+
+    Records name their provider; older ones are recognized by their fields.
+    """
+    if not record:
+        return None
+    if isinstance(record.get("provider"), str):
+        return record["provider"]
+    if "instance_pid_file" in record:
+        return "singularity"
+    if "anchor_pid" in record or "init_pid" in record:
+        return "enroot"
+    return None
+
+
 def labels_match(labels: Any, wanted: Mapping[str, str]) -> bool:
     return isinstance(labels, dict) and all(labels.get(k) == v for k, v in wanted.items())
 
@@ -179,15 +195,21 @@ async def sweep(
     stop: Stopper,
     *,
     labels: Mapping[str, str] | None = None,
+    provider: str | None = None,
+    claim_unknown: bool = True,
 ) -> JanitorReport:
     """Stop and remove abandoned sessions below ``root``.
 
     A session is abandoned when nobody holds its lease and its recorded owner
     process is gone. With ``labels``, only sessions whose labels include them
-    are considered. For each one, ``stop(path, record)`` stops whatever still
-    runs; ``record`` is the owner record if it is bound to this session on
-    this host, else None. Live sessions and unrecognized directories are never
-    touched; foreign directories and failed stops are reported and kept.
+    are considered. With ``provider``, sessions of another provider (see
+    :func:`record_provider`) are skipped, since only their provider knows how
+    to stop them, and so are sessions of no recognizable provider unless
+    ``claim_unknown``. For each remaining one, ``stop(path, record)`` stops
+    whatever still runs; ``record`` is the owner record if it is bound to
+    this session on this host, else None. Live sessions and unrecognized
+    directories are never touched; foreign directories and failed stops are
+    reported and kept.
     """
     report = JanitorReport()
     if not root.is_dir():
@@ -200,6 +222,10 @@ async def sweep(
             if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
                 report.errors.append(f"refusing foreign or non-private session {path}")
                 continue
+            if provider is not None:
+                owner = record_provider(_read_owner_record(path))
+                if owner != provider and (owner is not None or not claim_unknown):
+                    continue
             await _sweep_session(path, stop, labels, report)
     return report
 

@@ -73,7 +73,7 @@ the runtime underneath.
 |---|---|
 | `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the scratch and cache filesystems, free space, staging and reflink support, and what matters for the runtime: for Singularity/Apptainer the site settings (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices); for enroot whether namespaces can be created, whether imports can convert layer whiteouts, whether this process runs inside a container, and the site's `enroot.conf` and hooks. With `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
 | `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
-| `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Use it in job epilogues. |
+| `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless `--runtime` names one, it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
 
 All commands take `--runtime auto|singularity|enroot` (default
 `$HPC_SANDBOX_RUNTIME`, else the first of `singularity`, `apptainer` and
@@ -90,9 +90,11 @@ What both providers share:
    the image is staged to node-local scratch as `sha256-<digest>.<ext>`,
    verified while copying.
 2. **Session.** A private directory `sessions/hpcsb-<uuid>` (mode 0700) on
-   node-local scratch, leased with `flock` and holding an owner record: owner
-   PID and start time, the container's process identities, hostname and
-   labels. The writable root filesystem is extracted into it as a directory
+   node-local scratch (`sessions-enroot/hpcsb-<uuid>` for enroot), leased
+   with `flock` and holding an owner record: the provider, owner PID and
+   start time, the container's process identities, who commands run as
+   (`remap_root`, `container_uid`), hostname and labels. The writable root
+   filesystem is extracted into it as a directory
    owned by the calling uid: no loop devices, overlays or size-capped tmpfs.
 3. **Commands.** The host environment never reaches the sandbox; the
    container's own environment (the image's `ENV`), `HOME=/root`,
@@ -112,14 +114,16 @@ What both providers share:
 6. **Snapshots** copy the rootfs and the private tmp directories with
    `cp -a --reflink=auto` (near free on reflink filesystems), after a `sync`.
    Processes and memory are not captured; take snapshots while the sandbox is
-   quiescent. Snapshots live on the node that took them.
+   quiescent. Snapshots live on the node that took them; their metadata
+   records `remap_root` and `container_uid` like the owner record.
 7. **Teardown and janitors.** `stop()` kills running commands, stops the
    container, re-proving process identities before signalling anything, and
    deletes the session. Teardown is shielded from cancellation. A janitor
    considers only `hpcsb-<uuid>` sessions under its root whose lease is free
-   and whose owner process is dead, optionally filtered by labels; it fails
-   closed (reports and leaves the session) whenever identities disagree.
-   Each provider sweeps abandoned sessions before its first start.
+   and whose owner process is dead, optionally filtered by labels, and leaves
+   sessions that belong to another provider; it fails closed (reports and
+   leaves the session) whenever identities disagree. Each provider sweeps
+   abandoned sessions before its first start.
 
 ### Singularity CE / Apptainer
 
@@ -275,6 +279,10 @@ enroot:
 - **Sandboxes die with their owner.** The launcher and the container's init
   are killed when the owning process exits, even by SIGKILL; there are no
   orphaned containers to stop, only files for the janitor to remove.
+- **Upgrading from an earlier version.** Enroot sessions used to live in
+  `sessions` next to the Singularity ones; enroot janitors also sweep the
+  enroot sessions they find there, and, where no Singularity or Apptainer is
+  installed, sessions there whose owner record is missing.
 - **Site configuration.** `enroot.conf` settings such as
   `ENROOT_MOUNT_HOME yes`, `ENROOT_REMAP_ROOT` and the data and runtime paths
   are overridden per sandbox; system mounts (`/etc/enroot/mounts.d`) and

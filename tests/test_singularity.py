@@ -323,3 +323,19 @@ async def test_async_with_stops_the_sandbox(provider, sif):
         async with await provider.start(SandboxSpec(image=str(sif))) as failing:
             raise RuntimeError("boom")
     assert not failing.session_dir and not provider.sandboxes
+
+
+async def test_sessions_record_their_provider_and_user(provider, sif):
+    assert provider.session_root == provider.scratch_root / "sessions"
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    owner = json.loads((sandbox.session_dir / "owner.json").read_text())
+    assert owner["provider"] == "singularity"
+    assert (owner["remap_root"], owner["container_uid"]) == (False, os.getuid())
+
+
+def test_records_say_when_fakeroot_makes_commands_run_as_root(tmp_path, fake_runtime):
+    from hpc_sandbox.singularity import SingularitySandbox
+
+    provider = make_provider(tmp_path, extra_start_args=["--fakeroot"])
+    sandbox = SingularitySandbox(provider, SandboxSpec(image="x.sif"))
+    assert sandbox._user() == {"remap_root": True, "container_uid": 0}

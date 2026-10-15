@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -118,3 +119,15 @@ async def test_janitor_fails_closed_when_identities_disagree(tmp_path, sif, fake
     assert not report.removed and "disagree" in report.errors[0]
     assert owned_live_start_time(pid) is not None
     assert (provider.session_root / name).is_dir()
+
+
+async def test_janitor_leaves_sessions_of_other_providers_alone(tmp_path, sif, fake_runtime):
+    (name,) = await crashed_sandboxes(tmp_path, sif, "a")
+    owner = make_provider(tmp_path).session_root / name / "owner.json"
+    record = json.loads(owner.read_text())
+    record["provider"] = "enroot"
+    owner.write_text(json.dumps(record))
+    report = await make_provider(tmp_path).reap()
+    assert not report.removed and not report.errors and not report.live
+    assert owned_live_start_time(fake_runtime.instance_pid(name)) is not None
+    assert owner.exists()

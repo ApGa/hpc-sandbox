@@ -500,3 +500,60 @@ async def test_async_with_stops_the_sandbox(enroot_provider, sqsh):
         owner = json.loads((sandbox.session_dir / "owner.json").read_text())
     assert owned_live_start_time(owner["init_pid"]) != owner["init_start_time"]
     assert not enroot_provider.sandboxes
+
+
+async def test_sessions_record_their_provider_and_user(enroot_provider, sqsh):
+    assert enroot_provider.session_root == enroot_provider.scratch_root / "sessions-enroot"
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    owner = json.loads((sandbox.session_dir / "owner.json").read_text())
+    assert (owner["provider"], owner["remap_root"], owner["container_uid"]) == ("enroot", True, 0)
+    snapshot = await sandbox.snapshot()
+    assert (snapshot.metadata["remap_root"], snapshot.metadata["container_uid"]) == (True, 0)
+    await enroot_provider.delete_snapshot(snapshot)
+
+
+async def test_extra_start_args_that_remap_root_are_recorded(tmp_path, sqsh):
+    provider = make_enroot_provider(tmp_path, remap_root=False, extra_start_args=["--root"])
+    sandbox = await provider.start(SandboxSpec(image=str(sqsh)))
+    owner = json.loads((sandbox.session_dir / "owner.json").read_text())
+    assert (owner["remap_root"], owner["container_uid"]) == (True, 0)
+    assert (await sandbox.exec("id -u")).stdout == "0\n"
+    await sandbox.stop()
+
+
+@pytest.mark.parametrize("singularity_installed", [True, False])
+async def test_enroot_sessions_of_earlier_versions_are_swept(
+    tmp_path, fake_enroot, monkeypatch, singularity_installed
+):
+    import shutil
+
+    real_which = shutil.which
+    monkeypatch.setattr(
+        "hpc_sandbox.enroot.shutil.which",
+        lambda name, *args, **kwargs: (
+            f"/usr/bin/{name}"
+            if name in ("singularity", "apptainer") and singularity_installed
+            else None
+            if name in ("singularity", "apptainer")
+            else real_which(name, *args, **kwargs)
+        ),
+    )
+    provider = make_enroot_provider(tmp_path)
+    legacy = tmp_path / "scratch" / "sessions"
+    names = ["hpcsb-" + "4" * 32, "hpcsb-" + "5" * 32, "hpcsb-" + "6" * 32]
+    for name, identity in zip(
+        names, ({"anchor_pid": 1, "init_pid": 2}, {"instance_pid_file": "x"}, {}), strict=True
+    ):
+        session = open_session(legacy, name)
+        session.write_owner_record(labels={}, image="x", **identity)
+        record = json.loads((session.path / "owner.json").read_text())
+        record["owner_start_time"] = "0"
+        (session.path / "owner.json").write_text(json.dumps(record))
+        session.release()
+    report = await provider.reap()
+    unknown = names[2]  # cannot tell whose: left to a Singularity janitor if there is one
+    assert sorted(report.removed) == sorted(
+        [names[0], *([] if singularity_installed else [unknown])]
+    )
+    assert not report.errors and (legacy / names[1]).is_dir()
+    assert (legacy / unknown).is_dir() == singularity_installed

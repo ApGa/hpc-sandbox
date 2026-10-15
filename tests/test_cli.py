@@ -4,6 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
+from hpc_sandbox import SandboxSpec
 from hpc_sandbox.cli import main, resolve_runtime
 
 
@@ -86,3 +87,35 @@ def test_runtime_resolution(monkeypatch):
     assert resolve_runtime("auto") == "enroot"
     monkeypatch.setattr(shutil, "which", lambda name, *_: "/bin/x")
     assert resolve_runtime("auto") == "singularity"
+
+
+async def _abandon(provider, image):
+    """Start a sandbox and forget it, as a crashed owner would."""
+    sandbox = await provider.start(SandboxSpec(image=str(image)))
+    session = sandbox.session_dir
+    record = json.loads((session / "owner.json").read_text())
+    record["owner_start_time"] = "0"
+    (session / "owner.json").write_text(json.dumps(record))
+    sandbox._session.release()
+    return session
+
+
+def test_janitor_sweeps_every_installed_runtime(
+    tmp_path, sif, sqsh, fake_runtime, fake_enroot, capsys
+):
+    import asyncio
+
+    from conftest import make_enroot_provider, make_provider
+
+    async def abandon_both():
+        singularity = await _abandon(make_provider(tmp_path), sif)
+        enroot_provider = make_enroot_provider(tmp_path)
+        enroot = await _abandon(enroot_provider, sqsh)
+        sandbox = next(iter(enroot_provider.sandboxes))
+        await sandbox._stop_container(sandbox._session)  # its processes die with their owner
+        return singularity, enroot
+
+    singularity, enroot = asyncio.run(abandon_both())
+    assert main(["janitor", *common(tmp_path)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert sorted(report["removed"]) == sorted([singularity.name, enroot.name])

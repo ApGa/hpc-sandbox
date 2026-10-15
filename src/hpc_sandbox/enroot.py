@@ -47,9 +47,15 @@ from pathlib import Path
 from typing import Any
 
 from . import procfs
-from .images import DIGEST, LOCAL_PREFIXES, ImageStore, ResolvedImage
+from .images import (
+    DIGEST,
+    LOCAL_PREFIXES,
+    ImageStore,
+    ResolvedImage,
+)
 from .paths import default_image_cache, should_stage
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
+from .runtime import RUNTIME_CANDIDATES
 from .sandbox import SessionProvider, SessionSandbox, make_owner_writable, poll
 from .sessions import Session
 from .types import SandboxError, SandboxLostError, SandboxSpec, SandboxStartError
@@ -353,6 +359,7 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     """
 
     name = "enroot"
+    sessions_directory = "sessions-enroot"
 
     def __init__(
         self,
@@ -411,6 +418,13 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
                 raise SandboxError("nsenter (util-linux) is not on PATH")
             self._nsenter = resolved
         return self._nsenter
+
+    def _session_roots(self) -> list[tuple[Path, bool]]:
+        # Earlier versions kept enroot sessions in the Singularity provider's
+        # directory: sweep the ones recognizably ours there too, and those
+        # nobody can tell apart when no Singularity janitor could take them.
+        singularity = any(shutil.which(binary) for binary in RUNTIME_CANDIDATES)
+        return [*super()._session_roots(), (self.scratch_root / "sessions", not singularity)]
 
     def _check(self, spec: SandboxSpec) -> None:
         super()._check(spec)
@@ -474,6 +488,13 @@ class EnrootSandbox(SessionSandbox):
             "init_pid": self._init_pid,
             "init_start_time": self._init_start_time,
         }
+
+    def _user(self) -> dict[str, Any]:
+        provider = self._provider
+        remap_root = provider.remap_root or any(
+            arg in ("--root", "-r") for arg in provider.extra_start_args
+        )
+        return {"remap_root": remap_root, "container_uid": 0 if remap_root else os.getuid()}
 
     def _watch_root(self) -> int | None:
         # The launcher and the container's init (its only child) are protected.
