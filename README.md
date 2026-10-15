@@ -96,12 +96,24 @@ What both providers share:
    (`remap_root`, `container_uid`), hostname and labels. The writable root
    filesystem is extracted into it as a directory
    owned by the calling uid: no loop devices, overlays or size-capped tmpfs.
-3. **Commands.** The host environment never reaches the sandbox; the
+3. **Commands.** The host environment never reaches the sandbox. The
    container's own environment (the image's `ENV`), `HOME=/root`,
-   `SandboxSpec.env` and per-call `env` are passed verbatim. Output is bounded
-   (head and tail of each stream, 16 MiB); a command that leaves a background
-   process holding stdout still returns. Startup probes that the rootfs and
-   `workdir` are writable.
+   `SandboxSpec.env` and per-call `env` are sent, POSIX-quoted, as one line
+   ahead of the command's stdin, which a short `sh` prologue inside the
+   container reads and evaluates before the command gets the rest (or
+   `/dev/null` when there is no `stdin`). Values pass verbatim, appear neither
+   on command lines (which every user of a node can read) nor in the host-side
+   processes that enter the container, and need nothing from the sandbox's
+   filesystem. Names the image's `/bin/sh` reserves cannot be set: with bash,
+   `UID`, `EUID`, `PPID`, `BASHPID`, `GROUPS`, `FUNCNAME` and the like; with
+   dash, an `OPTIND` that is not a number. The prologue then enters the
+   working directory and announces the start on stderr (the announcement is
+   removed from the result); a command that never started — a missing working
+   directory, a runtime that could not enter the container — raises
+   `SandboxError` instead of returning an exit status.
+   Output is bounded (head and tail of each stream, 16 MiB); a command that
+   leaves a background process holding stdout still returns. Startup probes
+   that the rootfs and `workdir` are writable.
 4. **Transfers.** Through a fresh directory in the session's private `/tmp`,
    so they work for binary files of any size and see the container's view of
    paths (including its mounts). Code in the sandbox can change that directory
@@ -151,9 +163,11 @@ What both providers share:
   (host networking), the spec's mounts and an exact name `hpcsb-<uuid>`. No
   `--fakeroot`: the sandbox runs as your uid. Startup checks that the
   runtime's PID, the PID file and the process start time agree.
-- **Commands.** `exec --cleanenv --cwd ... instance://hpcsb-<uuid>`, with the
-  environment exported by a tiny `sh` prologue with POSIX quoting (`--env`
-  splits on commas, `--env-file` is shell-evaluated).
+- **Commands.** `exec --cleanenv --cwd ... instance://hpcsb-<uuid>` running
+  the prologue, which also enters the working directory itself: Singularity CE
+  silently falls back to another directory when `--cwd` is missing. The
+  runtime's own `--env` is not used: it splits on commas, and `--env-file` is
+  shell-evaluated.
 - **Teardown.** `instance stop --timeout` on the exact instance, then a
   direct signal if it survived. Nothing uses wildcards or
   `instance stop --all`.

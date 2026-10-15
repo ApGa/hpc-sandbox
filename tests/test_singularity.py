@@ -333,9 +333,24 @@ async def test_sessions_record_their_provider_and_user(provider, sif):
     assert (owner["remap_root"], owner["container_uid"]) == (False, os.getuid())
 
 
+async def test_a_command_that_never_started_is_an_infrastructure_error(provider, sif):
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    with pytest.raises(SandboxError, match="did not start"):
+        await sandbox.exec("true", cwd="/does/not/exist")
+    result = await sandbox.exec("echo err >&2")
+    assert result.stderr == "err\n" and (await sandbox.exec("echo ok")).stdout == "ok\n"
+
+
 def test_records_say_when_fakeroot_makes_commands_run_as_root(tmp_path, fake_runtime):
     from hpc_sandbox.singularity import SingularitySandbox
 
     provider = make_provider(tmp_path, extra_start_args=["--fakeroot"])
     sandbox = SingularitySandbox(provider, SandboxSpec(image="x.sif"))
     assert sandbox._user() == {"remap_root": True, "container_uid": 0}
+
+
+async def test_stderr_up_to_the_limit_is_not_truncated(tmp_path, sif, fake_runtime):
+    provider = make_provider(tmp_path, output_limit_bytes=4096)
+    async with await provider.start(SandboxSpec(image=str(sif))) as sandbox:
+        result = await sandbox.exec("head -c 4096 /dev/zero | tr '\\0' x >&2")
+    assert result.stderr == "x" * 4096

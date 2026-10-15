@@ -17,16 +17,17 @@ import json
 import logging
 import os
 import re
+import shlex
 import stat
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, Generic, Self, TypeVar
+from typing import Any, Generic, NoReturn, Self, TypeVar
 
 from . import memory, safefs
 from .images import ImageStore, ResolvedImage
@@ -54,6 +55,17 @@ from .types import (
 log = logging.getLogger(__name__)
 
 SNAPSHOT_FORMAT = "hpc-sandbox/rootfs-v1"
+# Printed on stderr by each provider's prologue right before it executes the
+# command, and stripped from the result: without it, the command never ran.
+START_MARKER = "hpc-sandbox: command started"
+_START_LINE = f"{START_MARKER}\n".encode()
+# Names a shell may refuse to assign, which makes a POSIX shell exit: bash
+# makes these read-only, and dash takes only a number for OPTIND. The prologue
+# sets them only where the shell allows it.
+_SHELL_RESERVED = frozenset(
+    {"BASHOPTS", "BASHPID", "BASH_VERSINFO", "EUID", "OPTIND", "PPID", "SHELLOPTS", "UID"}
+)
+MIN_OUTPUT_LIMIT = 4096
 RESERVED_TARGETS = ("/tmp", "/var/tmp")
 TRANSFER_DIR = ".hpc-sandbox-transfer"
 # How long removing a transfer's files may take: code in the sandbox can keep
@@ -119,6 +131,8 @@ class SessionProvider(Generic[S]):
         output_limit_bytes: int,
         memory_poll_s: float,
     ) -> None:
+        if output_limit_bytes < MIN_OUTPUT_LIMIT:
+            raise ValueError(f"output_limit_bytes must be at least {MIN_OUTPUT_LIMIT}")
         self.scratch_root = Path(scratch_root) if scratch_root else default_scratch_root()
         self.default_timeout_s = default_timeout_s
         self.start_timeout_s = start_timeout_s
@@ -459,16 +473,19 @@ class SessionSandbox:
 
     async def _spawn(
         self,
-        argv: list[str],
+        command: list[str],
         *,
-        cwd: str,
-        env: Mapping[str, str],
         stdin: bytes | None,
         timeout_s: float,
         on_start: Callable[[int], None],
     ) -> ProcessResult:
-        """Run ``argv`` in the container with exactly ``env`` and working directory ``cwd``."""
+        """Run ``command`` (a :func:`prologue`) in the container with the container's
+        own environment, and report the host PID of the process it spawns."""
         raise NotImplementedError
+
+    def _full_environment(self, env: Mapping[str, str]) -> dict[str, str]:
+        """The variables a command gets on top of what the runtime sets up."""
+        return dict(env)
 
     def _container_alive(self) -> bool:
         raise NotImplementedError
@@ -572,25 +589,43 @@ class SessionSandbox:
 
         try:
             result = await self._spawn(
-                argv, cwd=cwd, env=env, stdin=stdin, timeout_s=timeout_s, on_start=started
+                prologue(argv, cwd, stdin=stdin is not None),
+                stdin=environment_script(self._full_environment(env)) + (stdin or b""),
+                timeout_s=timeout_s,
+                on_start=started,
             )
         finally:
             for pid in roots:
                 self._execs.pop(pid, None)
         if self._stop_task is not None:
             raise SandboxError(f"sandbox {self.id} was stopped while the command ran")
+        started_command, raw_stderr = split_start_marker(result.stderr)
         stdout = result.stdout.decode(errors="replace")
-        stderr = result.stderr.decode(errors="replace")
+        stderr = raw_stderr.decode(errors="replace")
+        if not started_command:
+            if not self._container_alive():
+                self._mark_lost(stderr)
+            state = "timed out" if result.timed_out else f"exit {result.returncode}"
+            detail = (stderr + stdout).strip() or "no output"
+            raise SandboxError(f"sandbox {self.id}: the command did not start ({state}): {detail}")
         if result.timed_out:
             note = f"hpc-sandbox: command timed out after {timeout_s:g} s"
             return ExecResult(TIMEOUT_EXIT_CODE, stdout, _append(stderr, note), timed_out=True)
         if kills:
             return ExecResult(137, stdout, _append(stderr, kills[-1].message()))
         if result.returncode != 0 and not self._container_alive():
-            self._running = False
-            self._lost = stderr.strip() or "the container process is gone"
-            raise SandboxLostError(f"sandbox {self.id} lost its container: {self._lost}")
+            self._mark_lost(stderr)
         return ExecResult(result.returncode, stdout, stderr)
+
+    def _mark_lost(self, detail: str) -> NoReturn:
+        self._running = False
+        self._lost = detail.strip() or "the container process is gone"
+        raise SandboxLostError(f"sandbox {self.id} lost its container: {self._lost}")
+
+    @property
+    def _output_limit(self) -> int:
+        """Bytes captured per stream: the provider's limit plus the start marker."""
+        return self._provider.output_limit_bytes + len(_START_LINE)
 
     @asynccontextmanager
     async def _transfer(self) -> AsyncIterator[tuple[int, str]]:
@@ -707,6 +742,10 @@ def check_env(env: Mapping[str, str]) -> None:
             raise ValueError(f"invalid environment variable name {key!r}")
         if "\0" in value:
             raise ValueError(f"environment variable {key} contains a NUL byte")
+        try:
+            os.fsencode(value)
+        except UnicodeEncodeError:
+            raise ValueError(f"environment variable {key} is not encodable text") from None
 
 
 def make_owner_writable(rootfs: Path) -> None:
@@ -725,6 +764,76 @@ def make_owner_writable(rootfs: Path) -> None:
             wanted = 0o700 if stat.S_ISDIR(info.st_mode) else 0o600
             if stat.S_IMODE(info.st_mode) & wanted != wanted:
                 path.chmod(stat.S_IMODE(info.st_mode) | wanted)
+
+
+# Run by /bin/sh -c with the working directory, the start marker, "stdin" or
+# "none", and the command as positional parameters. The first line of stdin is
+# the environment (see environment_script); `read` takes it a byte at a time,
+# so the command gets exactly the rest, or /dev/null if the caller sent none.
+_PROLOGUE = """\
+hpc_sandbox_nl='
+'
+IFS= read -r hpc_sandbox_env || exit
+eval "$hpc_sandbox_env" || exit
+cd -- "$1" || exit
+[ "$3" = stdin ] || exec </dev/null || exit
+printf '%s\\n' "$2" >&2
+shift 3
+exec "$@"
+"""
+_NEWLINE = '"$hpc_sandbox_nl"'  # how environment_script writes a newline
+
+
+def prologue(argv: Sequence[str], cwd: str, *, stdin: bool) -> list[str]:
+    """``argv`` run by ``/bin/sh`` in ``cwd``, with the environment read from stdin.
+
+    Send :func:`environment_script` ahead of the command's own stdin; without
+    ``stdin``, the command reads /dev/null as if none were given. The prologue
+    announces the start on stderr once everything else has succeeded. The
+    working directory is entered here because some runtimes silently fall
+    back to another one; a missing one, or a missing environment line, ends
+    the prologue before the announcement.
+    """
+    mode = "stdin" if stdin else "none"
+    return ["/bin/sh", "-c", _PROLOGUE, "hpc-sandbox", cwd, START_MARKER, mode, *argv]
+
+
+def environment_script(env: Mapping[str, str]) -> bytes:
+    """One line of shell that exports ``env`` verbatim (POSIX quoting).
+
+    It travels through stdin rather than on a command line, where every user
+    of the node could read the values, or through a file, which would make
+    commands depend on the sandbox's own filesystem. Newlines in values are
+    written as a variable the prologue sets, so the line never breaks. Names
+    a shell may refuse are set only where it allows them, since a refused
+    assignment makes a POSIX shell exit, and bash's warnings about locales
+    the image lacks are not the command's output. Values that are not UTF-8
+    come back as the bytes they were decoded from (see :func:`os.fsdecode`).
+    """
+    commands = []
+    # A variable of the prologue's own name goes last, after every use of it.
+    for key, value in sorted(env.items(), key=lambda item: item[0] == "hpc_sandbox_nl"):
+        quoted = _NEWLINE.join(shlex.quote(part) for part in value.split("\n"))
+        assignment = f"{key}={quoted}"
+        if key in _SHELL_RESERVED:
+            commands.append(f"if ({assignment}) 2>/dev/null; then export {assignment}; fi")
+        elif key == "LANG" or key.startswith("LC_"):
+            commands.append(f"export {assignment} 2>/dev/null")
+        else:
+            commands.append(f"export {assignment}")
+    return os.fsencode("; ".join(commands) + "\n")
+
+
+def split_start_marker(stderr: bytes) -> tuple[bool, bytes]:
+    """Whether the prologue's start marker is in ``stderr``, and ``stderr`` without it.
+
+    The runtime may print warnings before the prologue runs, so only the first
+    occurrence counts (the command's own output comes after it).
+    """
+    index = stderr.find(_START_LINE)
+    if index < 0:
+        return False, stderr
+    return True, stderr[:index] + stderr[index + len(_START_LINE) :]
 
 
 def _append(text: str, line: str) -> str:

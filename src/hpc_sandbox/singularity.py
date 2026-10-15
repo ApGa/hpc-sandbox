@@ -28,11 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shlex
 import signal
 import stat
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -306,24 +305,23 @@ class SingularitySandbox(SessionSandbox):
 
     async def _spawn(
         self,
-        argv: list[str],
+        command: list[str],
         *,
-        cwd: str,
-        env: Mapping[str, str],
         stdin: bytes | None,
         timeout_s: float,
         on_start: Callable[[int], None],
     ) -> ProcessResult:
+        # The prologue enters the working directory; "/" always exists.
         return await self._runtime.run(
             "exec",
             "--cleanenv",
             "--cwd",
-            cwd,
+            "/",
             f"instance://{self.id}",
-            *with_env(argv, env),
+            *command,
             timeout_s=timeout_s,
             stdin=stdin,
-            output_limit=self._provider.output_limit_bytes,
+            output_limit=self._output_limit,
             on_start=on_start,
         )
 
@@ -347,18 +345,6 @@ class SingularitySandbox(SessionSandbox):
                 timeout_s=self._provider.stop_timeout_s,
             )
         self._instance_may_exist = False
-
-
-def with_env(argv: list[str], env: Mapping[str, str]) -> list[str]:
-    """Wrap ``argv`` so it runs with ``env`` exported, values passed verbatim.
-
-    ``--env`` splits on commas and ``--env-file`` is shell-evaluated by the
-    runtime, so values are POSIX-quoted into a tiny ``sh`` prologue instead.
-    """
-    if not env:
-        return argv
-    exports = "".join(f"export {key}={shlex.quote(value)}\n" for key, value in env.items())
-    return ["/bin/sh", "-c", f'{exports}exec "$@"', "hpc-sandbox", *argv]
 
 
 def make_mount_point(rootfs: Path, target: str, *, directory: bool) -> None:

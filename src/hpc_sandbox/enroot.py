@@ -17,9 +17,11 @@ therefore built around one long-lived ``enroot start``:
   leaves only files behind.
 - **Commands** enter the init's namespaces and root directory with
   ``nsenter``, in two steps (the PID and IPC namespaces belong to the
-  launcher's user namespace, the mounts to enroot's nested one), and run with
-  the container's environment plus the requested variables. Each command
-  costs a couple of milliseconds instead of a full ``enroot start``.
+  launcher's user namespace, the mounts to enroot's nested one). The
+  container's environment plus the requested variables is exported by a
+  prologue inside the container; the host-side ``nsenter`` processes run with
+  a minimal environment. Each command costs a couple of milliseconds instead
+  of a full ``enroot start``.
 - **Isolation from the site.** ``enroot start`` runs with a minimal
   environment: the home directory is not mounted (``ENROOT_MOUNT_HOME=no``;
   an empty value would fall back to the site default), the login shell and
@@ -58,7 +60,7 @@ from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import RUNTIME_CANDIDATES
 from .sandbox import SessionProvider, SessionSandbox, make_owner_writable, poll
 from .sessions import Session
-from .types import SandboxError, SandboxLostError, SandboxSpec, SandboxStartError
+from .types import SandboxError, SandboxSpec, SandboxStartError
 
 ANCHOR_SCRIPT = Path(__file__).with_name("anchor.py")
 READY = "hpc-sandbox-ready"
@@ -71,8 +73,9 @@ while :; do sleep 86400 & wait $!; done
 """
 RC_FILE = "rc"
 ANCHOR_LOG = "anchor.log"
-# Runs a command in a working directory: sh -c ENTER hpc-sandbox CWD ARGV...
-_ENTER = 'cd -- "$1" && shift && exec "$@"'
+# The environment of host-side helpers (nsenter): enough to run them, nothing
+# the container could have chosen.
+_HOST_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _SHELL_STATE = ("PWD", "OLDPWD", "SHLVL", "_")
 _DOCKER_HUB = ("docker.io", "index.docker.io", "registry-1.docker.io")
 _KILL_WAIT_S = 5.0
@@ -626,27 +629,28 @@ class EnrootSandbox(SessionSandbox):
 
     async def _spawn(
         self,
-        argv: list[str],
+        command: list[str],
         *,
-        cwd: str,
-        env: Mapping[str, str],
         stdin: bytes | None,
         timeout_s: float,
         on_start: Callable[[int], None],
     ) -> ProcessResult:
         # Re-prove the init's identity: nsenter must never enter a recycled PID.
         if not self._container_alive():
-            self._running = False
-            self._lost = "the container's init process is gone"
-            raise SandboxLostError(f"sandbox {self.id} lost its container: {self._lost}")
+            self._mark_lost("the container's init process is gone")
+        # The container's environment reaches the command through the prologue's
+        # stdin, never the host-side nsenter processes (think LD_PRELOAD).
         return await run_process(
-            [*self._enter_args(), "/bin/sh", "-c", _ENTER, "hpc-sandbox", cwd, *argv],
+            [*self._enter_args(), *command],
             timeout_s=timeout_s,
             stdin=stdin,
-            env={**self._environment, **env},
-            output_limit=self._provider.output_limit_bytes,
+            env={"PATH": _HOST_PATH},
+            output_limit=self._output_limit,
             on_start=on_start,
         )
+
+    def _full_environment(self, env: Mapping[str, str]) -> dict[str, str]:
+        return {**self._environment, **env}
 
     def _container_alive(self) -> bool:
         return (

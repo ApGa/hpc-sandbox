@@ -254,3 +254,25 @@ async def test_transfers_ignore_symlinks_the_sandbox_plants(provider, tmp_path):
     await sandbox.download("/app/in.txt", tmp_path / "back.txt")
     assert (tmp_path / "back.txt").read_text() == "payload\n"
     assert not any(outside.iterdir())
+
+
+@enroot_only
+async def test_commands_survive_a_sandbox_mounting_over_its_tmp(provider):
+    sandbox = await provider.start(SandboxSpec(image=IMAGE, env={"FROM_SPEC": "1"}))
+    mounted = await sandbox.exec("mount -t tmpfs tmpfs /tmp && echo mounted")
+    assert mounted.stdout == "mounted\n", mounted.stderr
+    result = await sandbox.exec('echo "$FROM_SPEC"; cat', stdin=b"in\n")
+    assert result.stdout == "1\nin\n", result.stderr
+
+
+async def test_commands_without_stdin_read_dev_null(provider):
+    sandbox = await provider.start(SandboxSpec(image=IMAGE))
+    result = await sandbox.exec("[ -c /proc/self/fd/0 ] && echo null; cat")
+    assert result.stdout == "null\n", result.stderr
+
+
+async def test_names_a_shell_reserves_do_not_stop_commands(provider):
+    reserved = {"OPTIND": "x", "BASHPID": "1", "UID": "5", "LC_ALL": "no-such-locale"}
+    sandbox = await provider.start(SandboxSpec(image=IMAGE, env={"FROM_SPEC": "1"}))
+    result = await sandbox.exec('echo "$FROM_SPEC"', env=reserved)
+    assert (result.exit_code, result.stdout) == (0, "1\n"), result.stderr

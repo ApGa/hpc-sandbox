@@ -221,8 +221,8 @@ def exec_(args: list[str]) -> int:
     mapper = Mapper(record)
     try:
         os.chdir(mapper.host(options.get("--cwd", ["/"])[0]))
-    except OSError as error:
-        return fail(f"could not change directory: {error}")
+    except OSError:
+        os.chdir(mapper.host("/"))  # like Singularity CE: a missing --cwd falls back to /
     command = [
         arg
         if index == 0 or command[index - 1] == "-c" or not arg.startswith("/")

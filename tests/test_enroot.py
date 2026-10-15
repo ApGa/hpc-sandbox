@@ -514,6 +514,16 @@ async def test_sessions_record_their_provider_and_user(enroot_provider, sqsh):
     await enroot_provider.delete_snapshot(snapshot)
 
 
+async def test_a_command_that_never_started_is_an_infrastructure_error(enroot_provider, sqsh):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    with pytest.raises(SandboxError, match="did not start.*/does/not/exist"):
+        await sandbox.exec("true", cwd="/does/not/exist")
+    missing = await sandbox.exec(["/no/such/program"])
+    assert missing.exit_code == 127 and "command started" not in missing.stderr
+    result = await sandbox.exec("echo out; echo err >&2")
+    assert (result.stdout, result.stderr) == ("out\n", "err\n")
+
+
 async def test_downloads_do_not_need_to_preserve_unmapped_owners(enroot_provider, sqsh, tmp_path):
     shared = Path("/usr/share")  # root-owned on the host: an unmapped owner in the sandbox
     sandbox = await enroot_provider.start(
@@ -526,6 +536,17 @@ async def test_downloads_do_not_need_to_preserve_unmapped_owners(enroot_provider
     )
     await sandbox.download(f"/mnt/shared/{source.name}", tmp_path / "copy")
     assert (tmp_path / "copy").read_bytes() == source.read_bytes()
+
+
+async def test_the_environment_never_reaches_host_helpers(enroot_provider, sqsh, tmp_path):
+    not_a_library = tmp_path / "not-a-library.so"  # exists on the host only
+    not_a_library.write_text("text")
+    sandbox = await enroot_provider.start(
+        SandboxSpec(image=str(sqsh), env={"LD_PRELOAD": str(not_a_library)})
+    )
+    result = await sandbox.exec('echo "$LD_PRELOAD"')
+    assert result.stdout == f"{not_a_library}\n"
+    assert "ELF" not in result.stderr  # the host's nsenter did not try to load it
 
 
 async def test_downloads_of_unreadable_files_and_special_files(enroot_provider, sqsh, tmp_path):
@@ -605,6 +626,25 @@ async def test_transfers_never_follow_what_the_sandbox_plants(enroot_provider, s
     assert not any(outside.iterdir())
 
 
+async def test_environment_values_stay_off_command_lines(enroot_provider, sqsh):
+    secret = "tok-" + "s3cret" * 4
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), env={"API_TOKEN": secret}))
+    # 200 kB in all: more than one command-line argument may hold (each variable stays
+    # below the kernel's 128 KiB limit for a single string).
+    large = {f"LARGE_{index}": "x" * 10_000 for index in range(20)}
+    task = asyncio.create_task(sandbox.exec("sleep 1; echo $API_TOKEN", env=large))
+    seen = []
+    while not task.done():
+        for proc in Path("/proc").iterdir():
+            try:
+                seen.append(secret in (proc / "cmdline").read_text(errors="replace"))
+            except OSError:
+                continue
+        await asyncio.sleep(0.05)
+    result = await task
+    assert result.stdout == f"{secret}\n" and not any(seen)
+
+
 async def test_snapshots_of_a_busy_sandbox_fail_cleanly_if_at_all(enroot_provider, sqsh):
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
     churn = asyncio.create_task(
@@ -669,6 +709,24 @@ def test_snapshot_preparation_opens_only_enroots_placeholders(tmp_path):
     finally:
         with safefs.opened_dir(tmp_path) as fd:
             safefs.remove("rootfs", fd)  # too deep for pytest's recursive cleanup
+
+
+async def test_commands_need_nothing_from_the_sandboxs_tmp(enroot_provider, sqsh):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), env={"FROM_SPEC": "1"}))
+    mounted = await sandbox.exec("mount -t tmpfs tmpfs /tmp && echo mounted")
+    if mounted.exit_code != 0:
+        pytest.skip(f"cannot mount in the fake container: {mounted.stderr}")
+    result = await sandbox.exec('echo "$FROM_SPEC $EXTRA"; cat', env={"EXTRA": "x"}, stdin=b"in\n")
+    assert result.stdout == "1 x\nin\n" and result.exit_code == 0, result
+    assert (await sandbox.exec("umount /tmp && echo unmounted")).stdout == "unmounted\n"
+
+
+async def test_commands_without_stdin_read_dev_null(enroot_provider, sqsh):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    result = await sandbox.exec("[ -c /proc/self/fd/0 ] && echo null; cat")
+    assert result.stdout == "null\n", result
+    piped = await sandbox.exec("[ -p /proc/self/fd/0 ] && echo pipe; cat", stdin=b"in")
+    assert piped.stdout == "pipe\nin", piped
 
 
 async def test_host_side_transfer_errors_stay_os_errors(enroot_provider, sqsh, tmp_path):
