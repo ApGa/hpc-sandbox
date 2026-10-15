@@ -556,6 +556,24 @@ async def test_imports_get_only_what_pulling_needs(tmp_path, fake_enroot, monkey
     assert env["ENROOT_SQUASH_OPTIONS"] == "-comp zstd"
 
 
+def test_singularity_option_names_are_accepted(tmp_path, fake_enroot):
+    def provider(**options):
+        return make_enroot_provider(tmp_path, **options)
+
+    assert provider(gpu="nv").gpus == "all"
+    assert "network_none" not in provider(allow_network_none=False).capabilities
+    assert "network_none" in provider(allow_network_none=True, stop_grace_s=5).capabilities
+    for options in ({"gpu": "rocm"}, {"gpu": "nv", "gpus": "0"}, {"cgroup_limits": True}):
+        with pytest.raises(ValueError):
+            provider(**options)
+
+
+async def test_network_none_can_be_turned_off(tmp_path, sqsh):
+    provider = make_enroot_provider(tmp_path, allow_network_none=False)
+    with pytest.raises(ValueError, match="allow_network_none"):
+        await provider.start(SandboxSpec(image=str(sqsh), network="none"))
+
+
 async def test_downloads_do_not_need_to_preserve_unmapped_owners(enroot_provider, sqsh, tmp_path):
     shared = Path("/usr/share")  # root-owned on the host: an unmapped owner in the sandbox
     sandbox = await enroot_provider.start(

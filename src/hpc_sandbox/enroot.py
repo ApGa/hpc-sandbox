@@ -59,7 +59,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from . import procfs, safefs
 from .images import (
@@ -612,8 +612,17 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     use (inside a Slurm allocation, the allocated ones), a list such as
     ``"0,1"`` selects GPUs numbered as this process sees them. Sandboxes are
     killed when the process that started them exits.
+
+    The :class:`~hpc_sandbox.singularity.SingularityProvider` option names are
+    accepted too, so one set of options works for both: ``gpu="nv"`` means
+    ``gpus="all"``; ``allow_network_none=False`` refuses ``network="none"``,
+    which is otherwise always available because every sandbox gets its own
+    network namespace; ``stop_grace_s`` is ignored because sandboxes are
+    stopped with SIGKILL. ``gpu="rocm"`` and ``cgroup_limits=True`` cannot be
+    honored and raise ValueError, as does a setting given under both names.
     """
 
+    network_none_hint = "network 'none' was turned off with allow_network_none=False"
     name = "enroot"
     sessions_directory = "sessions-enroot"
 
@@ -634,7 +643,22 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         extra_start_args: Sequence[str] = (),
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT,
         memory_poll_s: float = 1.0,
+        gpu: Literal["nv", "rocm"] | None = None,
+        allow_network_none: bool | None = None,
+        stop_grace_s: float | None = None,
+        cgroup_limits: bool = False,
     ) -> None:
+        if gpu is not None:
+            if gpus is not None:
+                raise ValueError("give gpus or gpu, not both")
+            if gpu != "nv":
+                raise ValueError(f"the enroot provider passes NVIDIA GPUs only, not gpu={gpu!r}")
+            gpus = "all"
+        if cgroup_limits:
+            raise ValueError(
+                "the enroot provider cannot apply cgroup limits; memory_mb arms the memory watchdog"
+            )
+        del stop_grace_s  # SIGKILL needs no grace period
         super().__init__(
             scratch_root=scratch_root,
             default_timeout_s=default_timeout_s,
@@ -667,7 +691,9 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         self.bind_resolv_conf = bind_resolv_conf
         self.extra_start_args = tuple(extra_start_args)
         self.capabilities = frozenset(
-            {"snapshot", "isolation", "network_none"} | ({"gpu"} if gpus else set())
+            {"snapshot", "isolation"}
+            | ({"network_none"} if allow_network_none is not False else set())
+            | ({"gpu"} if gpus else set())
         )
         self._nsenter: str | None = None
         self._sysconf: asyncio.Future[None] | None = None

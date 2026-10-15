@@ -64,7 +64,7 @@ the runtime underneath.
 | Images | SIF (pulled with `singularity pull`) | squashfs (imported with `enroot import`) |
 | Inside the sandbox | your uid | root mapped to your uid (or your uid) |
 | Per-command overhead | one `singularity exec` | about 2 ms (`nsenter`) |
-| `network="none"` | where the site allows network namespaces | always |
+| `network="none"` | where the site allows network namespaces | always, unless `allow_network_none=False` |
 | After the owner process dies | instances keep running until a janitor stops them | everything is killed at once; a janitor removes the files |
 
 ## Command line
@@ -296,6 +296,14 @@ Options both providers take:
 | `remap_root` | True | Run as root inside the sandbox (`enroot start --root`); False runs as your uid. |
 | `import_env` | () | Extra variables for `enroot import`: names, or prefixes such as `"AWS_*"`. |
 | `gpus` | None | Handed to enroot's NVIDIA hook as `NVIDIA_VISIBLE_DEVICES`: `"all"` for every GPU the process may use (inside a Slurm allocation, the allocated ones), or a list such as `"0,1"` numbered as the job sees its GPUs (like `CUDA_VISIBLE_DEVICES`, not the host indices in `SLURM_STEP_GPUS`). Adds the `gpu` capability. |
+
+`EnrootProvider` also accepts the `SingularityProvider` names, so one set of
+options works for both runtimes: `gpu="nv"` means `gpus="all"`;
+`allow_network_none=False` refuses `network="none"`, which is otherwise
+always available because every enroot sandbox has its own network namespace;
+`stop_grace_s` is ignored because enroot sandboxes are stopped with SIGKILL.
+`gpu="rocm"`, `cgroup_limits=True` and a setting given under both names raise
+`ValueError`.
 
 Default scratch root: `$HPC_SANDBOX_SCRATCH`, else `$PBS_LOCALDIR/hpc-sandbox`,
 else `/local/$PBS_JOBID/hpc-sandbox` when it exists, else
