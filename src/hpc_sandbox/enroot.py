@@ -23,12 +23,19 @@ therefore built around one long-lived ``enroot start``:
   a minimal environment. Each command costs a couple of milliseconds instead
   of a full ``enroot start``.
 - **Isolation from the site.** ``enroot start`` runs with a minimal
-  environment: the home directory is not mounted (``ENROOT_MOUNT_HOME=no``;
-  an empty value would fall back to the site default), the login shell and
-  user-level enroot configuration are skipped, ``/dev`` is restricted, the
-  NVIDIA and Mellanox hooks stay off unless GPUs are requested, and batch-job
-  variables do not reach site hooks. ``/tmp`` and ``/var/tmp`` are
+  environment and a system configuration the provider writes instead of the
+  site's ``/etc/enroot``: enroot's standard system mounts, a minimal ``/dev``,
+  and only the standard hooks sandboxes need. The home directory is not
+  mounted (``ENROOT_MOUNT_HOME=no``; an empty value would fall back to the
+  site default), the login shell and user-level enroot configuration are
+  skipped, the NVIDIA and Mellanox hooks stay off unless GPUs are requested,
+  and batch-job variables do not reach hooks. ``/tmp`` and ``/var/tmp`` are
   session-private directories and ``/dev/shm`` is a private tmpfs.
+- **Restores** start from files that code in the sandbox wrote, so enroot
+  must not act on them from the host: its ``/etc/fstab`` and
+  ``/etc/environment`` are set aside while the container starts, hooks that
+  write into the rootfs do not run (their results are in the snapshot), and
+  commands get the environment recorded with the snapshot.
 
 Host requirements: enroot 3.x with its ``+caps`` helpers for imports,
 util-linux ``nsenter`` and unprivileged user namespaces.
@@ -37,13 +44,19 @@ util-linux ``nsenter`` and unprivileged user namespaces.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -64,9 +77,10 @@ from .paths import default_image_cache, should_stage
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import RUNTIME_CANDIDATES
 from .sandbox import SessionProvider, SessionSandbox, make_owner_writable, poll
-from .sessions import Session
+from .sessions import Session, remove_tree
 from .types import SandboxError, SandboxSpec, SandboxStartError
 
+log = logging.getLogger(__name__)
 ANCHOR_SCRIPT = Path(__file__).with_name("anchor.py")
 READY = "hpc-sandbox-ready"
 KEEPALIVE = f"""\
@@ -82,8 +96,85 @@ ANCHOR_LOG = "anchor.log"
 # the container could have chosen.
 _HOST_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _SHELL_STATE = ("PWD", "OLDPWD", "SHLVL", "_")
+ENVIRONMENT_FILE = "environment.json"
+# Variables `enroot import` may need from the caller, besides ENROOT_* settings.
+_IMPORT_ENV = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "TAR_OPTIONS",
+        "SOURCE_DATE_EPOCH",
+        "REGISTRY_AUTH_FILE",
+        "CONTAINER_HOST",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "CURL_CA_BUNDLE",
+        *(f"{name}_proxy" for name in ("http", "https", "all", "no")),
+        *(f"{name}_PROXY" for name in ("HTTP", "HTTPS", "ALL", "NO")),
+    }
+)
+# Prefixes of variables enroot settings and dockerd:// and podman:// imports need.
+_IMPORT_PREFIXES = ("ENROOT_", "DOCKER_", "CONTAINERS_")
+# The configuration section of the enroot script, which loads enroot.conf and
+# its drop-ins and sets the defaults.
+_CONFIG_SECTION = re.compile(
+    r"^# -+ BEGIN CONFIG -+\n(.*?)^# -+ END CONFIG -+$", re.MULTILINE | re.DOTALL
+)
+_SETTING_TIMEOUT_S = 30.0
+_VARIABLE_REFERENCE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 _DOCKER_HUB = ("docker.io", "index.docker.io", "registry-1.docker.io")
 _KILL_WAIT_S = 5.0
+# The mounts every sandbox starts with: enroot's standard system mounts, with
+# a minimal /dev built here rather than by a hook (a /dev that depends on a
+# hook falls back to the host's whole /dev when the hook is missing), and the
+# host's /etc/hosts. /tmp, /var/tmp and /dev/shm are mounted per sandbox.
+SYSTEM_FSTAB = """\
+/proc        /proc        none    x-create=dir,rbind,rw,nosuid,nodev,noexec,rslave  0 -1
+/sys         /sys         none    x-create=dir,rbind,ro,nosuid,nodev,noexec,rslave  0 -1
+tmpfs        /dev         tmpfs   x-create=dir,rw,nosuid,noexec,mode=755,slave      0 -1
+/dev/null    /dev/null    none    x-create=file,bind,rw,nosuid,noexec,private       0 -1
+/dev/zero    /dev/zero    none    x-create=file,bind,rw,nosuid,noexec,private       0 -1
+/dev/full    /dev/full    none    x-create=file,bind,rw,nosuid,noexec,private       0 -1
+/dev/random  /dev/random  none    x-create=file,bind,rw,nosuid,noexec,private       0 -1
+/dev/urandom /dev/urandom none    x-create=file,bind,rw,nosuid,noexec,private       0 -1
+/dev/tty     /dev/tty     none    x-create=file,bind,rw,nosuid,noexec,private       0 -1
+devpts       /dev/pts     devpts  x-create=dir,rw,nosuid,noexec,newinstance,ptmxmode=0666,mode=620,slave 0 -1
+tmpfs        /var/run     tmpfs   x-create=dir,rw,nosuid,nodev,mode=755,slave       0 -1
+tmpfs        /var/lock    tmpfs   x-create=dir,rw,nosuid,nodev,mode=755,slave       0 -1
+/etc/hosts   /etc/hosts   none    x-create=file,bind,ro,nosuid,nodev,noexec,private 0 -1
+"""
+# The symlinks of the minimal /dev, created after the mounts above.
+DEV_LINKS_HOOK = """\
+#!/bin/sh
+# Written by hpc-sandbox: the symlinks of a minimal /dev.
+set -eu
+ln -s /proc/self/fd "${ENROOT_ROOTFS}/dev/fd"
+ln -s /proc/self/fd/0 "${ENROOT_ROOTFS}/dev/stdin"
+ln -s /proc/self/fd/1 "${ENROOT_ROOTFS}/dev/stdout"
+ln -s /proc/self/fd/2 "${ENROOT_ROOTFS}/dev/stderr"
+ln -s /dev/pts/ptmx "${ENROOT_ROOTFS}/dev/ptmx"
+"""
+DEV_LINKS_NAME = "10-hpc-sandbox-dev.sh"
+# Hooks shipped with enroot that sandboxes use when the installation has them
+# enabled: passwd and group entries for the mapped user, apt working as
+# remapped root, and NVIDIA GPUs (it acts only with gpus set).
+STANDARD_HOOKS = ("10-aptfix.sh", "10-shadow.sh", "98-nvidia.sh")
+# Of those, the ones a restore runs. A restored rootfs was written by code in
+# the sandbox, and the other hooks write into it with host-side shell code that
+# follows its symlinks; their results are in the snapshot anyway. The NVIDIA
+# hook defers to nvidia-container-cli, which is built to configure untrusted
+# root filesystems: it resolves paths inside the rootfs and runs the rootfs's
+# ldconfig inside the container.
+RESTORE_HOOKS = ("98-nvidia.sh",)
 
 # Enroot 3.5's whiteout converter aborts with EEXIST when a layer contains both
 # a whiteout and an entry of the same name, and cannot unlink whiteouts below
@@ -194,14 +285,15 @@ def import_uri(reference: str) -> str:
 
 
 class EnrootRuntime:
-    """The enroot command line, run with environments this package controls.
+    """The enroot command line, run with environments and configuration this package controls.
 
     ``cache_dir`` and ``temp_dir`` hold layers and extraction space for
     imports unless the caller's environment already sets ``ENROOT_CACHE_PATH``
-    or ``ENROOT_TEMP_PATH``; ``config_dir`` is an empty directory used as
-    ``ENROOT_CONFIG_PATH`` when containers start, so user-level hooks, mounts
-    and environment files never apply to sandboxes. ``tools_dir`` receives the
-    whiteout converter wrapper.
+    or ``ENROOT_TEMP_PATH``. When containers start, ``config_dir`` is an empty
+    ``ENROOT_CONFIG_PATH``, so user-level hooks, mounts and environment files
+    never apply, and a system configuration written below ``sysconf_root``
+    replaces the installation's; see :meth:`prepare_sysconf`. ``tools_dir``
+    receives the whiteout converter wrapper.
     """
 
     def __init__(
@@ -211,13 +303,19 @@ class EnrootRuntime:
         cache_dir: Path,
         temp_dir: Path,
         config_dir: Path,
+        sysconf_root: Path,
         tools_dir: Path,
+        import_env: Sequence[str] = (),
     ) -> None:
         self.binary = binary
         self.cache_dir = cache_dir
         self.temp_dir = temp_dir
         self.config_dir = config_dir
+        self.sysconf_root = sysconf_root
+        self.sysconf_dir: Path | None = None
+        self.restore_sysconf_dir: Path | None = None
         self.tools_dir = tools_dir
+        self.import_env = tuple(import_env)
         self._path: str | None = None
 
     @property
@@ -228,6 +326,132 @@ class EnrootRuntime:
                 raise SandboxError(f"enroot executable {self.binary or 'enroot'!r} is not on PATH")
             self._path = resolved
         return self._path
+
+    def enroot_conf(self) -> Path:
+        """The configuration file the enroot installation reads."""
+        match = re.search(r'config::init\s+"([^"$]+)"', self._script())
+        return Path(match.group(1)) if match else Path("/etc/enroot/enroot.conf")
+
+    def setting(self, key: str) -> str | None:
+        """The value enroot itself would use for ``key``, or None if it is unset or false.
+
+        bash runs the configuration section of the installed ``enroot``
+        script, without the directories it creates, so the environment,
+        ``enroot.conf``, its drop-ins and enroot's defaults combine exactly as
+        they do for enroot. Without that section, only the environment counts.
+        """
+        match = _CONFIG_SECTION.search(self._script())
+        if match is None:
+            return os.environ.get(key) or None
+        section = "".join(
+            line for line in match.group(1).splitlines(keepends=True) if "mkdir" not in line
+        )
+        script = (
+            "hpc_sandbox_key=$1\nshift\nset -euo pipefail\n"
+            f'{section}\nprintf "%s" "${{!hpc_sandbox_key-}}"\n'
+        )
+        try:
+            process = subprocess.Popen(
+                ["bash", "-c", script, "enroot-config", key],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            return None
+        try:
+            output, _ = process.communicate(timeout=_SETTING_TIMEOUT_S)
+        except subprocess.TimeoutExpired:  # a $(command) in enroot.conf hangs
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            assert process.stdout is not None
+            process.stdout.close()
+            return None
+        value = output.decode(errors="replace")
+        return value if process.returncode == 0 and value else None
+
+    def site_sysconf(self) -> Path:
+        """The installation's system configuration directory, found as enroot finds it.
+
+        :meth:`setting`, else the default written in the enroot script (which
+        depends on how enroot was installed).
+        """
+        if configured := self.setting("ENROOT_SYSCONF_PATH"):
+            return Path(configured)
+        match = re.search(r'config::export\s+ENROOT_SYSCONF_PATH\s+"([^"$]+)"', self._script())
+        return Path(match.group(1)) if match else self.enroot_conf().parent
+
+    def _script(self) -> str:
+        try:
+            return Path(self.path).read_text(errors="replace")
+        except (OSError, SandboxError):
+            return ""
+
+    def prepare_sysconf(self, *, gpus: bool) -> list[str]:
+        """Write the system configurations sandboxes start with; return the hooks skipped.
+
+        Sites extend their enroot configuration for interactive jobs (home
+        directories, cgroups, Slurm and PMIx variables, entrypoints, terminal
+        settings) with things that do not belong in sandboxes. Sandboxes get
+        :data:`SYSTEM_FSTAB`, no environment files, the ``/dev`` symlink hook
+        and those :data:`STANDARD_HOOKS` the installation has enabled, copied
+        from it; restored sandboxes only get :data:`RESTORE_HOOKS`. Each
+        configuration is written once into a directory named after its
+        content and never changed, so providers with other installations or
+        versions sharing the scratch root cannot alter it. Raises
+        SandboxError when ``gpus`` is set and the NVIDIA hook is missing.
+        """
+        source = self.site_sysconf() / "hooks.d"
+        hooks = {}
+        missing = []
+        for name in STANDARD_HOOKS:
+            path = source / name
+            try:
+                if not os.access(path, os.X_OK):
+                    raise OSError("not executable")  # enroot skips such hooks too
+                hooks[name] = path.read_bytes()
+            except OSError:
+                missing.append(name)
+        if gpus and "98-nvidia.sh" in missing:
+            raise SandboxError(
+                f"gpus needs enroot's NVIDIA hook, but {source}/98-nvidia.sh is not enabled"
+            )
+        self.sysconf_dir = self._publish_sysconf(hooks)
+        restore_hooks = {name: content for name, content in hooks.items() if name in RESTORE_HOOKS}
+        self.restore_sysconf_dir = self._publish_sysconf(restore_hooks)
+        return missing
+
+    def _publish_sysconf(self, hooks: dict[str, bytes]) -> Path:
+        files = {
+            "mounts.d/10-system.fstab": (SYSTEM_FSTAB.encode(), 0o600),
+            f"hooks.d/{DEV_LINKS_NAME}": (DEV_LINKS_HOOK.encode(), 0o700),
+            **{f"hooks.d/{name}": (content, 0o700) for name, content in hooks.items()},
+        }
+        digest = hashlib.sha256()
+        for name, (content, mode) in sorted(files.items()):
+            digest.update(f"{name}\0{mode:o}\0{len(content)}\0".encode() + content)
+        target = self.sysconf_root / digest.hexdigest()[:24]
+        if target.is_dir():
+            return target
+        self.sysconf_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".partial-", dir=self.sysconf_root))
+        try:
+            for child in ("hooks.d", "mounts.d", "environ.d"):
+                (staging / child).mkdir(mode=0o700)
+            for name, (content, mode) in files.items():
+                (staging / name).write_bytes(content)
+                (staging / name).chmod(mode)
+            staging.chmod(0o700)
+            try:
+                os.rename(staging, target)
+            except OSError:
+                if not target.is_dir():  # not just another process publishing the same
+                    raise
+        finally:
+            if staging.exists():
+                remove_tree(staging)
+        return target
 
     async def run(
         self, *args: str, env: Mapping[str, str], timeout_s: float, output_limit: int = 1 << 20
@@ -246,13 +470,26 @@ class EnrootRuntime:
         return result.stdout.decode(errors="replace").strip()
 
     def import_environment(self) -> dict[str, str]:
-        """The caller's environment (proxies, registry credentials) for ``enroot import``.
+        """The environment of ``enroot import``: what pulling needs.
 
-        Layers are extracted with GNU tar; ``--delay-directory-restore`` lets
-        images that revisit a read-only directory extract instead of failing
-        with ``Permission denied``.
+        Kept from the caller: ``PATH``, home and locale, XDG directories,
+        proxies, CA bundles, ``SOURCE_DATE_EPOCH``, ``ENROOT_*`` settings, the
+        Docker and Podman variables ``dockerd://`` and ``podman://`` imports
+        use, every variable the registry credentials file names (enroot
+        evaluates ``$VAR`` and ``$(command)`` password fields), and the names
+        or ``PREFIX*`` patterns in ``import_env``. Batch-job, GPU and other
+        variables are dropped. Layers are extracted with GNU tar;
+        ``--delay-directory-restore`` lets images that revisit a read-only
+        directory extract instead of failing with ``Permission denied``.
         """
-        env = dict(os.environ)
+        names = set(_IMPORT_ENV) | self.credential_variables()
+        prefixes = _IMPORT_PREFIXES + tuple(p[:-1] for p in self.import_env if p.endswith("*"))
+        names |= {name for name in self.import_env if not name.endswith("*")}
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in names or key.startswith(prefixes)
+        }
         env.setdefault("ENROOT_CACHE_PATH", str(self.cache_dir))
         env.setdefault("ENROOT_TEMP_PATH", str(self.temp_dir))
         tar_options = env.get("TAR_OPTIONS", "").split()
@@ -262,34 +499,41 @@ class EnrootRuntime:
         real = shutil.which("enroot-aufs2ovlfs", path=env.get("PATH"))
         if real is not None and Path(real).resolve() != wrapper.resolve():
             self.tools_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if not wrapper.is_file() or wrapper.read_text() != AUFS2OVLFS_WRAPPER:
-                temporary = wrapper.with_name(f".{wrapper.name}.{os.getpid()}")
-                temporary.write_text(AUFS2OVLFS_WRAPPER)
-                temporary.chmod(0o700)
-                os.replace(temporary, wrapper)
+            _publish(wrapper, AUFS2OVLFS_WRAPPER.encode(), 0o700)
             env["HPC_SANDBOX_REAL_AUFS2OVLFS"] = str(Path(real).resolve())
             env["PATH"] = os.pathsep.join([str(self.tools_dir), env.get("PATH", "")])
         return env
 
+    def _sysconf(self, restored: bool) -> Path:
+        directory = self.restore_sysconf_dir if restored else self.sysconf_dir
+        if directory is None:
+            raise SandboxError("the enroot system configuration has not been prepared")
+        return directory
+
+    def credential_variables(self) -> set[str]:
+        """Names of the variables enroot's registry credentials file refers to."""
+        configured = self.setting("ENROOT_CONFIG_PATH")
+        config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        directory = Path(configured) if configured else Path(config_home, "enroot")
+        try:
+            text = (directory / ".credentials").read_text(errors="replace")
+        except OSError:
+            return set()
+        return set(_VARIABLE_REFERENCE.findall(text))
+
     def container_environment(
-        self, session: Session, *, remap_root: bool, gpus: str | None
+        self, session: Session, *, remap_root: bool, gpus: str | None, restored: bool = False
     ) -> dict[str, str]:
         """The environment of ``enroot create`` and ``enroot start`` for ``session``.
 
         Only what enroot needs is passed, so batch-job and user variables never
-        reach site hooks. Boolean settings use explicit ``yes``/``no``: enroot
+        reach hooks. Boolean settings use explicit ``yes``/``no``: enroot
         treats an empty value as unset and falls back to the site default.
+        Restored sandboxes start with the restore system configuration.
         """
         env = {
             key: os.environ[key]
-            for key in (
-                "PATH",
-                "HOME",
-                "USER",
-                "LOGNAME",
-                "ENROOT_LIBRARY_PATH",
-                "ENROOT_SYSCONF_PATH",
-            )
+            for key in ("PATH", "HOME", "USER", "LOGNAME", "ENROOT_LIBRARY_PATH")
             if key in os.environ
         }
         env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
@@ -299,6 +543,7 @@ class EnrootRuntime:
             ENROOT_CACHE_PATH=str(self.cache_dir),
             ENROOT_TEMP_PATH=str(self.temp_dir),
             ENROOT_CONFIG_PATH=str(self.config_dir),
+            ENROOT_SYSCONF_PATH=str(self._sysconf(restored)),
             ENROOT_MOUNT_HOME="no",
             ENROOT_LOGIN_SHELL="no",
             ENROOT_RESTRICT_DEV="yes",
@@ -349,13 +594,10 @@ class SquashfsImages:
         return file_magic(path, 0, len(SQUASHFS_MAGIC)) == SQUASHFS_MAGIC
 
     async def pull(self, uri: str, target: Path, *, timeout_s: float) -> ProcessResult:
+        # Reading enroot's settings runs bash, which can take a while.
+        env = await asyncio.to_thread(self.runtime.import_environment)
         return await self.runtime.run(
-            "import",
-            "--output",
-            str(target),
-            uri,
-            env=self.runtime.import_environment(),
-            timeout_s=timeout_s,
+            "import", "--output", str(target), uri, env=env, timeout_s=timeout_s
         )
 
 
@@ -387,6 +629,8 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         stop_timeout_s: float = 60.0,
         remap_root: bool = True,
         gpus: str | None = None,
+        bind_resolv_conf: bool = True,
+        import_env: Sequence[str] = (),
         extra_start_args: Sequence[str] = (),
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT,
         memory_poll_s: float = 1.0,
@@ -405,7 +649,9 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
             cache_dir=self.scratch_root / "runtime-cache",
             temp_dir=self.scratch_root / "runtime-tmp",
             config_dir=self.scratch_root / "enroot-config",
+            sysconf_root=self.scratch_root / "enroot-sysconf",
             tools_dir=self.scratch_root / "enroot-tools",
+            import_env=import_env,
         )
         cache = Path(image_cache) if image_cache else default_image_cache()
         if stage_images is None:
@@ -418,11 +664,13 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         )
         self.remap_root = remap_root
         self.gpus = gpus
+        self.bind_resolv_conf = bind_resolv_conf
         self.extra_start_args = tuple(extra_start_args)
         self.capabilities = frozenset(
             {"snapshot", "isolation", "network_none"} | ({"gpu"} if gpus else set())
         )
         self._nsenter: str | None = None
+        self._sysconf: asyncio.Future[None] | None = None
 
     @property
     def nsenter(self) -> str:
@@ -454,6 +702,26 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
             runtime.temp_dir,
             runtime.config_dir,
         ]
+
+    async def _prepare(self) -> None:
+        await super()._prepare()
+        task = self._sysconf
+        if task is None or (task.done() and (task.cancelled() or task.exception())):
+            task = self._sysconf = asyncio.ensure_future(self._prepare_sysconf())
+        await asyncio.shield(task)
+
+    async def _prepare_sysconf(self) -> None:
+        """Write the system configurations once per provider."""
+        missing = await asyncio.to_thread(self.runtime.prepare_sysconf, gpus=bool(self.gpus))
+        for name in missing:
+            log.info("enroot hook %s is not enabled; sandboxes start without it", name)
+
+    async def _copy_snapshot(self, source: Path, session: Session) -> None:
+        await super()._copy_snapshot(source, session)
+        if (source / ENVIRONMENT_FILE).is_file():
+            await asyncio.to_thread(
+                shutil.copyfile, source / ENVIRONMENT_FILE, session.path / ENVIRONMENT_FILE
+            )
 
     async def _extract(self, image: ResolvedImage, session: Session) -> None:
         result = await self.runtime.run(
@@ -520,15 +788,59 @@ class EnrootSandbox(SessionSandbox):
         for directory in (session.tmp, session.var_tmp):
             directory.mkdir(exist_ok=True)
             directory.chmod(0o1777)
-        home = session.rootfs / "root"  # HOME defaults to /root
+        rootfs = session.rootfs
+        # enroot and its hooks write below these from the host side.
+        for name in ("etc", "dev"):
+            path = rootfs / name
+            if path.is_symlink() or (path.exists() and not path.is_dir()):
+                raise SandboxStartError(f"/{name} in the sandbox's rootfs is not a directory")
+        lock = rootfs / ".lock"  # enroot opens it for writing before it enters the rootfs
+        if lock.is_symlink() or (lock.exists() and not lock.is_file()):
+            _remove(lock)
+        home = rootfs / "root"  # HOME defaults to /root
         if not home.exists() and not home.is_symlink():
             home.mkdir()
+        # A restore keeps its snapshot's time zone, unless the snapshot predates
+        # recorded environments: sandboxes then got the zone at run time.
+        if not self._restored or not (session.path / ENVIRONMENT_FILE).is_file():
+            install_time_zone(rootfs)
         # Run the command as given: skip the image's entrypoint and rc.local.
         (session.path / RC_FILE).write_text('exec "$@"\n')
 
     def _prepare_snapshot(self) -> None:
         assert self._session is not None
         make_placeholders_readable(self._session.rootfs)
+
+    def _snapshot_files(self, target: Path) -> None:
+        # The environment a restore gives its commands: not the rootfs's
+        # /etc/environment, which code in the sandbox may have rewritten.
+        (target / ENVIRONMENT_FILE).write_text(json.dumps(self._environment, indent=2) + "\n")
+
+    def _hide_rootfs_config(self) -> list[tuple[Path, Path]]:
+        """Set aside the files of a restored rootfs that enroot reads from the host side.
+
+        enroot mounts what ``/etc/fstab`` lists and loads ``/etc/environment``
+        before it enters the rootfs; in a restored rootfs, code from the
+        sandbox may have written both.
+        """
+        assert self._session is not None
+        etc = self._session.rootfs / "etc"
+        token = uuid.uuid4().hex
+        hidden = []
+        for name in ("fstab", "environment"):
+            path = etc / name
+            if os.path.lexists(path):
+                aside = etc / f".hpc-sandbox-{name}-{token}"
+                os.rename(path, aside)
+                hidden.append((aside, path))
+        return hidden
+
+    @staticmethod
+    def _put_back(hidden: list[tuple[Path, Path]]) -> None:
+        for aside, path in hidden:
+            if os.path.lexists(path):
+                _remove(path)
+            os.rename(aside, path)
 
     def _start_args(self) -> list[str]:
         assert self._session is not None
@@ -540,6 +852,12 @@ class EnrootSandbox(SessionSandbox):
             f"{session.var_tmp}:/var/tmp:none:x-create=dir,bind,rw,nosuid",
             "tmpfs:/dev/shm:tmpfs:x-create=dir,rw,nosuid,nodev,mode=1777",
         ]
+        resolv_conf = Path("/etc/resolv.conf")
+        if self.spec.network == "host" and provider.bind_resolv_conf and resolv_conf.is_file():
+            mounts.append(
+                f"{resolv_conf.resolve()}:/etc/resolv.conf:none:"
+                "x-create=file,bind,ro,nosuid,nodev,noexec"
+            )
         for mount in self.spec.mounts:
             source = Path(mount.source).resolve()
             kind = "dir" if source.is_dir() else "file"
@@ -572,9 +890,42 @@ class EnrootSandbox(SessionSandbox):
             *self._start_args(),
         ]
         environment = provider.runtime.container_environment(
-            session, remap_root=provider.remap_root, gpus=provider.gpus
+            session, remap_root=provider.remap_root, gpus=provider.gpus, restored=self._restored
         )
-        log_path = session.path / ANCHOR_LOG
+        hidden = await asyncio.to_thread(self._hide_rootfs_config) if self._restored else []
+        await self._launch_anchor(command, environment)
+        # Only now that enroot is done with them; a failed start deletes the session.
+        if hidden:
+            await asyncio.to_thread(self._put_back, hidden)
+        anchor = self._anchor
+        assert anchor is not None
+        children = procfs.children(anchor.pid)
+        if len(children) != 1:
+            raise SandboxStartError(f"unexpected process tree below the launcher: {children}")
+        (init,) = children
+        started = procfs.owned_live_start_time(init)
+        if started is None or procfs.namespace_pid(init) != 1:
+            raise SandboxStartError("could not prove the identity of the container's init")
+        init_environment = procfs.environ(init)
+        if init_environment is None:
+            raise SandboxStartError("could not read the container's environment")
+        self._init_pid, self._init_start_time = init, started
+        self._environment = {
+            key: value for key, value in init_environment.items() if key not in _SHELL_STATE
+        }
+        recorded = session.path / ENVIRONMENT_FILE
+        if self._restored and recorded.is_file():
+            data = json.loads(recorded.read_text())
+            self._environment = {str(key): str(value) for key, value in data.items()}
+        elif self._restored:  # a snapshot from before environments were recorded
+            self._environment.setdefault("PATH", _HOST_PATH)
+        self._record()
+
+    async def _launch_anchor(self, command: list[str], environment: dict[str, str]) -> None:
+        """Start the launcher and wait until the container's keep-alive loop runs."""
+        assert self._session is not None
+        provider = self._provider
+        log_path = self._session.path / ANCHOR_LOG
         with log_path.open("wb") as log:
             # Popen, not asyncio: nothing can interrupt the spawn before the
             # handle is recorded, and no watcher thread waits on this child.
@@ -602,19 +953,6 @@ class EnrootSandbox(SessionSandbox):
                     f"{_tail(log_path)}"
                 )
             await asyncio.sleep(0.02)
-        children = procfs.children(anchor.pid)
-        if len(children) != 1:
-            raise SandboxStartError(f"unexpected process tree below the launcher: {children}")
-        (init,) = children
-        started = procfs.owned_live_start_time(init)
-        if started is None or procfs.namespace_pid(init) != 1:
-            raise SandboxStartError("could not prove the identity of the container's init")
-        environment = procfs.environ(init)
-        if environment is None:
-            raise SandboxStartError("could not read the container's environment")
-        self._init_pid, self._init_start_time = init, started
-        self._environment = {k: v for k, v in environment.items() if k not in _SHELL_STATE}
-        self._record()
 
     def _enter_args(self) -> list[str]:
         """``nsenter`` twice: the launcher's user namespace owns the PID, IPC and
@@ -775,6 +1113,55 @@ def _kill(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+def install_time_zone(rootfs: Path, source: Path = Path("/etc/localtime")) -> None:
+    """Give ``rootfs`` the host's time zone as a regular ``/etc/localtime``.
+
+    Images usually have a symlink there into their own zoneinfo database; it
+    is replaced, never written through. Nothing happens without an ``/etc``
+    directory in the rootfs or a time zone on the host.
+    """
+    try:
+        zone = source.read_bytes()
+    except OSError:
+        return
+    try:
+        etc = os.open(rootfs / "etc", safefs.DIRECTORY)
+    except OSError:
+        return
+    try:
+        try:
+            info = os.stat("localtime", dir_fd=etc, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is not None and stat.S_ISDIR(info.st_mode):
+            return
+        if info is not None:
+            os.unlink("localtime", dir_fd=etc)
+        safefs.write_file("localtime", etc, zone, mode=0o644)
+    finally:
+        os.close(etc)
+
+
+def _publish(path: Path, content: bytes, mode: int) -> None:
+    """Atomically write ``content`` to ``path`` unless it already holds it."""
+    try:
+        if path.read_bytes() == content and stat.S_IMODE(path.stat().st_mode) == mode:
+            return
+    except OSError:
+        pass
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
+    temporary.write_bytes(content)
+    temporary.chmod(mode)
+    os.replace(temporary, path)
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        remove_tree(path)
+    else:
+        path.unlink()
 
 
 def _read_lines(path: Path) -> list[str]:

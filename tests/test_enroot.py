@@ -492,6 +492,7 @@ def test_provider_capabilities_follow_the_options(tmp_path, fake_enroot):
     provider = EnrootProvider(scratch_root=tmp_path / "scratch", gpus="all")
     assert provider.capabilities == {"snapshot", "isolation", "network_none", "gpu"}
     session = Session("hpcsb-" + "3" * 32, tmp_path / "session", None)
+    provider.runtime.sysconf_dir = tmp_path / "sysconf"  # as if prepared
     environment = provider.runtime.container_environment(session, remap_root=True, gpus="all")
     assert environment["NVIDIA_VISIBLE_DEVICES"] == "all"
     assert "compute" in environment["NVIDIA_DRIVER_CAPABILITIES"]
@@ -541,6 +542,20 @@ async def test_wrong_images_are_refused_before_anything_is_created(tmp_path, fak
     assert not provider.scratch_root.exists() and not fake_enroot.calls()
 
 
+async def test_imports_get_only_what_pulling_needs(tmp_path, fake_enroot, monkeypatch):
+    monkeypatch.setenv("HPCS_CANARY", "secret")
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("https_proxy", "http://proxy:3128")
+    monkeypatch.setenv("ENROOT_SQUASH_OPTIONS", "-comp zstd")
+    provider = make_enroot_provider(tmp_path)
+    await provider.images.resolve("docker://example/task:1")
+    (call,) = fake_enroot.calls("import")
+    env = call["env"]
+    assert "HPCS_CANARY" not in env and "SLURM_JOB_ID" not in env
+    assert env["https_proxy"] == "http://proxy:3128"
+    assert env["ENROOT_SQUASH_OPTIONS"] == "-comp zstd"
+
+
 async def test_downloads_do_not_need_to_preserve_unmapped_owners(enroot_provider, sqsh, tmp_path):
     shared = Path("/usr/share")  # root-owned on the host: an unmapped owner in the sandbox
     sandbox = await enroot_provider.start(
@@ -553,6 +568,205 @@ async def test_downloads_do_not_need_to_preserve_unmapped_owners(enroot_provider
     )
     await sandbox.download(f"/mnt/shared/{source.name}", tmp_path / "copy")
     assert (tmp_path / "copy").read_bytes() == source.read_bytes()
+
+
+async def test_sandboxes_start_with_enroots_standard_configuration_only(
+    tmp_path, sqsh, fake_enroot, monkeypatch
+):
+    site = tmp_path / "site-enroot"
+    (site / "hooks.d").mkdir(parents=True)
+    for hook in ("10-devices.sh", "10-shadow.sh", "10-aptfix.sh", "10-home.sh", "98-nvidia.sh"):
+        (site / "hooks.d" / hook).write_text(f"#!/bin/sh\n# {hook}\n")
+        (site / "hooks.d" / hook).chmod(0o755)
+    (site / "hooks.d" / "10-aptfix.sh").chmod(0o644)  # disabled by the site
+    monkeypatch.setenv("ENROOT_SYSCONF_PATH", str(site))
+    provider = make_enroot_provider(tmp_path)
+    async with await provider.start(SandboxSpec(image=str(sqsh))):
+        pass
+    (start,) = fake_enroot.calls("start")
+    sysconf = Path(start["env"]["ENROOT_SYSCONF_PATH"])
+    assert sysconf.parent == provider.scratch_root / "enroot-sysconf"
+    hooks = sysconf / "hooks.d"
+    assert sorted(path.name for path in hooks.iterdir()) == [
+        "10-hpc-sandbox-dev.sh",
+        "10-shadow.sh",
+        "98-nvidia.sh",
+    ]
+    assert (hooks / "10-shadow.sh").read_text() == "#!/bin/sh\n# 10-shadow.sh\n"
+    assert all(os.access(path, os.X_OK) for path in hooks.iterdir())
+    restore_hooks = provider.runtime.restore_sysconf_dir / "hooks.d"
+    assert sorted(path.name for path in restore_hooks.iterdir()) == [
+        "10-hpc-sandbox-dev.sh",
+        "98-nvidia.sh",
+    ]
+    fstab = (sysconf / "mounts.d" / "10-system.fstab").read_text()
+    assert "/proc" in fstab and "/etc/hosts" in fstab and "hostname" not in fstab
+    assert "/etc/localtime" not in fstab  # images link it into their own zoneinfo
+    assert "tmpfs        /dev " in fstab and "/dev        /dev" not in fstab  # never the host's
+    assert not any((sysconf / "environ.d").iterdir())
+    resolv = [m for m in option_values(start["argv"], "--mount") if ":/etc/resolv.conf:" in m]
+    assert len(resolv) == int(Path("/etc/resolv.conf").is_file())
+
+
+# A copy of the configuration section of enroot 3.5's script.
+ENROOT_SCRIPT = """\
+#! /usr/bin/env bash
+set -euo pipefail
+
+# ---- BEGIN CONFIG ----
+
+config::export() {
+    [ -n "${3-}" ] && export "$1=$2" || export "$1=${!1:-$2}"
+}
+
+config::load() {
+    local -r file="$1" overwrite="${2-}"
+
+    if [ -e "${file}" ]; then
+        while IFS=$' \t=' read -r key value; do
+            if [[ "${key}" =~ ^ENROOT_[[:upper:]_]+$ ]]; then
+                config::export "${key}" "$(eval echo "${value}")" "${overwrite}"
+            fi
+        done < "${file}"
+   fi
+}
+
+config::init() {
+    local -r file="$1" overwrite="${2-}"
+
+    config::load "${file}" "${overwrite}"
+    if [ -d "${file}.d" ]; then
+      shopt -s nullglob
+      for dropin in "${file}.d"/*".conf"; do
+        config::load "${dropin}" "${overwrite}"
+      done
+      shopt -u nullglob
+    fi
+}
+
+config::fini() {
+    for var in $(compgen -e "ENROOT_"); do
+        if [[ "${!var}" =~ ^(no?|N[oO]?|[fF](alse)?|FALSE)$ ]]; then
+            unset "${var}"
+        fi
+    done
+}
+
+config::init "@CONF@"
+
+config::export ENROOT_SYSCONF_PATH     "/usr/local/etc/enroot"
+config::export ENROOT_RUNTIME_PATH     "@RUNTIME@"
+config::export ENROOT_REMAP_ROOT       false
+
+config::fini
+
+(umask 077 && mkdir -p "${ENROOT_RUNTIME_PATH}")
+
+# ----- END CONFIG -----
+"""
+
+
+def test_the_installations_configuration_is_found_like_enroot_finds_it(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENROOT_SYSCONF_PATH", raising=False)
+    conf = tmp_path / "etc" / "enroot.conf"
+    conf.parent.mkdir()
+    script = tmp_path / "enroot"
+    runtime_path = tmp_path / "runtime"
+    script.write_text(
+        ENROOT_SCRIPT.replace("@CONF@", str(conf)).replace("@RUNTIME@", str(runtime_path))
+    )
+    script.chmod(0o755)
+    runtime = EnrootProvider(scratch_root=tmp_path / "scratch", binary=str(script)).runtime
+    assert runtime.site_sysconf() == Path("/usr/local/etc/enroot")
+    for line in (
+        "ENROOT_SYSCONF_PATH /opt/enroot/etc",
+        "ENROOT_SYSCONF_PATH\t/opt/enroot/etc",
+        "ENROOT_SYSCONF_PATH=/opt/enroot/etc",
+        'ENROOT_SYSCONF_PATH "/opt/enroot/etc"   # site hooks',
+        "ENROOT_SYSCONF_PATH /opt/enroot/etc\nENROOT_SYSCONF_PATH /opt/other",
+        'ENROOT_SYSCONF_PATH ""\nENROOT_SYSCONF_PATH /opt/enroot/etc',  # empty means unset
+    ):
+        conf.write_text(line + "\n")
+        assert runtime.site_sysconf() == Path("/opt/enroot/etc"), line
+    conf.write_text("ENROOT_SYSCONF_PATH ${HOME}/enroot\n")
+    assert runtime.site_sysconf() == Path.home() / "enroot"
+    conf.write_text("")
+    (conf.parent / "enroot.conf.d").mkdir()
+    (conf.parent / "enroot.conf.d" / "10-site.conf").write_text("ENROOT_SYSCONF_PATH /opt/d\n")
+    assert runtime.site_sysconf() == Path("/opt/d")
+    monkeypatch.setenv("ENROOT_SYSCONF_PATH", "/from/env")
+    assert runtime.site_sysconf() == Path("/from/env")
+    assert runtime.setting("ENROOT_REMAP_ROOT") is None  # false: enroot unsets it
+    assert runtime.setting("ENROOT_RUNTIME_PATH") == str(runtime_path)
+    assert not runtime_path.exists()  # reading settings creates nothing
+    script.write_text('config::export ENROOT_SYSCONF_PATH "/usr/local/etc/enroot"\n')
+    assert runtime.site_sysconf() == Path("/from/env")
+    monkeypatch.delenv("ENROOT_SYSCONF_PATH")
+    assert runtime.site_sysconf() == Path("/usr/local/etc/enroot")
+
+
+async def test_gpus_need_the_nvidia_hook(tmp_path, sqsh, fake_enroot, monkeypatch):
+    monkeypatch.setenv("ENROOT_SYSCONF_PATH", str(tmp_path / "no-hooks"))
+    provider = make_enroot_provider(tmp_path, gpus="all")
+    with pytest.raises(SandboxError, match="98-nvidia.sh"):
+        await provider.start(SandboxSpec(image=str(sqsh)))
+
+
+async def test_concurrent_first_starts_share_one_configuration(tmp_path, sqsh, fake_enroot):
+    provider = make_enroot_provider(tmp_path)
+    runtime, prepared = provider.runtime, []
+    original = runtime.prepare_sysconf
+
+    def counting(**options):
+        prepared.append(options)
+        return original(**options)
+
+    runtime.prepare_sysconf = counting
+    sandboxes = await asyncio.gather(
+        *(provider.start(SandboxSpec(image=str(sqsh))) for _ in range(6))
+    )
+    assert len({sandbox.id for sandbox in sandboxes}) == 6 and len(prepared) == 1
+    other = make_enroot_provider(tmp_path)  # same scratch root: the same, unchanged directory
+    await other._prepare()
+    assert other.runtime.sysconf_dir == runtime.sysconf_dir
+
+
+async def test_restores_do_not_let_the_sandbox_steer_enroot(
+    enroot_provider, sqsh, fake_enroot, tmp_path
+):
+    secret = tmp_path / "host-secret.env"
+    secret.write_text("API_TOKEN=host-token\n")
+    spec = SandboxSpec(image=str(sqsh), env={"FROM_SPEC": "1"})
+    sandbox = await enroot_provider.start(spec)
+    planted = (
+        f"echo '{tmp_path} /mnt/host none x-create=dir,bind,rw 0 -1' >> /etc/fstab && "
+        f"ln -sf {secret} /etc/environment && ln -s {secret} /.lock && echo planted"
+    )
+    assert (await sandbox.exec(planted)).stdout == "planted\n"
+    snapshot = await sandbox.snapshot()
+    assert json.loads(Path(snapshot.path, "environment.json").read_text())["PATH"]
+    restored = await enroot_provider.restore(snapshot, spec)
+    starts = fake_enroot.starts()
+    assert starts[0]["rootfs_config"] == ["etc/environment"]  # the image's own
+    assert starts[-1]["rootfs_config"] == []  # hidden from enroot while it starts
+    (*_, restore_start) = fake_enroot.calls("start")
+    assert restore_start["env"]["ENROOT_SYSCONF_PATH"] == str(
+        enroot_provider.runtime.restore_sysconf_dir
+    )
+    environment = (await restored.exec("env")).stdout
+    assert "API_TOKEN" not in environment and "FROM_SPEC=1" in environment
+    assert (await restored.exec("tail -n 1 /etc/fstab")).stdout.startswith(str(tmp_path))
+    assert not (restored.session_dir / "rootfs" / ".lock").is_symlink()
+    await enroot_provider.delete_snapshot(snapshot)
+
+
+async def test_a_symlinked_etc_is_refused(enroot_provider, sqsh, tmp_path):
+    spec = SandboxSpec(image=str(sqsh))
+    sandbox = await enroot_provider.start(spec)
+    await sandbox.exec(f"mv /etc /etc.real && ln -s {tmp_path} /etc")
+    snapshot = await sandbox.snapshot()
+    with pytest.raises(SandboxStartError, match="/etc in the sandbox's rootfs"):
+        await enroot_provider.restore(snapshot, spec)
 
 
 async def test_the_environment_never_reaches_host_helpers(enroot_provider, sqsh, tmp_path):
@@ -728,6 +942,42 @@ def test_snapshot_preparation_opens_only_enroots_placeholders(tmp_path):
             safefs.remove("rootfs", fd)  # too deep for pytest's recursive cleanup
 
 
+def test_the_time_zone_replaces_symlinks_without_following_them(tmp_path):
+    from hpc_sandbox.enroot import install_time_zone
+
+    zone = tmp_path / "host-zone"
+    zone.write_bytes(b"TZif host")
+    image_zone = tmp_path / "image-utc"
+    image_zone.write_bytes(b"TZif utc")
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "etc").mkdir(parents=True)
+    (rootfs / "etc" / "localtime").symlink_to(image_zone)
+    install_time_zone(rootfs, zone)
+    localtime = rootfs / "etc" / "localtime"
+    assert not localtime.is_symlink() and localtime.read_bytes() == b"TZif host"
+    assert image_zone.read_bytes() == b"TZif utc"
+    install_time_zone(tmp_path / "no-etc", zone)
+    install_time_zone(rootfs, tmp_path / "no-zone")
+    assert localtime.read_bytes() == b"TZif host"
+
+
+async def test_fresh_sandboxes_get_the_hosts_time_zone_and_restores_keep_theirs(
+    enroot_provider, sqsh
+):
+    host = Path("/etc/localtime")
+    if not host.exists():
+        pytest.skip("the host has no /etc/localtime")
+    spec = SandboxSpec(image=str(sqsh))
+    sandbox = await enroot_provider.start(spec)
+    localtime = sandbox.session_dir / "rootfs" / "etc" / "localtime"
+    assert not localtime.is_symlink() and localtime.read_bytes() == host.read_bytes()
+    assert (await sandbox.exec("echo kept > /etc/localtime")).exit_code == 0
+    snapshot = await sandbox.snapshot()
+    restored = await enroot_provider.restore(snapshot, spec)
+    assert (restored.session_dir / "rootfs" / "etc" / "localtime").read_text() == "kept\n"
+    await enroot_provider.delete_snapshot(snapshot)
+
+
 async def test_commands_need_nothing_from_the_sandboxs_tmp(enroot_provider, sqsh):
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), env={"FROM_SPEC": "1"}))
     mounted = await sandbox.exec("mount -t tmpfs tmpfs /tmp && echo mounted")
@@ -736,6 +986,63 @@ async def test_commands_need_nothing_from_the_sandboxs_tmp(enroot_provider, sqsh
     result = await sandbox.exec('echo "$FROM_SPEC $EXTRA"; cat', env={"EXTRA": "x"}, stdin=b"in\n")
     assert result.stdout == "1 x\nin\n" and result.exit_code == 0, result
     assert (await sandbox.exec("umount /tmp && echo unmounted")).stdout == "unmounted\n"
+
+
+async def test_restores_of_snapshots_from_earlier_versions_get_the_hosts_time_zone(
+    enroot_provider, sqsh
+):
+    host = Path("/etc/localtime")
+    if not host.exists():
+        pytest.skip("the host has no /etc/localtime")
+    spec = SandboxSpec(image=str(sqsh))
+    sandbox = await enroot_provider.start(spec)
+    assert (await sandbox.exec("echo old > /etc/localtime")).exit_code == 0
+    snapshot = await sandbox.snapshot()
+    Path(snapshot.path, "environment.json").unlink()  # as earlier versions wrote them
+    restored = await enroot_provider.restore(snapshot, spec)
+    localtime = restored.session_dir / "rootfs" / "etc" / "localtime"
+    assert localtime.read_bytes() == host.read_bytes()
+    await enroot_provider.delete_snapshot(snapshot)
+
+
+def test_hanging_settings_are_abandoned_with_everything_they_started(tmp_path, monkeypatch):
+    marker = f"{os.getpid()}.4321"
+    conf = tmp_path / "enroot.conf"
+    conf.write_text(f"ENROOT_SYSCONF_PATH $(sleep {marker}; echo /never)\n")
+    script = tmp_path / "enroot"
+    script.write_text(
+        ENROOT_SCRIPT.replace("@CONF@", str(conf)).replace("@RUNTIME@", str(tmp_path / "rt"))
+    )
+    script.chmod(0o755)
+    monkeypatch.delenv("ENROOT_SYSCONF_PATH", raising=False)
+    monkeypatch.setattr("hpc_sandbox.enroot._SETTING_TIMEOUT_S", 1.0)
+    runtime = EnrootProvider(scratch_root=tmp_path / "scratch", binary=str(script)).runtime
+    assert runtime.setting("ENROOT_SYSCONF_PATH") is None
+
+    def sleeping() -> bool:
+        for proc in Path("/proc").iterdir():
+            with contextlib.suppress(OSError):
+                if marker in (proc / "cmdline").read_text():
+                    return True
+        return False
+
+    assert not sleeping()
+
+
+async def test_imports_read_enroots_settings_off_the_event_loop(tmp_path, fake_enroot):
+    import threading
+
+    provider = make_enroot_provider(tmp_path)
+    threads = []
+    original = provider.runtime.import_environment
+
+    def recording() -> dict[str, str]:
+        threads.append(threading.current_thread())
+        return original()
+
+    provider.runtime.import_environment = recording
+    await provider.images.resolve("docker://alpine:3.20")
+    assert threads and threading.main_thread() not in threads
 
 
 async def test_commands_without_stdin_read_dev_null(enroot_provider, sqsh):

@@ -135,6 +135,10 @@ class FakeEnroot:
     def __init__(self, state: Path) -> None:
         self.state = state
 
+    def starts(self) -> list[dict]:
+        path = self.state / "starts.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
     def set(self, knob: str, value: str) -> None:
         (self.state / knob).write_text(value)
 

@@ -168,7 +168,7 @@ class SessionProvider(Generic[S]):
         if snapshot.image != spec.image:
             raise ValueError(f"snapshot {snapshot.id} is of {snapshot.image!r}, not {spec.image!r}")
         await self._prepare()
-        return await self._launch(spec, partial(self._copy_snapshot, source))
+        return await self._launch(spec, partial(self._copy_snapshot, source), restored=True)
 
     async def delete_snapshot(self, snapshot: SandboxSnapshot) -> None:
         await asyncio.to_thread(remove_tree, self._snapshot_dir(snapshot))
@@ -239,8 +239,15 @@ class SessionProvider(Generic[S]):
         """Private directories created below the scratch root before the first start."""
         return [self.scratch_root, self.session_root, self.snapshot_root]
 
-    async def _launch(self, spec: SandboxSpec, populate: Callable[[Session], Awaitable[None]]) -> S:
+    async def _launch(
+        self,
+        spec: SandboxSpec,
+        populate: Callable[[Session], Awaitable[None]],
+        *,
+        restored: bool = False,
+    ) -> S:
         sandbox = self.sandbox_type(self, spec)
+        sandbox._restored = restored
         await sandbox._boot(populate)
         return sandbox
 
@@ -330,6 +337,9 @@ class SessionSandbox:
         # Active exec calls: host PID of the spawned process -> memory kills charged to it.
         self._execs: dict[int, list[memory.MemoryKill]] = {}
         self._watchdog: asyncio.Task[None] | None = None
+        # Whether the rootfs comes from a snapshot, that is from files code in a
+        # sandbox wrote, rather than from an image.
+        self._restored = False
         self._stop_task: asyncio.Future[None] | None = None
 
     def __repr__(self) -> str:
@@ -429,6 +439,7 @@ class SessionSandbox:
             ):
                 await self._provider.copy_tree(source, target / name)
             await asyncio.to_thread(remove_tree, target / "tmp" / TRANSFER_DIR)
+            await asyncio.to_thread(self._snapshot_files, target)
             snapshot = SandboxSnapshot(
                 id=snapshot_id,
                 provider=self._provider.name,
@@ -509,6 +520,9 @@ class SessionSandbox:
 
     def _prepare_snapshot(self) -> None:
         """Make the rootfs copyable before a snapshot; runs in a worker thread."""
+
+    def _snapshot_files(self, target: Path) -> None:
+        """Add provider files to the snapshot directory ``target``; runs in a worker thread."""
 
     def _watch_root(self) -> int | None:
         """Host PID whose process tree the memory watchdog charges to the sandbox.

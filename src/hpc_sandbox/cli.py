@@ -16,7 +16,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .enroot import ANCHOR_SCRIPT, EnrootProvider
+from .enroot import ANCHOR_SCRIPT, STANDARD_HOOKS, EnrootProvider
 from .paths import in_batch_job
 from .process import run_process
 from .runtime import RUNTIME_CANDIDATES, ContainerRuntime
@@ -276,10 +276,19 @@ async def _enroot_checks(report: _Report, provider: EnrootProvider) -> None:
             "use its file capabilities here; run on the host or pass .sqsh images",
         )
     report.line(*_whiteout_check(provider.runtime.temp_dir))
-    for key, value in enroot_site_config().items():
+    for key, value in enroot_site_config(provider.runtime.enroot_conf()).items():
         report.line("info", f"site: {key}", f"{value} (overridden per sandbox)")
-    hooks = sorted(path.name for path in _enroot_sysconf().joinpath("hooks.d").glob("*.sh"))
-    report.line("info", "site hooks", ", ".join(hooks) or "none")
+    runtime = provider.runtime
+    site_hooks = runtime.site_sysconf() / "hooks.d"
+    hooks = sorted(path.name for path in site_hooks.glob("*.sh"))
+    report.line("info", "site hooks", f"{site_hooks}: {', '.join(hooks) or 'none'}")
+    enabled = [hook for hook in STANDARD_HOOKS if os.access(site_hooks / hook, os.X_OK)]
+    missing = [hook for hook in STANDARD_HOOKS if hook not in enabled]
+    detail = ", ".join(enabled) or "none"
+    if missing:
+        report.line("warn", "sandbox hooks", f"{detail}; not enabled, so skipped: {missing}")
+    else:
+        report.line("ok", "sandbox hooks", detail)
 
 
 def _whiteout_check(temp_dir: Path) -> tuple[str, str, str]:
@@ -319,15 +328,10 @@ def outside_user_namespaces() -> bool:
     return mapping[:3] == ["0", "0", "4294967295"]
 
 
-def _enroot_sysconf() -> Path:
-    return Path(os.environ.get("ENROOT_SYSCONF_PATH", "/etc/enroot"))
-
-
-def enroot_site_config() -> dict[str, str]:
+def enroot_site_config(conf: Path) -> dict[str, str]:
     """The provider-relevant settings of the site's enroot.conf and its drop-ins."""
-    sysconf = _enroot_sysconf()
     values = {}
-    for path in [sysconf / "enroot.conf", *sorted(sysconf.glob("enroot.conf.d/*.conf"))]:
+    for path in [conf, *sorted(conf.parent.glob(f"{conf.name}.d/*.conf"))]:
         try:
             lines = path.read_text().splitlines()
         except OSError:

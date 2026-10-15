@@ -18,6 +18,7 @@ image that has ``nvidia-smi`` or ``rocm-smi`` available through the runtime.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import sys
@@ -190,13 +191,17 @@ async def test_network_none_has_only_loopback(provider):
 
 
 @enroot_only
-async def test_enroot_containers_are_kept_apart_from_the_host(provider):
+async def test_enroot_containers_are_kept_apart_from_the_host(provider, monkeypatch):
+    monkeypatch.setenv("HPCS_CANARY", "1")
     sandbox = await provider.start(SandboxSpec(image=IMAGE))
     mounts = (await sandbox.exec("cut -d' ' -f5 /proc/self/mountinfo")).stdout.split()
     assert "/root" not in mounts  # the site's home-directory hook stays off
-    assert "/dev/shm" in mounts and "/tmp" in mounts
+    assert "/dev/shm" in mounts and "/tmp" in mounts and "/etc/resolv.conf" in mounts
+    assert not {"/etc/hostname", "/etc/machine-id", "/etc/rc.local"} & set(mounts)  # site config
     environment = (await sandbox.exec("env")).stdout
-    assert "SLURM_" not in environment and "PMIX_" not in environment
+    for host_only in ("HPCS_CANARY=", "SLURM_", "PMIX_", "ENROOT_", "USER=", "TERM="):
+        assert host_only not in environment
+    assert (await sandbox.exec("test -L /dev/fd && id -un")).stdout == "root\n"
     background = (await sandbox.exec("sleep 300 >/dev/null 2>&1 & echo $!")).stdout.strip()
     assert (await sandbox.exec("kill -9 -1; echo survived")).stdout == "survived\n"
     assert (await sandbox.exec(f"kill -0 {background} 2>/dev/null || echo gone")).stdout == "gone\n"
@@ -240,6 +245,38 @@ def test_doctor_smoke_test_passes():
     assert result.returncode == 0, result.detail()
 
 
+@enroot_only
+async def test_enroot_dev_is_minimal_and_concurrent_starts_work(provider):
+    sandboxes = await asyncio.gather(*(provider.start(SandboxSpec(image=IMAGE)) for _ in range(4)))
+    devices = set((await sandboxes[0].exec("ls /dev")).stdout.split())
+    assert {"null", "zero", "urandom", "fd", "stdin", "pts", "ptmx", "shm"} <= devices
+    assert not {"kmsg", "fuse", "mem"} & devices and not any(d.startswith("nvme") for d in devices)
+    assert (await sandboxes[0].exec("test -c /dev/pts/ptmx && echo pty")).stdout == "pty\n"
+
+
+@enroot_only
+async def test_enroot_restores_ignore_what_the_sandbox_planted(provider, tmp_path):
+    host_dir = tmp_path / "host"
+    host_dir.mkdir()
+    (host_dir / "key").write_text("HOST-KEY\n")
+    secret = tmp_path / "secret.env"
+    secret.write_text("API_TOKEN=host-token\n")
+    spec = SandboxSpec(image=IMAGE)
+    sandbox = await provider.start(spec)
+    planted = await sandbox.exec(
+        f"echo '{host_dir} /mnt/host none x-create=dir,bind,rw 0 -1' >> /etc/fstab"
+        f" && ln -sf {secret} /etc/environment && echo planted"
+    )
+    assert planted.stdout == "planted\n", planted.stderr
+    snapshot = await sandbox.snapshot()
+    restored = await provider.restore(snapshot, spec)
+    probe = await restored.exec("cat /mnt/host/key 2>/dev/null; touch /mnt/host/x 2>/dev/null; env")
+    assert "HOST-KEY" not in probe.stdout and "API_TOKEN" not in probe.stdout
+    assert sorted(path.name for path in host_dir.iterdir()) == ["key"]
+    assert (await restored.exec("grep -c /mnt/host /etc/fstab")).stdout == "1\n"  # its own file
+    await provider.delete_snapshot(snapshot)
+
+
 async def test_transfers_ignore_symlinks_the_sandbox_plants(provider, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -254,6 +291,26 @@ async def test_transfers_ignore_symlinks_the_sandbox_plants(provider, tmp_path):
     await sandbox.download("/app/in.txt", tmp_path / "back.txt")
     assert (tmp_path / "back.txt").read_text() == "payload\n"
     assert not any(outside.iterdir())
+
+
+@enroot_only
+async def test_enroot_sandboxes_keep_the_hosts_time_zone(provider):
+    host = Path("/etc/localtime")
+    if not host.exists():
+        pytest.skip("the host has no /etc/localtime")
+    sandbox = await provider.start(SandboxSpec(image=IMAGE))
+    digest = hashlib.sha256(host.read_bytes()).hexdigest()
+    result = await sandbox.exec("sha256sum /etc/localtime && env -u TZ date +%Z")
+    assert result.exit_code == 0, result.stderr
+    checksum, zone = result.stdout.split("\n")[:2]
+    host_zone = (await run_process(["env", "-u", "TZ", "date", "+%Z"], timeout_s=10)).stdout
+    assert checksum.split()[0] == digest and zone == host_zone.decode().strip()
+    # The image's own zoneinfo is untouched: UTC is still UTC.
+    utc = await sandbox.exec(
+        "for zone in Etc/UTC UTC; do"
+        ' [ -f "/usr/share/zoneinfo/$zone" ] && TZ="$zone" date +%Z && exit; done; echo none'
+    )
+    assert utc.stdout.strip() in ("UTC", "none"), utc.stdout
 
 
 @enroot_only

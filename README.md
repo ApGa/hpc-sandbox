@@ -186,10 +186,15 @@ long-lived `enroot start` whose command is a keep-alive loop.
 
 - **Images.** `docker://repo:tag` (Docker's `registry/path` or enroot's
   `registry#path` spelling), a bare `repo:tag`, `dockerd://` and `podman://`,
-  imported with `enroot import` into `<cache>/uri-<hash>.sqsh`. Enroot 3.x
-  cannot import by digest; to pin an image, import it once and pass the
-  `.sqsh` path with an `@sha256:<hex>` suffix. Imports run with
-  `TAR_OPTIONS=--delay-directory-restore`, and with a wrapper around
+  imported with `enroot import` into `<cache>/uri-<hash>.sqsh`. Imports get
+  the variables pulling needs and no others: `PATH`, home and locale, XDG
+  directories, proxies, CA bundles, `SOURCE_DATE_EPOCH`, `ENROOT_*`, the
+  Docker and Podman variables (`DOCKER_*`, `CONTAINER_HOST`, `CONTAINERS_*`,
+  `REGISTRY_AUTH_FILE`), every variable the registry credentials file names
+  (enroot evaluates `$NGC_API_KEY` or `$(command)` password fields), and the
+  names or `PREFIX*` patterns in `import_env` (for example `AWS_*` when a
+  password field runs the AWS CLI). Imports run with
+  `TAR_OPTIONS=--delay-directory-restore` and use a wrapper around
   `enroot-aufs2ovlfs` that resolves whiteouts enroot 3.5 aborts on, so images
   that revisit read-only directories or shadow their own entries import.
 - **Digest pins.** Enroot 3.x misparses `@sha256:` references, so they raise
@@ -212,20 +217,46 @@ long-lived `enroot start` whose command is a keep-alive loop.
   the init is that loop: tasks cannot signal it, it reaps orphans, and
   killing it from the host kills every process in the sandbox. The launcher
   and the init are SIGKILLed when the process that started them dies.
-- **What enroot is allowed to add.** `enroot start` runs with a minimal
-  environment: no home directory mount (`ENROOT_MOUNT_HOME=no`; an empty value
-  would fall back to the site default, which often mounts it), no login
-  shell, no user-level enroot configuration, a restricted `/dev`, the NVIDIA
-  and Mellanox hooks off unless `gpus` is set, and no batch-job variables for
-  site hooks to read. `/tmp` and `/var/tmp` are session-private directories,
-  `/dev/shm` a private tmpfs. The image's entrypoint and `/etc/rc.local` are
-  skipped. Site mounts such as `/etc/hosts` and `/etc/resolv.conf` still
-  apply.
+- **What enroot is allowed to add.** Sites extend their enroot configuration
+  for interactive jobs — home directories, cgroups, Slurm and PMIx variables,
+  entrypoints, terminal settings — and none of that belongs in a sandbox.
+  `enroot start` therefore uses a system configuration the provider writes
+  (`ENROOT_SYSCONF_PATH`): enroot's standard system mounts (`/proc`, `/sys`
+  read-only, `/var/run`, `/var/lock`), a minimal `/dev` (a tmpfs with `null`,
+  `zero`, `full`, `random`, `urandom`, `tty`, a private `pts` and the usual
+  symlinks; never the host's), the host's `/etc/hosts`, no environment files,
+  and the standard enroot hooks sandboxes need, copied from the installation
+  when it has them enabled: `10-shadow` (passwd and group entries),
+  `10-aptfix` (apt works as remapped root) and `98-nvidia` (only acts when
+  `gpus` is set, which requires it). The installation's configuration
+  directory is found as enroot finds it, by running the configuration section
+  of the installed `enroot` script: the environment, `enroot.conf`, its
+  drop-ins and enroot's defaults combine exactly as they do for enroot. A new
+  sandbox gets the host's time zone as a regular `/etc/localtime` file,
+  replacing the image's symlink into its own zoneinfo (a restore keeps the
+  snapshot's, unless an earlier version took it). It runs with a minimal
+  environment besides: no home directory mount (`ENROOT_MOUNT_HOME=no`; an
+  empty value would fall back to the site default, which often mounts it), no
+  login shell, no user-level enroot configuration, and no batch-job variables.
+  `/tmp` and `/var/tmp` are session-private directories, `/dev/shm` a private
+  tmpfs, and `/etc/resolv.conf` the host's, read-only, with host networking
+  and `bind_resolv_conf`. The image's entrypoint and `/etc/rc.local` are
+  skipped.
 - **Commands** enter the init's namespaces and root directory with
   `nsenter` — twice, because the PID and IPC namespaces belong to the
   launcher's user namespace and the mounts to enroot's nested one — and run
   as root (your uid outside) in a couple of milliseconds. The init's
   identity is re-proved before each command.
+- **Restores** start from a rootfs that code in the sandbox wrote, and enroot
+  works on the rootfs from the host side while it starts. So a restore sets
+  the rootfs's `/etc/fstab` and `/etc/environment` aside until the container
+  runs (they would otherwise be mounted and loaded with your host
+  privileges), skips the hooks that write into the rootfs with host-side
+  shell code (their results are in the snapshot; the NVIDIA hook still runs,
+  because `nvidia-container-cli` is built to configure untrusted root
+  filesystems), refuses a rootfs whose `/etc` or `/dev` is not a directory,
+  and gives commands the environment recorded when the snapshot was taken.
+  Images are trusted the way enroot trusts them.
 - **Teardown.** SIGKILL the init after re-proving its identity; its parent,
   the launcher, reaps it and exits. A janitor finds the processes of an
   abandoned session already gone, kills any survivor whose start time and
@@ -244,6 +275,7 @@ Options both providers take:
 | `default_timeout_s` | 600 | Timeout of `exec` and transfers without an explicit one. |
 | `start_timeout_s` | 1800 | Pull, extraction, container start and snapshot copy timeout. |
 | `stop_timeout_s` | 60 | Bound on the whole stop. |
+| `bind_resolv_conf` | True | Bind the host's `/etc/resolv.conf` with host networking. |
 | `extra_start_args` | () | Extra `instance start` / `enroot start` flags. |
 | `output_limit_bytes` | 16 MiB | Captured bytes per stream and command. |
 | `memory_poll_s` | 1.0 | Watchdog sampling interval. |
@@ -256,13 +288,13 @@ Options both providers take:
 | `allow_network_none` | False | Permit `network="none"` (`--net --network none`); only where users may create network namespaces. Adds the `network_none` capability. |
 | `gpu` | None | `"nv"` or `"rocm"` (`--nv` / `--rocm`); adds the `gpu` capability. |
 | `cgroup_limits` | False | Pass `cpus` and `memory_mb` as `--cpus` / `--memory` where rootless cgroups work. Otherwise `cpus` is advisory. |
-| `bind_resolv_conf` | True | Bind the host's `/etc/resolv.conf` with host networking. |
 
 `EnrootProvider` only:
 
 | Option | Default | Meaning |
 |---|---|---|
 | `remap_root` | True | Run as root inside the sandbox (`enroot start --root`); False runs as your uid. |
+| `import_env` | () | Extra variables for `enroot import`: names, or prefixes such as `"AWS_*"`. |
 | `gpus` | None | Handed to enroot's NVIDIA hook as `NVIDIA_VISIBLE_DEVICES`: `"all"` for every GPU the process may use (inside a Slurm allocation, the allocated ones), or a list such as `"0,1"` numbered as the job sees its GPUs (like `CUDA_VISIBLE_DEVICES`, not the host indices in `SLURM_STEP_GPUS`). Adds the `gpu` capability. |
 
 Default scratch root: `$HPC_SANDBOX_SCRATCH`, else `$PBS_LOCALDIR/hpc-sandbox`,
@@ -327,9 +359,10 @@ enroot:
   installed, sessions there whose owner record is missing.
 - **Site configuration.** `enroot.conf` settings such as
   `ENROOT_MOUNT_HOME yes`, `ENROOT_REMAP_ROOT` and the data and runtime paths
-  are overridden per sandbox; system mounts (`/etc/enroot/mounts.d`) and
-  hooks (`/etc/enroot/hooks.d`) still apply, without the batch job's
-  environment.
+  are overridden per sandbox, and the site's mounts, environment files and
+  hooks are replaced by the provider's own system configuration (see above).
+  `doctor` lists the site's hooks and which standard ones sandboxes get; a
+  standard hook the installation lacks or has disabled is skipped.
 
 Both:
 

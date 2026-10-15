@@ -44,6 +44,8 @@ RECORDED_ENV = (
     "NVIDIA_VISIBLE_DEVICES",
     "MELLANOX_VISIBLE_DEVICES",
     "SLURM_JOB_ID",
+    "HPCS_CANARY",
+    "https_proxy",
 )
 VALUED = {"--output", "-o", "--name", "-n", "--rc", "--mount", "-m", "--env", "-e"}
 CLONE_NEWNS, CLONE_NEWUSER = 0x00020000, 0x10000000
@@ -200,6 +202,10 @@ def start(args: list[str]) -> int:
     rootfs = Path(os.environ["ENROOT_DATA_PATH"]) / name
     if not rootfs.is_dir():
         return fail(f"No such file or directory: {rootfs}")
+    # What enroot would read from the rootfs on the host side.
+    seen = [f"etc/{n}" for n in ("fstab", "environment") if os.path.lexists(rootfs / "etc" / n)]
+    with (STATE / "starts.jsonl").open("a") as starts:
+        starts.write(json.dumps({"rootfs_config": seen}) + "\n")
     rc = Path(options["--rc"][-1]).read_text() if "--rc" in options else 'exec "$@"\n'
     uid, gid = os.getuid(), os.getgid()
     inside_uid, inside_gid = (0, 0) if "--root" in options else (uid, gid)
@@ -227,7 +233,8 @@ def start(args: list[str]) -> int:
     os.chroot(rootfs)
     os.chdir("/")
     environment = {}
-    for line in Path("/etc/environment").read_text().splitlines():
+    environ = Path("/etc/environment")  # optional, as for enroot
+    for line in (environ.read_text() if environ.is_file() else "").splitlines():
         key, separator, value = line.partition("=")
         if separator:
             environment[key] = value
