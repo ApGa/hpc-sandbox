@@ -341,6 +341,29 @@ async def test_a_command_that_never_started_is_an_infrastructure_error(provider,
     assert result.stderr == "err\n" and (await sandbox.exec("echo ok")).stdout == "ok\n"
 
 
+async def test_squashfs_images_are_refused_before_anything_is_created(tmp_path, fake_runtime):
+    provider = make_provider(tmp_path)
+    squashfs = tmp_path / "task.sqsh"
+    squashfs.write_bytes(b"hsqs")
+    with pytest.raises(ValueError, match="squashfs"):
+        await provider.start(SandboxSpec(image=str(squashfs)))
+    assert not provider.scratch_root.exists()
+
+
+def test_unknown_schemes_and_bare_squashfs_names_are_refused(tmp_path, fake_runtime):
+    check = make_provider(tmp_path).images.format.check
+    for reference in (
+        "dockerd://image:1",
+        "foo://image",
+        "task.sqsh",
+        "task.squashfs@sha256:" + "a" * 64,
+    ):
+        with pytest.raises(ValueError):
+            check(reference)
+    for reference in ("docker://alpine:3.20", "ubuntu:24.04", "oras://registry/x:1", "/x/task.sif"):
+        check(reference)
+
+
 def test_records_say_when_fakeroot_makes_commands_run_as_root(tmp_path, fake_runtime):
     from hpc_sandbox.singularity import SingularitySandbox
 

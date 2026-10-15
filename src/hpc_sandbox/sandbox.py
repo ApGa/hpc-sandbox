@@ -245,6 +245,7 @@ class SessionProvider(Generic[S]):
         return sandbox
 
     def _check(self, spec: SandboxSpec) -> None:
+        self.images.format.check(spec.image)
         if spec.network not in ("host", "none"):
             raise ValueError(f"unknown network mode {spec.network!r}")
         if spec.network == "none" and "network_none" not in self.capabilities:

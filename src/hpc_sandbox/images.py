@@ -39,6 +39,9 @@ from .types import SandboxError
 DIGEST = re.compile(r"@sha256:([0-9a-f]{64})$")
 _REMOTE_SCHEMES = ("docker://", "oras://", "library://", "shub://", "http://", "https://")
 LOCAL_PREFIXES = ("/", "./", "../", "~", "file://")
+SQUASHFS_MAGIC = b"hsqs"
+SQUASHFS_SUFFIXES = (".sqsh", ".squashfs")
+SIF_MAGIC = b"SIF_MAGIC"
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,13 @@ class ImageFormat(Protocol):
 
     def is_local(self, reference: str) -> bool:
         """Whether ``reference`` names a local file rather than a remote image."""
+        ...
+
+    def check(self, reference: str) -> None:
+        """Raise ValueError if ``reference`` can never resolve to an image of this format.
+
+        Cheap and side-effect free: called before a sandbox creates anything.
+        """
         ...
 
     def pull_uri(self, reference: str) -> str:
@@ -91,6 +101,21 @@ class SifImages:
     def is_local(self, reference: str) -> bool:
         return is_local(reference)
 
+    def check(self, reference: str) -> None:
+        if self.is_local(reference):
+            path = local_path(reference)
+            if path.suffix in SQUASHFS_SUFFIXES or file_magic(path, 0, 4) == SQUASHFS_MAGIC:
+                raise ValueError(
+                    f"{reference!r} is a squashfs image; the Singularity provider runs SIF images"
+                )
+        elif DIGEST.sub("", reference).endswith(SQUASHFS_SUFFIXES):
+            raise ValueError(
+                f"{reference!r} is a squashfs image; the Singularity provider runs SIF images"
+            )
+        elif "://" in reference and not reference.startswith(_REMOTE_SCHEMES):
+            scheme = reference.split("://", 1)[0]
+            raise ValueError(f"Singularity cannot pull {scheme}:// references: {reference!r}")
+
     def pull_uri(self, reference: str) -> str:
         return pull_uri(reference)
 
@@ -100,6 +125,26 @@ class SifImages:
 
     async def pull(self, uri: str, target: Path, *, timeout_s: float) -> ProcessResult:
         return await self.runtime.run("pull", "--force", str(target), uri, timeout_s=timeout_s)
+
+
+def local_path(reference: str) -> Path:
+    """The file a local image reference names, without its ``@sha256:`` pin."""
+    return Path(DIGEST.sub("", reference).removeprefix("file://")).expanduser().resolve()
+
+
+def file_magic(path: Path, offset: int, size: int) -> bytes:
+    """``size`` bytes of ``path`` at ``offset``, or b"" if it cannot be read."""
+    try:
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            return stream.read(size)
+    except OSError:
+        return b""
+
+
+def is_sif(path: Path) -> bool:
+    """Whether ``path`` starts like a SIF file (launch script, then ``SIF_MAGIC``)."""
+    return file_magic(path, 32, len(SIF_MAGIC)) == SIF_MAGIC
 
 
 def is_local(reference: str) -> bool:
@@ -143,6 +188,14 @@ def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
 
 
 class ImageStore:
+    """Resolve references to image files of one format.
+
+    Pulled images are cached by reference, so a tag that moves keeps the image
+    it named when it was first pulled. To pull it again, delete its cached
+    ``uri-<hash>`` file and ``.json`` sidecar; better, pin images by digest
+    or by file content.
+    """
+
     def __init__(
         self,
         image_format: ImageFormat,
@@ -194,7 +247,7 @@ class ImageStore:
 
     async def _local(self, reference: str) -> tuple[Path, str | None]:
         pinned = match.group(1) if (match := DIGEST.search(reference)) else None
-        path = Path(DIGEST.sub("", reference).removeprefix("file://")).expanduser().resolve()
+        path = local_path(reference)
         if not path.is_file():
             raise SandboxError(f"image {reference!r} is not a file")
         if not await self._is_valid(path):

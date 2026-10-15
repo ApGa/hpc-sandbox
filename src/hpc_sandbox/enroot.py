@@ -52,8 +52,13 @@ from . import procfs, safefs
 from .images import (
     DIGEST,
     LOCAL_PREFIXES,
+    SQUASHFS_MAGIC,
+    SQUASHFS_SUFFIXES,
     ImageStore,
     ResolvedImage,
+    file_magic,
+    is_sif,
+    local_path,
 )
 from .paths import default_image_cache, should_stage
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
@@ -324,18 +329,24 @@ class SquashfsImages:
 
     def is_local(self, reference: str) -> bool:
         return reference.startswith(LOCAL_PREFIXES) or DIGEST.sub("", reference).endswith(
-            (".sqsh", ".squashfs")
+            SQUASHFS_SUFFIXES
         )
+
+    def check(self, reference: str) -> None:
+        if not self.is_local(reference):
+            import_uri(reference)  # raises ValueError for what enroot cannot import
+            return
+        path = local_path(reference)
+        if path.suffix == ".sif" or is_sif(path):
+            raise ValueError(
+                f"{reference!r} is a SIF image; the enroot provider runs squashfs images"
+            )
 
     def pull_uri(self, reference: str) -> str:
         return import_uri(reference)
 
     async def validate(self, path: Path) -> bool:
-        try:
-            with path.open("rb") as stream:
-                return stream.read(4) == b"hsqs"
-        except OSError:
-            return False
+        return file_magic(path, 0, len(SQUASHFS_MAGIC)) == SQUASHFS_MAGIC
 
     async def pull(self, uri: str, target: Path, *, timeout_s: float) -> ProcessResult:
         return await self.runtime.run(

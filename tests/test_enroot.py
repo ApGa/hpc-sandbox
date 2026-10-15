@@ -524,6 +524,23 @@ async def test_a_command_that_never_started_is_an_infrastructure_error(enroot_pr
     assert (result.stdout, result.stderr) == ("out\n", "err\n")
 
 
+async def test_wrong_images_are_refused_before_anything_is_created(tmp_path, fake_enroot):
+    provider = make_enroot_provider(tmp_path)
+    sif = tmp_path / "task.sif"
+    sif.write_bytes(b"#!/usr/bin/env run-singularity\n\0SIF_MAGIC\0")
+    renamed = tmp_path / "task.img"
+    renamed.write_bytes(sif.read_bytes())
+    for image in (
+        str(sif),
+        str(renamed),
+        "oras://registry/image:1",
+        "docker://x@sha256:" + "a" * 64,
+    ):
+        with pytest.raises(ValueError):
+            await provider.start(SandboxSpec(image=image))
+    assert not provider.scratch_root.exists() and not fake_enroot.calls()
+
+
 async def test_downloads_do_not_need_to_preserve_unmapped_owners(enroot_provider, sqsh, tmp_path):
     shared = Path("/usr/share")  # root-owned on the host: an unmapped owner in the sandbox
     sandbox = await enroot_provider.start(

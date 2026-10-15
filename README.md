@@ -83,10 +83,16 @@ All commands take `--runtime auto|singularity|enroot` (default
 
 What both providers share:
 
-1. **Image.** A remote reference is pulled once into the image cache under a
-   file lock, validated and published read-only. A local image path may carry
-   an `@sha256:<hex>` suffix to pin the file's content. Inside a batch job
-   whose image cache is on another filesystem (for example Lustre or NFS),
+1. **Image.** A reference the provider can never run (a SIF image for enroot,
+   a squashfs image for Singularity, a scheme the runtime cannot pull) raises
+   `ValueError` before anything is created. A remote reference is pulled once
+   into the image cache under a file lock, validated and published read-only.
+   The cache is keyed by reference, so a tag that moves keeps the image it
+   named when first pulled: pin images by digest (or by file content), or
+   delete the cached `uri-<hash>` file and its `.json` sidecar to pull again.
+   A local image path may carry an `@sha256:<hex>` suffix to pin the file's
+   content. Inside a batch job whose image cache is on another filesystem
+   (for example Lustre or NFS),
    the image is staged to node-local scratch as `sha256-<digest>.<ext>`,
    verified while copying.
 2. **Session.** A private directory `sessions/hpcsb-<uuid>` (mode 0700) on
@@ -186,6 +192,18 @@ long-lived `enroot start` whose command is a keep-alive loop.
   `TAR_OPTIONS=--delay-directory-restore`, and with a wrapper around
   `enroot-aufs2ovlfs` that resolves whiteouts enroot 3.5 aborts on, so images
   that revisit read-only directories or shadow their own entries import.
+- **Digest pins.** Enroot 3.x misparses `@sha256:` references, so they raise
+  `ValueError`. To pin an image, import it once and pass the file with a
+  content pin, which is checked before every use:
+
+  ```bash
+  enroot import --output /shared/images/task.sqsh docker://registry#org/task:tag
+  sha256sum /shared/images/task.sqsh   # -> <hex>
+  ```
+
+  ```python
+  SandboxSpec(image="/shared/images/task.sqsh@sha256:<hex>")
+  ```
 - **Root filesystem.** `enroot create` into the session directory.
 - **Namespaces.** A small launcher creates new user, mount, PID and IPC
   namespaces — plus a network namespace with only an up loopback interface
