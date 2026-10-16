@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -44,6 +45,12 @@ from .sessions import (
     sweep,
 )
 from .types import (
+    CWD_ERROR_EXIT_CODE,
+    CWD_ERROR_PREFIX,
+    CWD_ERROR_REASONS,
+    DROPPED_LINKS_SHOWN,
+    DownloadReport,
+    DroppedLink,
     ExecResult,
     SandboxError,
     SandboxLostError,
@@ -406,14 +413,17 @@ class SessionSandbox:
             if result.exit_code != 0:
                 raise SandboxError(f"upload to {dst} failed: {result.stderr.strip()}")
 
-    async def download(self, src: str, dst: str | Path) -> None:
-        """Copy sandbox file ``src`` to host path ``dst``, or a directory to ``dst``."""
+    async def download(self, src: str, dst: str | Path) -> DownloadReport:
+        """Copy sandbox file ``src`` to host path ``dst``, or a directory to ``dst``.
+
+        A symlink given as ``src`` is followed. Symlinks inside a directory
+        that could lead out of the copy are left out and reported.
+        """
         self._require_running()
         target = Path(dst)
+        source = self._in_workdir(src)
         async with self._transfer() as (staging, container_dir):
-            result = await self._transfer_exec(
-                _DOWNLOAD, self._in_workdir(src), f"{container_dir}/payload"
-            )
+            result = await self._transfer_exec(_DOWNLOAD, source, f"{container_dir}/payload")
             if result.exit_code == _MISSING_SOURCE:
                 raise FileNotFoundError(f"no such file or directory in the sandbox: {src}")
             if result.exit_code != 0:
@@ -423,14 +433,27 @@ class SessionSandbox:
                 removed = await _in_thread(partial(safefs.copy_out, "payload", staging, target))
             except SandboxError as error:  # what the sandbox left there cannot be copied
                 raise SandboxError(f"download of {src} to {target} failed: {error}") from error
-        if removed:
+        tree = source if source.startswith("/") else None
+        dropped = [
+            DroppedLink(
+                path,
+                link,
+                "absolute into the tree"
+                if reason == "absolute" and tree and _within(link, tree)
+                else reason,
+            )
+            for path, link, reason in removed
+        ]
+        if dropped:
             log.warning(
-                "sandbox %s: download of %s left out %d symlink(s) pointing outside it: %s",
+                "sandbox %s: download of %s left out %d symlink(s) that could lead outside it: %s",
                 self.id,
                 src,
-                len(removed),
-                ", ".join(removed[:20]) + (", ..." if len(removed) > 20 else ""),
+                len(dropped),
+                ", ".join(link.path for link in dropped[:20])
+                + (", ..." if len(dropped) > 20 else ""),
             )
+        return DownloadReport(dropped[:DROPPED_LINKS_SHOWN], len(dropped))
 
     async def snapshot(self) -> SandboxSnapshot:
         """Copy the writable rootfs and private tmp dirs; processes are not captured.
@@ -638,8 +661,10 @@ class SessionSandbox:
         stdout = result.stdout.decode(errors="replace")
         stderr = raw_stderr.decode(errors="replace")
         if not started_command:
-            if result.returncode == WORKDIR_EXIT_CODE and _WORKDIR_FAILURE in raw_stderr:
-                return ExecResult(WORKDIR_EXIT_CODE, stdout, stderr)
+            if (line := _cwd_error(result.returncode, stderr)) is not None:
+                # The command failed like any other (as with `docker exec`): the
+                # sandbox's own state, not the infrastructure, is to blame.
+                return ExecResult(CWD_ERROR_EXIT_CODE, "", line)
             if not self._container_alive():
                 self._mark_lost(stderr)
             state = "timed out" if result.timed_out else f"exit {result.returncode}"
@@ -832,11 +857,6 @@ shift 3
 exec "$@"
 """
 _NEWLINE = '"$hpc_sandbox_nl"'  # how environment_script writes a newline
-# What the prologue reports when the working directory cannot be entered: the
-# command fails like any other (as with `docker exec`), since the sandbox's own
-# state, not the infrastructure, is to blame.
-WORKDIR_EXIT_CODE = 126
-_WORKDIR_FAILURE = b"hpc-sandbox: cannot enter the working directory "
 
 
 def prologue(argv: Sequence[str], cwd: str, *, stdin: bool) -> list[str]:
@@ -877,6 +897,25 @@ def environment_script(env: Mapping[str, str]) -> bytes:
         else:
             commands.append(f"export {assignment}")
     return os.fsencode("; ".join(commands) + "\n")
+
+
+def _within(path: str, tree: str) -> bool:
+    path, tree = (posixpath.normpath("/" + p.lstrip("/")) for p in (path, tree))  # "//x" is "/x"
+    return path == tree or path.startswith(tree.rstrip("/") + "/")
+
+
+def _cwd_error(returncode: int, stderr: str) -> str | None:
+    """The prologue's line when it could not enter the working directory, else None.
+
+    It is the last thing the prologue prints before it exits, and is taken
+    whole from its prefix to the end, since the directory itself may hold
+    line breaks; what a runtime printed before it is not the command's.
+    """
+    index = stderr.rfind(CWD_ERROR_PREFIX)
+    if returncode != CWD_ERROR_EXIT_CODE or index < 0:
+        return None
+    line = stderr[index:]
+    return line if line.endswith(tuple(f": {r}\n" for r in CWD_ERROR_REASONS)) else None
 
 
 def split_start_marker(stderr: bytes) -> tuple[bool, bytes]:

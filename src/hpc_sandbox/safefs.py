@@ -225,7 +225,7 @@ def _copy_in_entry(
 
 def copy_out(
     name: str, dir_fd: int, target: Path, stop: threading.Event | None = None
-) -> list[str]:
+) -> list[tuple[str, str, str]]:
     """Copy the entry ``name`` to the host path ``target``.
 
     The caller chose ``target``, so it is treated like ``shutil.copytree``
@@ -241,7 +241,8 @@ def copy_out(
     applies (the caller always gets read access, and full access to
     directories). Symlinks are copied only if they stay inside ``target``
     whatever the sandbox puts there, now or in later downloads (see
-    :func:`stays_inside`); returns the ones left out, relative to ``target``.
+    :func:`link_problem`); returns the ones left out as (path relative to
+    ``target``, link text, reason).
     Entries the caller already had in ``target`` are reachable through kept
     links, so download into a new or empty directory to keep the sandbox's
     links away from the caller's own files. An entry that is itself a symlink
@@ -260,7 +261,7 @@ def copy_out(
         _copy_entry(name, dir_fd, target, info, stop, umask=umask, top=True)
         return []
     # Depth-first with one open descriptor per level, at most MAX_DEPTH of them.
-    left_out: list[str] = []
+    left_out: list[tuple[str, str, str]] = []
     stack: list[list] = []  # [descriptor, host directory, status, names or None]
     try:
         stack.append([open_dir(name, dir_fd), target, info, None])
@@ -284,12 +285,13 @@ def copy_out(
                     link = os.readlink(child, dir_fd=fd)
                 except OSError as error:  # replaced since the stat
                     raise SandboxError(f"{relative} changed while it was copied") from error
-                if stays_inside(link, len(relative.parts) - 1):
+                problem = link_problem(link, len(relative.parts) - 1)
+                if problem is None:
                     if child_target.is_symlink() or child_target.exists():
                         child_target.unlink()
                     os.symlink(link, child_target)
                 else:
-                    left_out.append(str(relative))
+                    left_out.append((str(relative), link, problem))
                 continue
             if not stat.S_ISDIR(child_info.st_mode):
                 _copy_entry(child, fd, child_target, child_info, stop, umask=umask, top=False)
@@ -320,27 +322,31 @@ def _real_directory(path: Path) -> None:
             raise SandboxError(f"{path} changed while it was written") from None
 
 
-def stays_inside(link: str, depth: int) -> bool:
-    """Whether a symlink to ``link``, ``depth`` directories below a tree's root, stays in it.
+def link_problem(link: str, depth: int) -> str | None:
+    """Why a symlink to ``link``, ``depth`` directories below a tree's root, may leave it.
 
-    It must be relative, climb with leading ``..`` no higher than the root,
-    and never climb after a name: ``a/..`` means wherever ``a`` leads, which
-    a later download into the same tree could change. Judged on the link
-    alone, the rule holds whatever else downloads put in the tree: links
-    through other such links stay inside because those obey it too, or
-    dangle. Entries the tree held before are not covered.
+    None if it stays inside: it must be relative (else ``"absolute"``), climb
+    with leading ``..`` no higher than the root (else ``"escapes with .."``),
+    and never climb after a name (else ``"climbs after a name"``): ``a/..``
+    means wherever ``a`` leads, which a later download into the same tree
+    could change. Judged on the link alone, the rule holds whatever else
+    downloads put in the tree: links through other such links stay inside
+    because those obey it too, or dangle. Entries the tree held before are
+    not covered.
     """
     if link.startswith("/"):
-        return False
+        return "absolute"
     named = False
     for part in link.split("/"):
         if part == "..":
-            if named or depth == 0:
-                return False
+            if named:
+                return "climbs after a name"
+            if depth == 0:
+                return "escapes with .."
             depth -= 1
         elif part not in ("", "."):
             named = True
-    return True
+    return None
 
 
 def _mode(info: os.stat_result, umask: int) -> int:

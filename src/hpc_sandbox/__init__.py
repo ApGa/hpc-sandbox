@@ -6,6 +6,11 @@ from .runtime import ContainerRuntime
 from .sessions import JanitorReport
 from .singularity import SingularityProvider, SingularitySandbox
 from .types import (
+    CWD_ERROR_EXIT_CODE,
+    CWD_ERROR_PREFIX,
+    CWD_ERROR_REASONS,
+    DownloadReport,
+    DroppedLink,
     ExecResult,
     Mount,
     Sandbox,
@@ -20,7 +25,12 @@ from .types import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "CWD_ERROR_EXIT_CODE",
+    "CWD_ERROR_PREFIX",
+    "CWD_ERROR_REASONS",
     "ContainerRuntime",
+    "DownloadReport",
+    "DroppedLink",
     "EnrootProvider",
     "EnrootRuntime",
     "EnrootSandbox",

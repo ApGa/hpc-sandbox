@@ -293,19 +293,19 @@ def test_downloads_drop_privilege_bits_and_apply_the_umask(tmp_path):
 
 
 def test_symlinks_stay_inside_by_their_own_target():
-    for link, depth, inside in (
-        ("file", 0, True),
-        ("./sub/./file", 0, True),
-        (".", 0, True),
-        ("../file", 1, True),
-        ("../../x", 2, True),
-        ("../../x", 1, False),  # above the root
-        ("/etc/passwd", 5, False),
-        ("sub/..", 3, False),  # wherever sub leads
-        ("../sub/../x", 3, False),
-        ("a/b/c", 0, True),
+    for link, depth, problem in (
+        ("file", 0, None),
+        ("./sub/./file", 0, None),
+        (".", 0, None),
+        ("../file", 1, None),
+        ("../../x", 2, None),
+        ("a/b/c", 0, None),
+        ("../../x", 1, "escapes with .."),  # above the root
+        ("/etc/passwd", 5, "absolute"),
+        ("sub/..", 3, "climbs after a name"),  # wherever sub leads
+        ("../sub/../x", 3, "climbs after a name"),
     ):
-        assert safefs.stays_inside(link, depth) is inside, (link, depth)
+        assert safefs.link_problem(link, depth) == problem, (link, depth)
 
 
 def test_downloads_leave_out_symlinks_that_could_lead_outside(tmp_path):
@@ -329,9 +329,18 @@ def test_downloads_leave_out_symlinks_that_could_lead_outside(tmp_path):
     for name, target in links.items():
         (payload / name).symlink_to(target)
     with safefs.opened_dir(tree) as fd:
-        left_out = safefs.copy_out("payload", fd, tmp_path / "copy")
+        reported = safefs.copy_out("payload", fd, tmp_path / "copy")
     kept = {"sub/inside", "sub/deeper/up", "to-sub", "through-sub", "to-root", "chain"}
+    assert all(target == links[path] for path, target, _ in reported)
+    left_out = [path for path, _, _ in reported]
     assert sorted(left_out) == sorted(set(links) - kept)
+    assert {path: reason for path, _, reason in reported} == {
+        "absolute": "absolute",
+        "escape": "escapes with ..",
+        "deep-escape": "climbs after a name",
+        "root-parent": "climbs after a name",
+        "dangling": "climbs after a name",
+    }
     copy = tmp_path / "copy"
     assert all(os.readlink(copy / name) == links[name] for name in kept)
     assert not any(os.path.lexists(copy / name) for name in left_out)

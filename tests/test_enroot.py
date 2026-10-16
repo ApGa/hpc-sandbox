@@ -16,7 +16,12 @@ from conftest import make_enroot_provider
 from test_safefs import make_deep_tree
 
 from hpc_sandbox import (
+    CWD_ERROR_EXIT_CODE,
+    CWD_ERROR_PREFIX,
+    DownloadReport,
+    DroppedLink,
     EnrootProvider,
+    ExecResult,
     Mount,
     Sandbox,
     SandboxError,
@@ -1116,12 +1121,12 @@ async def test_a_missing_working_directory_fails_the_command_not_the_sandbox(
 ):
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), workdir="/work"))
     assert (await sandbox.exec("rm -rf /work && echo payload > /out.txt", cwd="/")).exit_code == 0
-    for cwd, reason in ((None, "it does not exist"), ("/work", "it does not exist")):
+    for cwd in (None, "/work"):
         result = await sandbox.exec("echo ran", cwd=cwd)
-        assert result.exit_code == 126 and result.stdout == "", (cwd, result)
-        assert "cannot enter the working directory /work: " + reason in result.stderr, result
+        missing = f"{CWD_ERROR_PREFIX}/work: it does not exist or cannot be reached\n"
+        assert result == ExecResult(CWD_ERROR_EXIT_CODE, "", missing), (cwd, result)
     result = await sandbox.exec("echo ran", cwd="/out.txt")
-    assert (result.exit_code, result.stderr.split(": ")[-1]) == (126, "not a directory\n")
+    assert result == ExecResult(126, "", f"{CWD_ERROR_PREFIX}/out.txt: not a directory\n")
     assert (await sandbox.exec("pwd", cwd="/")).stdout == "/\n"
     # Transfers of absolute paths do not need the workdir; relative ones resolve from it.
     await sandbox.download("/out.txt", tmp_path / "out.txt")
@@ -1182,17 +1187,24 @@ async def test_downloads_keep_only_symlinks_inside_what_they_copy(
 ):
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
     made = await sandbox.exec(
-        "mkdir -p out && echo data > out/f && chmod 4755 out/f"
-        " && ln -s f out/inside && ln -s /etc/passwd out/absolute && ln -s ../../x out/escape"
+        "mkdir -p out && echo data > out/f && chmod 4755 out/f && ln -s f out/inside"
+        " && ln -s /etc/passwd out/absolute && ln -s ../../x out/escape && ln -s /app/out/f out/abs-in"
     )
     assert made.exit_code == 0, made.stderr
     with caplog.at_level("WARNING"):
-        await sandbox.download("/app/out", tmp_path / "out")
+        report = await sandbox.download("out", tmp_path / "out")  # relative: from the workdir
     copy = tmp_path / "out"
     assert sorted(path.name for path in copy.iterdir()) == ["f", "inside"]
     assert (copy / "inside").read_text() == "data\n"
     assert not stat.S_IMODE((copy / "f").stat().st_mode) & (stat.S_ISUID | stat.S_ISGID)
-    assert "absolute, escape" in caplog.text or "escape, absolute" in caplog.text
+    assert report.dropped_total == 3 and sorted(report.dropped_links, key=str) == [
+        DroppedLink("abs-in", "/app/out/f", "absolute into the tree"),
+        DroppedLink("absolute", "/etc/passwd", "absolute"),
+        DroppedLink("escape", "../../x", "escapes with .."),
+    ]
+    assert f"sandbox {sandbox.id}: download of out left out 3 symlink(s)" in caplog.text
+    single = await sandbox.download("/app/out/inside", tmp_path / "single")  # followed, as cp -H
+    assert (tmp_path / "single").read_text() == "data\n" and single == DownloadReport()
 
 
 async def test_digest_pinned_images_are_imported_by_digest(tmp_path, fake_enroot):
@@ -1225,3 +1237,31 @@ async def test_pulls_create_the_scratch_directories_they_need(tmp_path, fake_enr
     provider = make_enroot_provider(tmp_path)
     await provider.images.pull("docker://example/task:1")
     assert provider.runtime.temp_dir.is_dir() and provider.runtime.cache_dir.is_dir()
+
+
+async def test_working_directory_failures_keep_their_shape_whatever_the_path(
+    enroot_provider, sqsh, monkeypatch
+):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    for cwd in ("/no\nsuch", "/no\x85such", "/no\u2028such"):
+        reason = "it does not exist or cannot be reached"
+        assert await sandbox.exec("true", cwd=cwd) == ExecResult(
+            126, "", f"{CWD_ERROR_PREFIX}{cwd}: {reason}\n"
+        ), cwd
+    from hpc_sandbox import sandbox as module
+
+    original = module.prologue
+
+    def chatty(*args, **kwargs):  # a runtime that prints before the prologue runs
+        return [
+            "/bin/sh",
+            "-c",
+            'echo banner; echo warning >&2; exec "$@"',
+            "x",
+            *original(*args, **kwargs),
+        ]
+
+    monkeypatch.setattr(module, "prologue", chatty)
+    reason = "it does not exist or cannot be reached"
+    expected = ExecResult(126, "", f"{CWD_ERROR_PREFIX}/gone: {reason}\n")
+    assert await sandbox.exec("true", cwd="/gone") == expected

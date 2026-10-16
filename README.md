@@ -52,7 +52,14 @@ per-call `timeout_s`, `env`, `cwd` and `stdin` bytes. Every call has a timeout
 process tree is killed and the result has `timed_out=True` and exit code 124.
 Infrastructure failures raise `SandboxError` (`SandboxStartError` when a
 sandbox cannot start, `SandboxLostError` when its container died) instead of
-masquerading as command failures.
+masquerading as command failures; a runtime that cannot enter the container
+and a command that never started are such failures. A working directory that
+is missing or cannot be entered is the sandbox's state, not a failure of the
+infrastructure: the command returns exit code 126 (`CWD_ERROR_EXIT_CODE`),
+empty stdout and, on stderr, only `CWD_ERROR_PREFIX + "<dir>: <reason>"`, with
+the reason one of `CWD_ERROR_REASONS`. `download` raises `FileNotFoundError`
+for a missing source and returns a `DownloadReport` of the symlinks it left
+out (see Transfers). These are stable parts of the interface.
 
 Both providers satisfy the `SandboxProvider` and `Sandbox` protocols in
 `hpc_sandbox.types`, so code written against the protocols does not depend on
@@ -145,15 +152,16 @@ What both providers share:
    if they stay inside the downloaded tree on their own: relative, climbing
    with leading `..` no higher than the tree, and never after a name (`a/..`
    leads wherever `a` does, which a later download into the same directory
-   could change). Others, absolute ones included, are left out with a logged
-   warning. Kept links can still reach what the destination already held, so
-   download into a new or empty directory to keep the sandbox's links away
-   from your own files; special files and directories nested more than 256
-   levels deep raise `SandboxError`. Uploads refuse special files on the host
-   with `SpecialFileError`, except a character device given as the source
-   itself (`/dev/null` gives an empty file). The destination is yours: a
-   symlink there is followed, a directory receives a directory's contents, and
-   only a file replaces an existing file.
+   could change). Others, absolute ones included, are left out, logged, and
+   returned in the `DownloadReport` with each link's path, text and reason.
+   Kept links can still reach what the destination already held, so download
+   into a new or empty directory to keep the sandbox's links away from your
+   own files; special files and directories nested more than 256 levels deep
+   raise `SandboxError`. Uploads refuse special files on the host with
+   `SpecialFileError`, except a character device given as the source itself
+   (`/dev/null` gives an empty file). The destination is yours: a symlink
+   there is followed, a directory receives a directory's contents, and only a
+   file replaces an existing file.
 5. **Memory.** With `memory_mb`, a watchdog samples the proportional set size
    of the container's processes and of every running command once a second.
    On a breach it kills the largest process, like the kernel OOM killer, and

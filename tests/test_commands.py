@@ -66,3 +66,16 @@ def test_the_prologue_takes_the_environment_from_the_first_line_of_stdin():
         argv = [*shell, *prologue(command, "/", stdin=True)[1:]]
         result = subprocess.run(argv, input=b"", capture_output=True, check=False)
         assert result.returncode != 0 and START_MARKER.encode() not in result.stderr
+
+
+def test_only_the_prologues_own_line_marks_a_working_directory_failure():
+    from hpc_sandbox import CWD_ERROR_PREFIX
+    from hpc_sandbox.sandbox import _cwd_error
+
+    for cwd in ("/work", "/no\nsuch", "/a\x85b\u2028c", "/d\re"):
+        line = f"{CWD_ERROR_PREFIX}{cwd}: permission denied\n"
+        noisy = f"WARNING: runtime noise\n{line}"
+        assert _cwd_error(126, noisy) == line, cwd  # runtime warnings are not the command's
+        assert _cwd_error(1, noisy) is None
+    assert _cwd_error(126, "some command failed with 126\n") is None
+    assert _cwd_error(126, f"{CWD_ERROR_PREFIX}/work: made up\n") is None

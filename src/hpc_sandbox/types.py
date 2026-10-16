@@ -53,6 +53,47 @@ class ExecResult:
     timed_out: bool = False
 
 
+# How a command that could not enter its working directory reports it: exit
+# status CWD_ERROR_EXIT_CODE (126, as with `docker exec`), empty stdout, and on
+# stderr only the line CWD_ERROR_PREFIX + "<directory>: <reason>", the reason
+# being one of CWD_ERROR_REASONS.
+CWD_ERROR_EXIT_CODE = 126
+CWD_ERROR_PREFIX = "hpc-sandbox: cannot enter the working directory "
+CWD_ERROR_REASONS = (
+    "it does not exist or cannot be reached",
+    "not a directory",
+    "permission denied",
+)
+
+
+@dataclass(frozen=True)
+class DroppedLink:
+    """A symlink a download left out, so that host tools never follow it.
+
+    ``path`` is relative to the download's destination, ``target`` the link's
+    text, and ``reason`` one of ``"absolute"``, ``"absolute into the tree"``
+    (absolute, but naming something inside the downloaded tree as the
+    sandbox sees it), ``"escapes with .."`` (its leading ``..`` climb above
+    the destination) or ``"climbs after a name"`` (``a/..`` leads wherever
+    ``a`` does).
+    """
+
+    path: str
+    target: str
+    reason: str
+
+
+@dataclass
+class DownloadReport:
+    """What a download left out: at most ``DROPPED_LINKS_SHOWN`` links, and how many in all."""
+
+    dropped_links: list[DroppedLink] = field(default_factory=list)
+    dropped_total: int = 0
+
+
+DROPPED_LINKS_SHOWN = 100
+
+
 @dataclass
 class SandboxSnapshot:
     """A point-in-time copy of a sandbox's filesystem state.
@@ -85,7 +126,7 @@ class Sandbox(Protocol):
 
     async def upload(self, src: str | Path, dst: str) -> None: ...
 
-    async def download(self, src: str, dst: str | Path) -> None: ...
+    async def download(self, src: str, dst: str | Path) -> DownloadReport: ...
 
     async def snapshot(self) -> SandboxSnapshot: ...
 
