@@ -941,9 +941,10 @@ def test_descriptor_helpers_never_follow_symlinks(tmp_path):
         assert safefs.set_mode("file-link", fd, exact=0o000) is None
         with pytest.raises(NotADirectoryError):
             safefs.open_dir("dir-link", fd)
-        safefs.copy_out("dir-link", fd, tmp_path / "copy")
+        with pytest.raises(SandboxError, match="symlink"):
+            safefs.copy_out("dir-link", fd, tmp_path / "copy")
         safefs.remove("dir-link", fd)
-    assert (tmp_path / "copy").is_symlink() and (outside / "secret").read_text() == "host\n"
+    assert not os.path.lexists(tmp_path / "copy") and (outside / "secret").read_text() == "host\n"
     assert stat.S_IMODE((outside / "secret").stat().st_mode) == 0o600
 
 
@@ -1138,6 +1139,24 @@ async def test_a_missing_working_directory_fails_the_command_not_the_sandbox(
     assert moved.stdout == "/work/sub\n", moved
     with pytest.raises(FileNotFoundError):
         await sandbox.download("", tmp_path / "everything")
+
+
+async def test_downloads_keep_only_symlinks_inside_what_they_copy(
+    enroot_provider, sqsh, tmp_path, caplog
+):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
+    made = await sandbox.exec(
+        "mkdir -p out && echo data > out/f && chmod 4755 out/f"
+        " && ln -s f out/inside && ln -s /etc/passwd out/absolute && ln -s ../../x out/escape"
+    )
+    assert made.exit_code == 0, made.stderr
+    with caplog.at_level("WARNING"):
+        await sandbox.download("/app/out", tmp_path / "out")
+    copy = tmp_path / "out"
+    assert sorted(path.name for path in copy.iterdir()) == ["f", "inside"]
+    assert (copy / "inside").read_text() == "data\n"
+    assert not stat.S_IMODE((copy / "f").stat().st_mode) & (stat.S_ISUID | stat.S_ISGID)
+    assert "absolute, escape" in caplog.text or "escape, absolute" in caplog.text
 
 
 async def test_digest_pinned_images_are_imported_by_digest(tmp_path, fake_enroot):

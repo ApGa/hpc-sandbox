@@ -135,14 +135,25 @@ What both providers share:
    paths (including its mounts). Code in the sandbox can change that directory
    at any time, so the host side works in it only through file descriptors,
    never follows a symlink it finds there and never blocks on a FIFO.
-   Downloads keep modes and timestamps but not owners (inside a user
-   namespace, files on host mounts belong to owners the namespace does not
-   map), and the copy is always readable by you; special files such as FIFOs
-   and directories nested more than 256 levels deep raise `SandboxError`.
-   Uploads refuse special files on the host with `SpecialFileError`, except a
-   character device given as the source itself (`/dev/null` gives an empty
-   file). The destination is yours: a symlink there is followed, a directory
-   receives a directory's contents, and only a file replaces an existing file.
+   Transfers run from `/`, so they work once the workdir is gone; relative
+   paths still resolve from it, as does a relative `cwd` for `exec`. Downloads
+   keep timestamps and modes, but not owners (inside a user namespace, files
+   on host mounts belong to owners the namespace does not map) and not what
+   the sandbox must not hand you: setuid, setgid and sticky bits are dropped,
+   your umask applies, and the copy is always readable by you. A symlink given
+   as the source is followed, as `cp -H` does. Symlinks inside are copied only
+   if they stay inside the downloaded tree on their own: relative, climbing
+   with leading `..` no higher than the tree, and never after a name (`a/..`
+   leads wherever `a` does, which a later download into the same directory
+   could change). Others, absolute ones included, are left out with a logged
+   warning. Kept links can still reach what the destination already held, so
+   download into a new or empty directory to keep the sandbox's links away
+   from your own files; special files and directories nested more than 256
+   levels deep raise `SandboxError`. Uploads refuse special files on the host
+   with `SpecialFileError`, except a character device given as the source
+   itself (`/dev/null` gives an empty file). The destination is yours: a
+   symlink there is followed, a directory receives a directory's contents, and
+   only a file replaces an existing file.
 5. **Memory.** With `memory_mb`, a watchdog samples the proportional set size
    of the container's processes and of every running command once a second.
    On a breach it kills the largest process, like the kernel OOM killer, and

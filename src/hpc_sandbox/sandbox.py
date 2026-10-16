@@ -420,9 +420,17 @@ class SessionSandbox:
                 raise SandboxError(f"download of {src} failed: {result.stderr.strip()}")
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                await _in_thread(partial(safefs.copy_out, "payload", staging, target))
+                removed = await _in_thread(partial(safefs.copy_out, "payload", staging, target))
             except SandboxError as error:  # what the sandbox left there cannot be copied
                 raise SandboxError(f"download of {src} to {target} failed: {error}") from error
+        if removed:
+            log.warning(
+                "sandbox %s: download of %s left out %d symlink(s) pointing outside it: %s",
+                self.id,
+                src,
+                len(removed),
+                ", ".join(removed[:20]) + (", ..." if len(removed) > 20 else ""),
+            )
 
     async def snapshot(self) -> SandboxSnapshot:
         """Copy the writable rootfs and private tmp dirs; processes are not captured.

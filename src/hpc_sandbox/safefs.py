@@ -223,7 +223,9 @@ def _copy_in_entry(
             os.close(writer)
 
 
-def copy_out(name: str, dir_fd: int, target: Path, stop: threading.Event | None = None) -> None:
+def copy_out(
+    name: str, dir_fd: int, target: Path, stop: threading.Event | None = None
+) -> list[str]:
     """Copy the entry ``name`` to the host path ``target``.
 
     The caller chose ``target``, so it is treated like ``shutil.copytree``
@@ -231,21 +233,34 @@ def copy_out(name: str, dir_fd: int, target: Path, stop: threading.Event | None 
     directory's contents, nothing replaces an existing file except a file
     (FileExistsError), and a FIFO is refused (SpecialFileError). Below it,
     names come from the sandbox: nothing is read through a symlink or blocks
-    on a FIFO, symlinks are copied as symlinks, existing non-directories are
-    replaced, special files raise SandboxError, and files are copied up to
-    the size they had when opened. The caller gets read access to what it
-    copies; modes and times are kept otherwise.
+    on a FIFO, existing non-directories are replaced, special files raise
+    SandboxError, and files are copied up to the size they had when opened.
+
+    Modes and times are kept, except what the sandbox must not hand the
+    caller: setuid, setgid and sticky bits are dropped and the caller's umask
+    applies (the caller always gets read access, and full access to
+    directories). Symlinks are copied only if they stay inside ``target``
+    whatever the sandbox puts there, now or in later downloads (see
+    :func:`stays_inside`); returns the ones left out, relative to ``target``.
+    Entries the caller already had in ``target`` are reachable through kept
+    links, so download into a new or empty directory to keep the sandbox's
+    links away from the caller's own files. An entry that is itself a symlink
+    raises SandboxError.
     """
+    umask = current_umask()
     info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if stat.S_ISLNK(info.st_mode):
+        raise SandboxError(f"refusing to copy {name}: it is a symlink")
     if stat.S_ISDIR(info.st_mode):
         if os.path.lexists(target) and not target.is_dir():
             raise FileExistsError(f"download target exists and is not a directory: {target}")
     elif target.is_dir():
         raise IsADirectoryError(f"download target is a directory: {target}")
     else:
-        _copy_entry(name, dir_fd, target, info, stop, top=True)
-        return
+        _copy_entry(name, dir_fd, target, info, stop, umask=umask, top=True)
+        return []
     # Depth-first with one open descriptor per level, at most MAX_DEPTH of them.
+    left_out: list[str] = []
     stack: list[list] = []  # [descriptor, host directory, status, names or None]
     try:
         stack.append([open_dir(name, dir_fd), target, info, None])
@@ -258,24 +273,90 @@ def copy_out(name: str, dir_fd: int, target: Path, stop: threading.Event | None 
             if child is None:
                 stack.pop()
                 os.close(fd)
-                os.chmod(directory, stat.S_IMODE(info.st_mode) | 0o700)
+                os.chmod(directory, _mode(info, umask) | 0o700)
                 os.utime(directory, ns=(info.st_atime_ns, info.st_mtime_ns))
                 continue
             child_info = os.stat(child, dir_fd=fd, follow_symlinks=False)
             child_target = directory / child
+            if stat.S_ISLNK(child_info.st_mode):
+                relative = child_target.relative_to(target)
+                try:
+                    link = os.readlink(child, dir_fd=fd)
+                except OSError as error:  # replaced since the stat
+                    raise SandboxError(f"{relative} changed while it was copied") from error
+                if stays_inside(link, len(relative.parts) - 1):
+                    if child_target.is_symlink() or child_target.exists():
+                        child_target.unlink()
+                    os.symlink(link, child_target)
+                else:
+                    left_out.append(str(relative))
+                continue
             if not stat.S_ISDIR(child_info.st_mode):
-                _copy_entry(child, fd, child_target, child_info, stop, top=False)
+                _copy_entry(child, fd, child_target, child_info, stop, umask=umask, top=False)
                 continue
             if len(stack) >= MAX_DEPTH:
                 raise SandboxError(f"directory tree deeper than {MAX_DEPTH} levels: {name}")
             stack.append([open_dir(child, fd), child_target, child_info, None])
             if child_target.is_symlink() or (child_target.exists() and not child_target.is_dir()):
                 child_target.unlink()
-            child_target.mkdir(exist_ok=True)
+            _real_directory(child_target)
             stack[-1][3] = iter(listing(stack[-1][0]))
     finally:
         for fd, *_ in stack:
             os.close(fd)
+    return left_out
+
+
+def _real_directory(path: Path) -> None:
+    """Create ``path``, or accept a directory there, but never a symlink to one.
+
+    Another download into the same directory may have put a symlink there
+    since it was checked; the links below would then land elsewhere.
+    """
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise SandboxError(f"{path} changed while it was written") from None
+
+
+def stays_inside(link: str, depth: int) -> bool:
+    """Whether a symlink to ``link``, ``depth`` directories below a tree's root, stays in it.
+
+    It must be relative, climb with leading ``..`` no higher than the root,
+    and never climb after a name: ``a/..`` means wherever ``a`` leads, which
+    a later download into the same tree could change. Judged on the link
+    alone, the rule holds whatever else downloads put in the tree: links
+    through other such links stay inside because those obey it too, or
+    dangle. Entries the tree held before are not covered.
+    """
+    if link.startswith("/"):
+        return False
+    named = False
+    for part in link.split("/"):
+        if part == "..":
+            if named or depth == 0:
+                return False
+            depth -= 1
+        elif part not in ("", "."):
+            named = True
+    return True
+
+
+def _mode(info: os.stat_result, umask: int) -> int:
+    """The permission bits of ``info`` without setuid, setgid and sticky, under ``umask``."""
+    return stat.S_IMODE(info.st_mode) & 0o777 & ~umask
+
+
+def current_umask() -> int:
+    """This process's umask, read without setting it (other threads may be creating files)."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0o022
 
 
 def _copy_entry(
@@ -285,14 +366,10 @@ def _copy_entry(
     info: os.stat_result,
     stop: threading.Event | None,
     *,
+    umask: int,
     top: bool,
 ) -> None:
-    """Copy one non-directory entry; ``top`` writes through the caller's own target."""
-    if stat.S_ISLNK(info.st_mode):
-        if not top and (target.is_symlink() or target.exists()):
-            target.unlink()
-        os.symlink(os.readlink(name, dir_fd=dir_fd), target)
-        return
+    """Copy one file; ``top`` writes through the caller's own target."""
     if not stat.S_ISREG(info.st_mode):
         raise SandboxError(f"cannot copy the special file {name}")
     try:
@@ -308,7 +385,7 @@ def _copy_entry(
         writer = _open_target(target, top=top)
         try:
             _copy_data(source, writer, stop, limit=opened.st_size)
-            os.fchmod(writer, stat.S_IMODE(info.st_mode) | 0o400)
+            os.fchmod(writer, _mode(info, umask) | 0o400)
             os.utime(writer, ns=(info.st_atime_ns, info.st_mtime_ns))
         finally:
             os.close(writer)

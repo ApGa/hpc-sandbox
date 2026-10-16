@@ -69,7 +69,7 @@ def test_downloads_never_block_on_a_fifo_swapped_in(tmp_path):
     def copy() -> None:
         with safefs.opened_dir(tree) as fd:
             try:
-                safefs._copy_entry("file", fd, tmp_path / "out", checked, None, top=True)
+                safefs._copy_entry("file", fd, tmp_path / "out", checked, None, umask=0, top=True)
             except SandboxError as error:
                 errors.append(error)
 
@@ -101,7 +101,7 @@ def test_download_targets_are_treated_like_shutil_would(tmp_path):
         safefs.copy_out("file", fd, tmp_path / "file-link")
         with pytest.raises(FileExistsError):
             safefs.copy_out("dir", fd, real_file)
-        with pytest.raises(FileExistsError):
+        with pytest.raises(SandboxError, match="symlink"):  # only a sandbox's race makes one
             safefs.copy_out("link", fd, real_file)
         with pytest.raises(IsADirectoryError):
             safefs.copy_out("file", fd, real_dir)
@@ -271,3 +271,114 @@ def test_failed_downloads_leak_no_descriptors(tmp_path):
     finally:
         (locked / "existing").chmod(0o700)
         locked.chmod(0o700)
+
+
+def test_downloads_drop_privilege_bits_and_apply_the_umask(tmp_path):
+    tree = tmp_path / "tree"
+    (tree / "payload" / "shared").mkdir(parents=True)
+    (tree / "payload" / "tool").write_text("#!/bin/sh\n")
+    (tree / "payload" / "tool").chmod(0o6777)
+    (tree / "payload" / "locked").write_text("x")
+    (tree / "payload" / "locked").chmod(0o000)
+    (tree / "payload" / "shared").chmod(0o3777)
+    previous = os.umask(0o027)  # not the fallback current_umask() assumes
+    try:
+        assert safefs.current_umask() == 0o027
+        with safefs.opened_dir(tree) as fd:
+            safefs.copy_out("payload", fd, tmp_path / "copy")
+    finally:
+        os.umask(previous)
+    modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in (tmp_path / "copy").iterdir()}
+    assert modes == {"tool": 0o750, "locked": 0o400, "shared": 0o750}
+
+
+def test_symlinks_stay_inside_by_their_own_target():
+    for link, depth, inside in (
+        ("file", 0, True),
+        ("./sub/./file", 0, True),
+        (".", 0, True),
+        ("../file", 1, True),
+        ("../../x", 2, True),
+        ("../../x", 1, False),  # above the root
+        ("/etc/passwd", 5, False),
+        ("sub/..", 3, False),  # wherever sub leads
+        ("../sub/../x", 3, False),
+        ("a/b/c", 0, True),
+    ):
+        assert safefs.stays_inside(link, depth) is inside, (link, depth)
+
+
+def test_downloads_leave_out_symlinks_that_could_lead_outside(tmp_path):
+    tree = tmp_path / "tree"
+    payload = tree / "payload"
+    (payload / "sub" / "deeper").mkdir(parents=True)
+    (payload / "sub" / "file").write_text("inside")
+    links = {
+        "sub/inside": "file",
+        "sub/deeper/up": "../file",
+        "to-sub": "sub",
+        "through-sub": "to-sub/file",  # inside through another link
+        "to-root": ".",
+        "chain": "absolute",  # on to a link that is left out: dangles
+        "absolute": "/etc/passwd",
+        "escape": "../outside",
+        "deep-escape": "sub/../../outside",
+        "root-parent": "to-root/..",
+        "dangling": "missing/../../outside",
+    }
+    for name, target in links.items():
+        (payload / name).symlink_to(target)
+    with safefs.opened_dir(tree) as fd:
+        left_out = safefs.copy_out("payload", fd, tmp_path / "copy")
+    kept = {"sub/inside", "sub/deeper/up", "to-sub", "through-sub", "to-root", "chain"}
+    assert sorted(left_out) == sorted(set(links) - kept)
+    copy = tmp_path / "copy"
+    assert all(os.readlink(copy / name) == links[name] for name in kept)
+    assert not any(os.path.lexists(copy / name) for name in left_out)
+    assert (copy / "through-sub").read_text() == "inside" and not (copy / "chain").exists()
+
+
+def test_downloads_into_one_directory_cannot_combine_into_an_escape(tmp_path):
+    secret = tmp_path / "secret.txt"  # next to the download directory
+    secret.write_text("host")
+    copy = tmp_path / "copy"
+    for links in ({"a": "b/..", "c": "d/.."}, {"b": ".", "d": "sub"}, {"b": ".."}):
+        tree = tmp_path / f"tree-{len(list(tmp_path.iterdir()))}"
+        (tree / "payload" / "sub").mkdir(parents=True)
+        for name, target in links.items():
+            (tree / "payload" / name).symlink_to(target)
+        with safefs.opened_dir(tree) as fd:
+            safefs.copy_out("payload", fd, copy)
+    top = os.path.realpath(copy)
+    for path in copy.rglob("*"):
+        resolved = os.path.realpath(path)
+        assert os.path.commonpath([top, resolved]) == top, (path, resolved)
+    assert not (copy / "a").exists() and not os.path.lexists(copy / "a" / "secret.txt")
+
+
+def test_failed_downloads_never_leave_links_that_lead_outside(tmp_path):
+    tree = tmp_path / "tree"
+    (tree / "payload" / "z").mkdir(parents=True)
+    (tree / "payload" / "a-absolute").symlink_to("/etc")
+    os.mkfifo(tree / "payload" / "z" / "fifo")  # copied after the link, fails the copy
+    with safefs.opened_dir(tree) as fd, pytest.raises(SandboxError, match="special file"):
+        safefs.copy_out("payload", fd, tmp_path / "copy")
+    assert not os.path.lexists(tmp_path / "copy" / "a-absolute")
+
+
+def test_a_racing_download_cannot_slip_a_symlink_under_a_directory(tmp_path, monkeypatch):
+    tree = tmp_path / "tree"
+    (tree / "payload" / "a").mkdir(parents=True)
+    (tree / "payload" / "a" / "x").symlink_to("../secret.txt")  # one level down: kept
+    copy = tmp_path / "copy"
+    real_mkdir = os.mkdir
+
+    def racing(path, *args, **kwargs):
+        if Path(path) == copy / "a":
+            os.symlink(".", path)  # another download got there between the check and mkdir
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", racing)
+    with safefs.opened_dir(tree) as fd, pytest.raises(SandboxError, match="changed while"):
+        safefs.copy_out("payload", fd, copy)
+    assert not os.path.lexists(copy / "x")
