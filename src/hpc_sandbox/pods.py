@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self
 from . import procfs
 from .process import kill_tree
 from .sandbox import SessionSandbox, check_env, environment_script, poll
-from .sessions import Session, create_session, discard_session, new_instance_name
+from .sessions import Session, create_session, new_instance_name, trash_session_awaiting
 from .types import (
     HealthCheck,
     PodNetwork,
@@ -788,8 +788,10 @@ class SessionPod:
         self._services.clear()
         session = self._session
         if session is not None:
-            await discard_session(session)
+            doomed = await trash_session_awaiting(session)
             self._session = None
+            if doomed is not None:
+                self._provider._delete_in_background(doomed)
 
     async def _stop_holder(self) -> None:
         holder, control = self._holder, self._control
@@ -899,6 +901,12 @@ class PodService(SessionSandbox):
 
     def _session_root(self) -> Path:
         return self.pod.services_root
+
+    async def _discard(self, session: Session) -> None:
+        if self.pod._stop_task is not None:  # the pod's deletion takes these files too
+            session.release()
+            return
+        await super()._discard(session)
 
     async def snapshot(self) -> SandboxSnapshot:
         raise SandboxError("snapshots of pod services are not supported yet")

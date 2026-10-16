@@ -287,7 +287,10 @@ async def test_many_pods_start_and_stop_cleanly(provider, gateway):
 
     await asyncio.gather(*(one(index) for index in range(count)))
     assert provider.pods == frozenset()
-    assert [p.name for p in provider.pod_root.iterdir() if p.name != ".janitor.lock"] == []
+    assert await provider.wait_for_deletions(300)
+    assert [p.name for p in provider.pod_root.iterdir() if p.name.startswith("hpcsb-")] == []
+    trash = provider.pod_root / ".trash"
+    assert not trash.exists() or list(trash.iterdir()) == []
     timings.sort()
     p99 = timings[min(len(timings) - 1, round(0.99 * (len(timings) - 1)))]
     print(f"\n{count} pods: setup p50 {statistics.median(timings):.2f} s, p99 {p99:.2f} s")

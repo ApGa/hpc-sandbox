@@ -245,7 +245,7 @@ async def test_health_follows_compose_rules(runtime):
     with pytest.raises(SandboxStartError, match="unhealthy: nope"):
         await pod.start_service(broken, wait="healthy")
     assert set(pod.services) == {"slow"}
-    assert len(leftovers(pod)) == 1  # slow's directory
+    assert len(await leftovers(pod)) == 1  # slow's directory
     # The name is free again.
     broken.healthcheck = None
     await pod.start_service(broken, wait="healthy")
@@ -309,8 +309,10 @@ def hold_extraction(provider: Any, monkeypatch: pytest.MonkeyPatch) -> asyncio.E
     return reached
 
 
-def leftovers(pod: Any) -> list[str]:
-    """Service sessions in the pod's directory, and what its trash still holds."""
+async def leftovers(pod: Any) -> list[str]:
+    """Service sessions in the pod's directory, and what its trash still holds once
+    the deletions this process started are done."""
+    assert await pod._provider.wait_for_deletions(30)
     root = pod.services_root
     sessions = [p.name for p in root.iterdir() if p.name.startswith("hpcsb-")]
     trash = [p.name for p in (root / ".trash").iterdir()] if (root / ".trash").is_dir() else []
@@ -329,7 +331,7 @@ async def test_a_cancelled_start_leaves_nothing(runtime, monkeypatch):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-    assert pod.services == {} and leftovers(pod) == []
+    assert pod.services == {} and await leftovers(pod) == []
     # Cancelled while waiting for health: the running service goes too.
     never = HealthCheck("exit 1", interval_s=0.1, start_period_s=3600, start_interval_s=0.1)
     spec = ServiceSpec(
@@ -342,7 +344,7 @@ async def test_a_cancelled_start_leaves_nothing(runtime, monkeypatch):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert pod.services == {} and leftovers(pod) == [] and anchor.poll() is not None
+    assert pod.services == {} and await leftovers(pod) == [] and anchor.poll() is not None
     await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))  # the name is free
     await pod.stop()
 
