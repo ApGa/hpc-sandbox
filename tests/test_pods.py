@@ -245,7 +245,7 @@ async def test_health_follows_compose_rules(runtime):
     with pytest.raises(SandboxStartError, match="unhealthy: nope"):
         await pod.start_service(broken, wait="healthy")
     assert set(pod.services) == {"slow"}
-    assert len(list(pod.services_root.iterdir())) == 2  # slow's directory and the lock
+    assert len(leftovers(pod)) == 1  # slow's directory
     # The name is free again.
     broken.healthcheck = None
     await pod.start_service(broken, wait="healthy")
@@ -310,7 +310,11 @@ def hold_extraction(provider: Any, monkeypatch: pytest.MonkeyPatch) -> asyncio.E
 
 
 def leftovers(pod: Any) -> list[str]:
-    return sorted(p.name for p in pod.services_root.iterdir() if p.name != ".janitor.lock")
+    """Service sessions in the pod's directory, and what its trash still holds."""
+    root = pod.services_root
+    sessions = [p.name for p in root.iterdir() if p.name.startswith("hpcsb-")]
+    trash = [p.name for p in (root / ".trash").iterdir()] if (root / ".trash").is_dir() else []
+    return sorted(sessions + trash)
 
 
 async def test_a_cancelled_start_leaves_nothing(runtime, monkeypatch):
