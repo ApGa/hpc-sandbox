@@ -17,7 +17,9 @@ filesystem directory:
   identities, and session directories are leased, so teardown and janitors
   stop only what they can prove is theirs and never use
   ``instance stop --all``. Unprivileged instance metadata is kept per user,
-  not per job, so this matters on shared nodes;
+  not per job, so this matters on shared nodes. Starting and stopping one
+  instance hold that instance's own control lock, so instances start and
+  stop in parallel;
 - every runtime call has a timeout, networking is the host's by default, and
   memory is guarded by a PSS watchdog because users rarely get cgroups.
 
@@ -207,7 +209,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
         if record is not None and record.get("instance_pid_file") != str(path / PID_FILE):
             record = None
-        async with locked(path.parent / CONTROL_LOCK):
+        async with locked(path / CONTROL_LOCK):
             if record is None and await self.runtime.instance_record(path.name) is not None:
                 raise SandboxError("instance is running but its owner record is not bound to it")
             expected_pid = record.get("instance_pid") if record else None
@@ -339,7 +341,7 @@ class SingularitySandbox(SessionSandbox):
         assert self._session is not None
         session, provider = self._session, self._provider
         pid_file = session.path / PID_FILE
-        async with locked(provider.session_root / CONTROL_LOCK):
+        async with locked(session.path / CONTROL_LOCK):
             # Cancellation can arrive after the runtime created the instance but
             # before its result reaches us, so cleanup must assume it exists.
             self._instance_may_exist = True
@@ -400,7 +402,7 @@ class SingularitySandbox(SessionSandbox):
     async def _stop_container(self, session: Session) -> None:
         if not self._instance_may_exist:
             return
-        async with locked(self._provider.session_root / CONTROL_LOCK):
+        async with locked(session.path / CONTROL_LOCK):
             await stop_instance(
                 self._runtime,
                 self.id,

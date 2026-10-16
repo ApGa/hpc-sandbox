@@ -14,6 +14,7 @@ State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_PULL_DELAY      seconds each pull takes (default 0)
   FAKE_SINGULARITY_PULL_REVISION   pulls write a different image, as after a tag moved
   FAKE_SINGULARITY_INSTANCE_EXITS  "1": instances exit right after starting
+  FAKE_SINGULARITY_START_DELAY     seconds each instance start takes (default 0)
 """
 
 from __future__ import annotations
@@ -136,6 +137,7 @@ def build(args: list[str]) -> int:
 
 def instance_start(args: list[str]) -> int:
     options, (rootfs, name) = parse(args)
+    time.sleep(float(os.environ.get("FAKE_SINGULARITY_START_DELAY", "0")))
     if "--writable-tmpfs" in options or "--fakeroot" in options:
         return fail("hpc-sandbox must not use --writable-tmpfs or --fakeroot", 98)
     root = Path(rootfs)
