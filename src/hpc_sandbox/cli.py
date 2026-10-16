@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .enroot import ANCHOR_SCRIPT, STANDARD_HOOKS, EnrootProvider
+from .images import DIGEST
 from .paths import in_batch_job
 from .process import run_process
 from .runtime import RUNTIME_CANDIDATES, ContainerRuntime
@@ -192,8 +193,13 @@ async def _pull(args: argparse.Namespace) -> int:
     images = _provider(args).images
     for reference in args.references:
         image = await images.pull(reference, refresh=args.refresh)
-        sha256 = image.sha256 or await images.digest(image.path)
-        record = {"reference": reference, "path": str(image.path), "sha256": sha256}
+        pin = None if images.format.is_local(reference) else DIGEST.search(reference)
+        record = {
+            "reference": reference,
+            "path": str(image.path),
+            "sha256": image.sha256 or await images.digest(image.path),  # of the image file
+            "manifest_digest": f"sha256:{pin.group(1)}" if pin else None,  # when pinned
+        }
         print(json.dumps(record), flush=True)
     return 0
 

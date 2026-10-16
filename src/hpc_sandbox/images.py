@@ -23,6 +23,7 @@ sandbox starts read local disk instead of shared storage.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -30,11 +31,12 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .locks import locked
+from .locks import locked, open_lock_file
 from .process import ProcessResult
 from .runtime import ContainerRuntime
 from .types import SandboxError
@@ -182,6 +184,14 @@ def copy_and_hash(source: Path, target: Path) -> str:
     return digest.hexdigest()
 
 
+def _try_lock(descriptor: int) -> bool:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
 def _number(record: dict[str, object] | None, key: str) -> float:
     value = record.get(key) if record else None
     return float(value) if isinstance(value, int | float) else 0.0
@@ -230,7 +240,7 @@ class ImageStore:
         image = await self.pull(reference)
         path, sha256 = image.path, image.sha256
         if self.stage_dir is not None and path.parent != self.stage_dir:
-            sha256 = sha256 or await self.digest(path)
+            sha256 = sha256 or await self.digest(path, remember=True)
             path = await self._stage(path, sha256)
         return ResolvedImage(reference, path, sha256)
 
@@ -251,13 +261,34 @@ class ImageStore:
             path, sha256 = await self._pulled(reference, refresh=refresh)
         return ResolvedImage(reference, path, sha256)
 
-    async def digest(self, path: Path) -> str:
+    async def digest(self, path: Path, *, remember: bool = False) -> str:
+        """The SHA-256 of ``path``; with ``remember``, kept on node-local scratch for later processes."""
         key = _stat_key(path)
         if key is None:
             raise SandboxError(f"image {path} disappeared")
         if key not in self._digests:
-            self._digests[key] = await asyncio.to_thread(sha256_file, path)
+            self._digests[key] = await asyncio.to_thread(self._hash, path, key, remember)
         return self._digests[key]
+
+    def _hash(self, path: Path, key: tuple[int, int, int, int], remember: bool) -> str:
+        # Every process that stages a local image would otherwise read it in full
+        # from shared storage. The record is keyed by device, inode, size and
+        # modification time, so a changed file is hashed again, and staging still
+        # checks what it copies.
+        memo = None
+        if remember and self.stage_dir is not None:
+            memo = self._make_stage_dir() / ".digests" / "-".join(map(str, key))
+            with suppress(OSError):
+                if re.fullmatch(r"[0-9a-f]{64}", recorded := memo.read_text().strip()):
+                    return recorded
+        digest = sha256_file(path)
+        if memo is not None:
+            with suppress(OSError):
+                memo.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                temporary = memo.with_name(f".{memo.name}.{os.getpid()}.{uuid.uuid4().hex}")
+                temporary.write_text(digest + "\n")
+                os.replace(temporary, memo)
+        return digest
 
     async def _is_valid(self, path: Path) -> bool:
         key = _stat_key(path)
@@ -277,7 +308,7 @@ class ImageStore:
             raise SandboxError(f"image {reference!r} is not a file")
         if not await self._is_valid(path):
             raise SandboxError(f"image {path} is not a valid {self.format.name}")
-        if pinned is not None and (actual := await self.digest(path)) != pinned:
+        if pinned is not None and (actual := await self.digest(path, remember=True)) != pinned:
             raise SandboxError(f"image {path} has SHA-256 {actual}, expected {pinned}")
         return path, pinned
 
@@ -296,7 +327,15 @@ class ImageStore:
         if self.prepare is not None:
             await asyncio.to_thread(self.prepare)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        async with locked(self.cache_dir / f"{key}.lock", private=False):
+        descriptor = open_lock_file(self.cache_dir / f"{key}.lock", private=False)
+        try:
+            while not _try_lock(descriptor):
+                # Another process pulls or refreshes this reference. A start never
+                # waits for that while an image for it is cached, even one cached
+                # by an earlier version.
+                if not refresh and (cached := await self._cached_or_legacy(key, uri)):
+                    return cached
+                await asyncio.sleep(0.05)
             # Another process may have pulled while this one waited; a refresh
             # takes only a pull that started after it was requested.
             started = _number(self._pointer(key), "started_at")
@@ -305,6 +344,17 @@ class ImageStore:
             ) is not None:
                 return cached
             return await self._pull(uri, key)
+        finally:
+            os.close(descriptor)
+
+    async def _cached_or_legacy(self, key: str, uri: str) -> tuple[Path, str] | None:
+        """The image the pointer names, else one an earlier version cached (used as is)."""
+        if (cached := await self._cached(key, uri)) is not None:
+            return cached
+        legacy = self.cache_dir / f"{key}{self.format.suffix}"
+        if self._pointer(key) is None and await self._is_valid(legacy):
+            return legacy, await self.digest(legacy)
+        return None
 
     async def _cached(
         self, key: str, uri: str, *, migrate: bool = False
@@ -412,6 +462,15 @@ class ImageStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _make_stage_dir(self) -> Path:
+        """The stage directory, created private (and the scratch root before it)."""
+        assert self.stage_dir is not None
+        if self.prepare is not None:
+            self.prepare()
+        self.stage_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.stage_dir.mkdir(mode=0o700, exist_ok=True)
+        return self.stage_dir
+
     async def _stage(self, source: Path, sha256: str) -> Path:
         """Copy ``source`` to node-local scratch as ``sha256-<digest><suffix>``, verified.
 
@@ -423,7 +482,7 @@ class ImageStore:
         staged = self.stage_dir / f"sha256-{sha256}{suffix}"
         if _stat_key(staged) in self._valid:
             return staged
-        self.stage_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        await asyncio.to_thread(self._make_stage_dir)
         async with locked(self.stage_dir / f"sha256-{sha256}.lock"):
             info = staged.stat() if staged.is_file() else None
             if info is None or info.st_size != source.stat().st_size or info.st_mode & 0o222:

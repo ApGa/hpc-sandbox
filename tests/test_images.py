@@ -236,3 +236,65 @@ async def test_files_of_earlier_versions_are_adopted_only_once(tmp_path, fake_ru
     again = await store(tmp_path).resolve(uri)
     assert len(fake_runtime.calls("pull")) == pulls + 2  # pulled, not the superseded file
     assert b"2" in again.path.read_bytes()
+
+
+async def test_starts_never_wait_for_a_refresh(tmp_path, fake_runtime, monkeypatch):
+    import time
+
+    first = await store(tmp_path).resolve("docker://example/task:1")
+    monkeypatch.setenv("FAKE_SINGULARITY_PULL_DELAY", "2")
+    monkeypatch.setenv("FAKE_SINGULARITY_PULL_REVISION", "2")
+    refresh = asyncio.ensure_future(store(tmp_path).pull("docker://example/task:1", refresh=True))
+    await asyncio.sleep(0.5)  # the refresh holds the lock and pulls
+    began = time.monotonic()
+    during = await store(tmp_path).resolve("docker://example/task:1")  # a new process's start
+    assert time.monotonic() - began < 1.0 and during.path == first.path
+    assert (await refresh).path != first.path
+
+
+async def test_local_image_digests_are_remembered_across_processes(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    stage = tmp_path / "scratch" / "images"
+    first = await store(tmp_path, stage_dir=stage).resolve(str(sif))
+    (record,) = (stage / ".digests").iterdir()
+    assert record.read_text().strip() == first.sha256 == sha256(sif)
+
+    def unread(path: Path) -> str:
+        raise AssertionError(f"{path} was read again")
+
+    monkeypatch.setattr("hpc_sandbox.images.sha256_file", unread)
+    assert (await store(tmp_path, stage_dir=stage).resolve(str(sif))).sha256 == first.sha256
+    record.write_text("ab" * 32 + "\n")  # a wrong record: staging checks what it copies
+    with pytest.raises(SandboxError, match="expected"):
+        await store(tmp_path, stage_dir=stage).resolve(str(sif))
+
+
+async def test_starts_never_wait_for_a_refresh_of_an_image_an_earlier_version_cached(
+    tmp_path, fake_runtime, monkeypatch
+):
+    import time
+
+    uri = "docker://example/task:1"
+    old = await store(tmp_path / "old").resolve(uri)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    legacy = cache / f"{uri_key(uri)}.sif"
+    legacy.write_bytes(old.path.read_bytes())
+    monkeypatch.setenv("FAKE_SINGULARITY_PULL_DELAY", "2")
+    refresh = asyncio.ensure_future(store(tmp_path).pull(uri, refresh=True))
+    await asyncio.sleep(0.5)
+    began = time.monotonic()
+    during = await store(tmp_path).resolve(uri)
+    assert time.monotonic() - began < 1.0
+    assert during.path == legacy and during.sha256 == old.sha256
+    await refresh
+
+
+async def test_the_stage_directory_is_private_however_it_is_created(tmp_path, sif, fake_runtime):
+    import stat as stats
+
+    stage = tmp_path / "scratch" / "images"
+    await store(tmp_path, stage_dir=stage).pull(f"{sif}@sha256:{sha256(sif)}")  # hashes first
+    for directory in (stage.parent, stage, stage / ".digests"):
+        assert stats.S_IMODE(directory.stat().st_mode) == 0o700, directory
