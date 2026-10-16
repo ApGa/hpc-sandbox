@@ -525,10 +525,16 @@ async def test_sessions_record_their_provider_and_user(enroot_provider, sqsh):
     await enroot_provider.delete_snapshot(snapshot)
 
 
-async def test_a_command_that_never_started_is_an_infrastructure_error(enroot_provider, sqsh):
+async def test_a_command_that_never_started_is_an_infrastructure_error(
+    enroot_provider, sqsh, monkeypatch
+):
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
-    with pytest.raises(SandboxError, match="did not start.*/does/not/exist"):
-        await sandbox.exec("true", cwd="/does/not/exist")
+    with monkeypatch.context() as patch:  # a runtime that never ran the prologue
+        for status in (3, 126):  # 126 alone is not a missing working directory
+            failing = ["/bin/sh", "-c", f"echo runtime failed >&2; exit {status}"]
+            patch.setattr("hpc_sandbox.sandbox.prologue", lambda *_, failing=failing, **__: failing)
+            with pytest.raises(SandboxError, match=rf"did not start \(exit {status}\)"):
+                await sandbox.exec("true")
     missing = await sandbox.exec(["/no/such/program"])
     assert missing.exit_code == 127 and "command started" not in missing.stderr
     result = await sandbox.exec("echo out; echo err >&2")
@@ -1102,6 +1108,36 @@ async def test_host_side_transfer_errors_stay_os_errors(enroot_provider, sqsh, t
     finally:
         locked.chmod(0o700)
         unreadable.chmod(0o600)
+
+
+async def test_a_missing_working_directory_fails_the_command_not_the_sandbox(
+    enroot_provider, sqsh, tmp_path
+):
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), workdir="/work"))
+    assert (await sandbox.exec("rm -rf /work && echo payload > /out.txt", cwd="/")).exit_code == 0
+    for cwd, reason in ((None, "it does not exist"), ("/work", "it does not exist")):
+        result = await sandbox.exec("echo ran", cwd=cwd)
+        assert result.exit_code == 126 and result.stdout == "", (cwd, result)
+        assert "cannot enter the working directory /work: " + reason in result.stderr, result
+    result = await sandbox.exec("echo ran", cwd="/out.txt")
+    assert (result.exit_code, result.stderr.split(": ")[-1]) == (126, "not a directory\n")
+    assert (await sandbox.exec("pwd", cwd="/")).stdout == "/\n"
+    # Transfers of absolute paths do not need the workdir; relative ones resolve from it.
+    await sandbox.download("/out.txt", tmp_path / "out.txt")
+    assert (tmp_path / "out.txt").read_text() == "payload\n"
+    await sandbox.upload(tmp_path / "out.txt", "/back.txt")
+    assert (await sandbox.exec("cat /back.txt", cwd="/")).stdout == "payload\n"
+    await sandbox.exec("mkdir /work", cwd="/")
+    await sandbox.upload(tmp_path / "out.txt", "relative.txt")
+    assert (await sandbox.exec("cat /work/relative.txt", cwd="/")).stdout == "payload\n"
+    await sandbox.download("relative.txt", tmp_path / "relative.txt")
+    assert (tmp_path / "relative.txt").read_text() == "payload\n"
+    # A relative cwd resolves from the workdir too, whatever CDPATH says.
+    await sandbox.exec("mkdir -p /work/sub /opt/sub", cwd="/")
+    moved = await sandbox.exec("pwd", cwd="sub", env={"CDPATH": "/opt"})
+    assert moved.stdout == "/work/sub\n", moved
+    with pytest.raises(FileNotFoundError):
+        await sandbox.download("", tmp_path / "everything")
 
 
 async def test_digest_pinned_images_are_imported_by_digest(tmp_path, fake_enroot):

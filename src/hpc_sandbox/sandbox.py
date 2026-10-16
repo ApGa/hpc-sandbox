@@ -384,7 +384,11 @@ class SessionSandbox:
         environment = {"HOME": "/root", **self.spec.env, **(env or {})}
         check_env(environment)
         return await self._run(
-            argv, cwd=cwd or self.spec.workdir, env=environment, stdin=stdin, timeout_s=timeout
+            argv,
+            cwd=self._in_workdir(cwd) if cwd else self.spec.workdir,
+            env=environment,
+            stdin=stdin,
+            timeout_s=timeout,
         )
 
     async def upload(self, src: str | Path, dst: str) -> None:
@@ -396,7 +400,9 @@ class SessionSandbox:
         async with self._transfer() as (staging, container_dir):
             await _in_thread(partial(safefs.copy_in, source, "payload", staging))
             script = _UPLOAD_DIR if source.is_dir() else _UPLOAD_FILE
-            result = await self._transfer_exec(script, f"{container_dir}/payload", dst)
+            result = await self._transfer_exec(
+                script, f"{container_dir}/payload", self._in_workdir(dst)
+            )
             if result.exit_code != 0:
                 raise SandboxError(f"upload to {dst} failed: {result.stderr.strip()}")
 
@@ -405,7 +411,9 @@ class SessionSandbox:
         self._require_running()
         target = Path(dst)
         async with self._transfer() as (staging, container_dir):
-            result = await self._transfer_exec(_DOWNLOAD, src, f"{container_dir}/payload")
+            result = await self._transfer_exec(
+                _DOWNLOAD, self._in_workdir(src), f"{container_dir}/payload"
+            )
             if result.exit_code == _MISSING_SOURCE:
                 raise FileNotFoundError(f"no such file or directory in the sandbox: {src}")
             if result.exit_code != 0:
@@ -622,6 +630,8 @@ class SessionSandbox:
         stdout = result.stdout.decode(errors="replace")
         stderr = raw_stderr.decode(errors="replace")
         if not started_command:
+            if result.returncode == WORKDIR_EXIT_CODE and _WORKDIR_FAILURE in raw_stderr:
+                return ExecResult(WORKDIR_EXIT_CODE, stdout, stderr)
             if not self._container_alive():
                 self._mark_lost(stderr)
             state = "timed out" if result.timed_out else f"exit {result.returncode}"
@@ -676,10 +686,17 @@ class SessionSandbox:
             finally:
                 os.close(root)
 
+    def _in_workdir(self, path: str) -> str:
+        """``path`` resolved from the workdir, as a command there would see it."""
+        if not path or path.startswith("/"):
+            return path  # "" names nothing, wherever it is resolved
+        return f"{self.spec.workdir.rstrip('/')}/{path}"
+
     async def _transfer_exec(self, script: str, *args: str) -> ExecResult:
+        # From /: transfers of absolute paths work even once the workdir is gone.
         return await self._run(
             ["/bin/sh", "-c", script, "hpc-sandbox", *args],
-            cwd=self.spec.workdir,
+            cwd="/",
             env={},
             stdin=None,
             timeout_s=self._provider.default_timeout_s,
@@ -794,13 +811,24 @@ hpc_sandbox_nl='
 '
 IFS= read -r hpc_sandbox_env || exit
 eval "$hpc_sandbox_env" || exit
-cd -- "$1" || exit
+if ! cd -- "$1" >/dev/null 2>&1; then
+    if [ -d "$1" ]; then set -- "$1" "permission denied"
+    elif [ -e "$1" ]; then set -- "$1" "not a directory"
+    else set -- "$1" "it does not exist or cannot be reached"; fi
+    printf 'hpc-sandbox: cannot enter the working directory %s: %s\\n' "$1" "$2" >&2
+    exit 126
+fi
 [ "$3" = stdin ] || exec </dev/null || exit
 printf '%s\\n' "$2" >&2
 shift 3
 exec "$@"
 """
 _NEWLINE = '"$hpc_sandbox_nl"'  # how environment_script writes a newline
+# What the prologue reports when the working directory cannot be entered: the
+# command fails like any other (as with `docker exec`), since the sandbox's own
+# state, not the infrastructure, is to blame.
+WORKDIR_EXIT_CODE = 126
+_WORKDIR_FAILURE = b"hpc-sandbox: cannot enter the working directory "
 
 
 def prologue(argv: Sequence[str], cwd: str, *, stdin: bool) -> list[str]:

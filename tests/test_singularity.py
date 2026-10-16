@@ -333,10 +333,12 @@ async def test_sessions_record_their_provider_and_user(provider, sif):
     assert (owner["remap_root"], owner["container_uid"]) == (False, os.getuid())
 
 
-async def test_a_command_that_never_started_is_an_infrastructure_error(provider, sif):
+async def test_a_command_that_never_started_is_an_infrastructure_error(provider, sif, monkeypatch):
     sandbox = await provider.start(SandboxSpec(image=str(sif)))
-    with pytest.raises(SandboxError, match="did not start"):
-        await sandbox.exec("true", cwd="/does/not/exist")
+    with monkeypatch.context() as patch:  # a runtime that never ran the prologue
+        patch.setattr("hpc_sandbox.sandbox.prologue", lambda *_, **__: ["/bin/sh", "-c", "exit 3"])
+        with pytest.raises(SandboxError, match=r"did not start \(exit 3\)"):
+            await sandbox.exec("true")
     result = await sandbox.exec("echo err >&2")
     assert result.stderr == "err\n" and (await sandbox.exec("echo ok")).stdout == "ok\n"
 
@@ -402,3 +404,21 @@ async def test_stderr_up_to_the_limit_is_not_truncated(tmp_path, sif, fake_runti
     async with await provider.start(SandboxSpec(image=str(sif))) as sandbox:
         result = await sandbox.exec("head -c 4096 /dev/zero | tr '\\0' x >&2")
     assert result.stderr == "x" * 4096
+
+
+async def test_a_missing_working_directory_fails_the_command_not_the_sandbox(
+    provider, sif, tmp_path
+):
+    import shutil
+
+    sandbox = await provider.start(SandboxSpec(image=str(sif), workdir="/work"))
+    # The fake maps only path arguments, so the sandbox's files are set up from the host.
+    shutil.rmtree(sandbox.session_dir / "rootfs" / "work")
+    (sandbox.session_dir / "tmp" / "out.txt").write_text("payload\n")
+    result = await sandbox.exec("echo ran")
+    assert result.exit_code == 126 and result.stdout == ""
+    assert "cannot enter the working directory" in result.stderr  # the fake shows host paths
+    assert result.stderr.endswith("/work: it does not exist or cannot be reached\n")
+    await sandbox.download("/tmp/out.txt", tmp_path / "out.txt")
+    await sandbox.upload(tmp_path / "out.txt", "/tmp/back.txt")
+    assert (sandbox.session_dir / "tmp" / "back.txt").read_text() == "payload\n"

@@ -121,9 +121,12 @@ What both providers share:
    `UID`, `EUID`, `PPID`, `BASHPID`, `GROUPS`, `FUNCNAME` and the like; with
    dash, an `OPTIND` that is not a number. The prologue then enters the
    working directory and announces the start on stderr (the announcement is
-   removed from the result); a command that never started — a missing working
-   directory, a runtime that could not enter the container — raises
-   `SandboxError` instead of returning an exit status.
+   removed from the result). A working directory that is missing or cannot be
+   entered fails the command with exit status 126 and a message on stderr, as
+   with `docker exec`, without falling back to another directory: it is the
+   sandbox's state, not an infrastructure failure. A command that never
+   started for other reasons — a runtime that could not enter the container —
+   raises `SandboxError` instead of returning an exit status.
    Output is bounded (head and tail of each stream, 16 MiB); a command that
    leaves a background process holding stdout still returns. Startup probes
    that the rootfs and `workdir` are writable.
