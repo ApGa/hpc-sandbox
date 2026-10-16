@@ -131,3 +131,7 @@ def test_layouts_are_checked(tmp_path, fake_runtime, monkeypatch):
     monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")
     assert make_provider(tmp_path).rootfs_layout == "fuse-overlay"
     assert make_provider(tmp_path, rootfs_layout="copy").rootfs_layout == "copy"
+    # A site-wide default a provider cannot take falls back to copies rather than refusing the provider.
+    assert make_provider(tmp_path, gpu="nv").rootfs_layout == "copy"
+    assert make_provider(tmp_path, extra_start_args=["--fakeroot"]).rootfs_layout == "copy"
+    assert make_provider(tmp_path, rootfs_templates=False).rootfs_layout == "copy"

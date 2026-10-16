@@ -183,13 +183,18 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         if layout not in ROOTFS_LAYOUTS:
             raise ValueError(f"rootfs_layout must be one of {ROOTFS_LAYOUTS}, not {layout!r}")
         if layout == "fuse-overlay":
-            if gpu or cgroup_limits or any(a in ("--fakeroot", "-f") for a in extra_start_args):
-                raise ValueError(
-                    "the fuse-overlay layout runs unprivileged instances: GPUs, cgroup "
-                    "limits and --fakeroot need rootfs_layout='copy'"
-                )
-            if not rootfs_templates:
-                raise ValueError("the fuse-overlay layout needs rootfs_templates")
+            fakeroot = any(arg in ("--fakeroot", "-f") for arg in extra_start_args)
+            conflict = (
+                "GPUs, cgroup limits and --fakeroot need rootfs_layout='copy'"
+                if gpu or cgroup_limits or fakeroot
+                else "it needs rootfs_templates"
+                if not rootfs_templates
+                else None
+            )
+            if conflict and rootfs_layout is not None:
+                raise ValueError(f"the fuse-overlay layout runs unprivileged instances: {conflict}")
+            if conflict:  # a site-wide default this provider cannot take
+                layout = "copy"
         self.rootfs_layout = layout
 
     def _scratch_directories(self) -> list[Path]:
