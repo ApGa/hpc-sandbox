@@ -366,6 +366,10 @@ class SessionProvider(Generic[S]):
         """Fill ``session.rootfs`` from ``image``."""
         raise NotImplementedError
 
+    async def _extract_service(self, image: ResolvedImage, session: Session) -> None:
+        """Fill a pod service's ``session.rootfs``, a plain directory: pods unmount nothing."""
+        await self._extract(image, session)
+
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
         """Stop whatever still runs for the abandoned session at ``path``.
 

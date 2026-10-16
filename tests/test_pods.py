@@ -298,14 +298,14 @@ async def test_stop_leaves_nothing(runtime, gateway):
 
 def hold_extraction(provider: Any, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
     """Make service starts wait after extracting their rootfs; the event says one got there."""
-    extract, reached = provider._extract, asyncio.Event()
+    extract, reached = provider._extract_service, asyncio.Event()
 
     async def held(image: Any, session: Any) -> None:
         await extract(image, session)
         reached.set()
         await asyncio.sleep(3600)
 
-    monkeypatch.setattr(provider, "_extract", held)
+    monkeypatch.setattr(provider, "_extract_service", held)
     return reached
 
 

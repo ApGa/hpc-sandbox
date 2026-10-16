@@ -623,7 +623,7 @@ class SessionPod:
         service = provider.service_type(provider, self, spec)
         await asyncio.to_thread(self._announce, spec.name)
         image = await provider.images.resolve(spec.sandbox.image)
-        await service._boot(lambda session: provider._extract(image, session))
+        await service._boot(lambda session: provider._extract_service(image, session))
         health = self._health[spec.name] = _Health()
         self._services[spec.name] = service
         try:
