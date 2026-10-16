@@ -237,7 +237,10 @@ async def test_memory_watchdog_kills_the_largest_process(provider, sif):
     result = await sandbox.exec([PYTHON, "-c", hog], timeout_s=20)
     assert result.exit_code == 137
     assert "memory limit exceeded" in result.stderr
-    assert sandbox.memory_kills and sandbox.memory_kills[0].pss_bytes > 100 * 1024 * 1024
+    kill = sandbox.memory_kills[0]
+    # The sandbox's total crossed the limit; the hog, killed, was most of it.
+    assert kill.total_bytes > kill.limit_bytes == 100 * 1024 * 1024
+    assert kill.pss_bytes > kill.total_bytes // 2
     assert (await sandbox.exec("echo survived")).stdout == "survived\n"
 
 
