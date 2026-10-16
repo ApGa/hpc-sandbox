@@ -3,11 +3,13 @@
 Each sandbox is one persistent instance started from a private, writable root
 filesystem directory:
 
-- the image is extracted with ``build --sandbox --fix-perms`` into the
-  sandbox's session directory on node-local scratch, so no loop devices,
-  overlays or ``--fakeroot`` are needed and the size of the writable layer is
-  bounded only by the scratch filesystem (unlike ``--writable-tmpfs``, which
-  many sites cap at a few tens of MiB);
+- the image is extracted with ``build --sandbox --fix-perms`` once per node
+  into a template on node-local scratch, and each sandbox's session directory
+  gets a copy of it (``cp -a --reflink=auto``: a reflink clone on XFS or Btrfs,
+  a plain copy elsewhere), so no loop devices, overlays or ``--fakeroot`` are
+  needed and the size of the writable layer is bounded only by the scratch
+  filesystem (unlike ``--writable-tmpfs``, which many sites cap at a few tens
+  of MiB);
 - the instance runs with ``--cleanenv --containall --no-home --no-eval
   --no-mount home,cwd,bind-paths`` and session-private ``/tmp`` and
   ``/var/tmp`` binds, as the calling user;
@@ -27,10 +29,12 @@ into the extracted rootfs.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import stat
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -49,7 +53,7 @@ from .sandbox import (
     make_owner_writable,
     poll,
 )
-from .sessions import Session
+from .sessions import Session, remove_tree
 from .types import SandboxError, SandboxStartError
 
 KEEPALIVE_STARTSCRIPT = """\
@@ -64,6 +68,8 @@ done
 """
 PID_FILE = "instance.pid"
 CONTROL_LOCK = ".instance-control.lock"
+TEMPLATE_DIR = "templates"
+TEMPLATE_MARKER = ".complete"
 _PID_WAIT_S = 5.0
 
 
@@ -109,6 +115,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         memory_poll_s: float = 1.0,
         slirp4netns: str | None = None,
         service_stop_grace_s: float = 0.0,
+        rootfs_templates: bool = True,
     ) -> None:
         super().__init__(
             scratch_root=scratch_root,
@@ -138,6 +145,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             prepare=self._make_scratch_directories,
         )
         self.stop_grace_s = stop_grace_s
+        self.rootfs_templates = rootfs_templates
         self.allow_network_none = allow_network_none
         self.gpu = gpu
         self.cgroup_limits = cgroup_limits
@@ -154,17 +162,58 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         return [*super()._scratch_directories(), self.runtime.tmp_dir, self.runtime.cache_dir]
 
     async def _extract(self, image: ResolvedImage, session: Session) -> None:
+        if not self.rootfs_templates:
+            await self._extract_into(image, session.rootfs)
+            return
+        template = await self._rootfs_template(image)
+        await self.copy_tree(template, session.rootfs)
+
+    async def _extract_into(self, image: ResolvedImage, rootfs: Path) -> None:
         result = await self.runtime.run(
             "build",
             "--sandbox",
             "--fix-perms",
-            str(session.rootfs),
+            str(rootfs),
             str(image.path),
             timeout_s=self.start_timeout_s,
         )
         if result.returncode != 0 or result.timed_out:
             raise SandboxStartError(f"could not extract {image.path}: {result.detail()}")
-        await asyncio.to_thread(make_owner_writable, session.rootfs)
+        await asyncio.to_thread(make_owner_writable, rootfs)
+
+    async def _rootfs_template(self, image: ResolvedImage) -> Path:
+        """This node's extracted root filesystem of ``image``, which every sandbox of it copies.
+
+        Extracted once per image file, under a lock per image, and published by
+        a rename once complete. Like a staged image, a template is trusted later
+        when it is a private directory of this uid holding its marker. No
+        sandbox ever runs on it or mounts it: each gets a copy (reflinked where
+        the filesystem can), so nothing a sandbox writes reaches the template.
+        """
+        key = f"sha256-{image.sha256}" if image.sha256 else _stat_name(image.path)
+        root = self.scratch_root / TEMPLATE_DIR
+        final = root / key
+        if _template_ready(final):
+            return final / "rootfs"
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        async with locked(root / f"{key}.lock"):
+            if _template_ready(final):
+                return final / "rootfs"
+            work = root / f".{key}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+            work.mkdir(mode=0o700)
+            try:
+                await self._extract_into(image, work / "rootfs")
+                marker = {
+                    "image": str(image.path),
+                    "reference": image.reference,
+                    "sha256": image.sha256,
+                }
+                (work / TEMPLATE_MARKER).write_text(json.dumps(marker, sort_keys=True) + "\n")
+                os.rename(work, final)
+            except BaseException:
+                await asyncio.shield(asyncio.to_thread(remove_tree, work))
+                raise
+        return final / "rootfs"
 
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
         if record is not None and record.get("instance_pid_file") != str(path / PID_FILE):
@@ -432,6 +481,27 @@ class SingularityService(PodService, SingularitySandbox):
     def _runtime_environment(self) -> dict[str, str]:
         environment = self._runtime.environment()
         return {k: v for k, v in environment.items() if k not in PASSED_DESPITE_CLEANENV}
+
+
+def _template_ready(path: Path) -> bool:
+    """Whether ``path`` is a complete template: a private directory of this uid with its marker."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and not stat.S_IMODE(info.st_mode) & 0o077
+        and (path / TEMPLATE_MARKER).is_file()
+        and (path / "rootfs").is_dir()
+    )
+
+
+def _stat_name(path: Path) -> str:
+    """A template name for an image file whose digest is unknown: its stat identity."""
+    info = path.stat()
+    return f"stat-{info.st_dev}-{info.st_ino}-{info.st_size}-{info.st_mtime_ns}"
 
 
 def make_mount_point(rootfs: Path, target: str, *, directory: bool) -> None:
