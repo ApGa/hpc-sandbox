@@ -26,6 +26,16 @@ filesystem directory:
 OCI-derived images ship an empty ``%startscript``, and an instance whose
 startscript exits is removed at once, so a keep-alive startscript is written
 into the extracted rootfs.
+
+With ``rootfs_layout="fuse-overlay"`` a sandbox's root filesystem is not a copy
+but a ``fuse-overlayfs`` mount, made by this user: the node's template of the
+image is the read-only lower layer and the session's ``overlay/upper`` holds
+what the sandbox writes, with Docker's semantics (whiteouts, opaque and renamed
+directories). The instance runs it unprivileged (``--userns --writable``), so
+a start and a stop cost the same whatever the image's size, and deleting a
+session deletes only what its sandbox wrote. File operations in the sandbox go
+through FUSE: metadata-heavy ones (``find``, many small files) are slower than
+on a copy. GPUs, cgroup limits and ``--fakeroot`` need the copy layout.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
 import stat
 import time
@@ -45,7 +56,7 @@ from . import procfs
 from .images import ImageStore, ResolvedImage, SifImages
 from .locks import locked
 from .paths import default_image_cache, should_stage
-from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult
+from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import ContainerRuntime, instance_pid
 from .sandbox import (
     RESERVED_TARGETS,
@@ -71,7 +82,15 @@ PID_FILE = "instance.pid"
 CONTROL_LOCK = ".instance-control.lock"
 TEMPLATE_DIR = "templates"
 TEMPLATE_MARKER = ".complete"
+ROOTFS_LAYOUTS = ("copy", "fuse-overlay")
+OVERLAY_DIR = (
+    "overlay"  # <session>/overlay/{upper,work}: the writable layer of a fuse-overlay rootfs
+)
+OVERLAY_RECORD = (
+    "fuse-overlay.json"  # <session>/fuse-overlay.json: the mount, for teardown and janitors
+)
 _PID_WAIT_S = 5.0
+_UNMOUNT_TIMEOUT_S = 30.0
 
 
 class SingularityProvider(SessionProvider["SingularitySandbox"]):
@@ -110,6 +129,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT,
         memory_poll_s: float = 1.0,
         rootfs_templates: bool = True,
+        rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
     ) -> None:
         super().__init__(
             scratch_root=scratch_root,
@@ -147,6 +167,18 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             | ({"network_none"} if allow_network_none else set())
             | ({"gpu"} if gpu else set())
         )
+        layout = rootfs_layout or os.environ.get("HPC_SANDBOX_ROOTFS_LAYOUT") or "copy"
+        if layout not in ROOTFS_LAYOUTS:
+            raise ValueError(f"rootfs_layout must be one of {ROOTFS_LAYOUTS}, not {layout!r}")
+        if layout == "fuse-overlay":
+            if gpu or cgroup_limits or any(a in ("--fakeroot", "-f") for a in extra_start_args):
+                raise ValueError(
+                    "the fuse-overlay layout runs unprivileged instances: GPUs, cgroup "
+                    "limits and --fakeroot need rootfs_layout='copy'"
+                )
+            if not rootfs_templates:
+                raise ValueError("the fuse-overlay layout needs rootfs_templates")
+        self.rootfs_layout = layout
 
     def _scratch_directories(self) -> list[Path]:
         assert self.runtime.tmp_dir is not None and self.runtime.cache_dir is not None
@@ -157,6 +189,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             await self._extract_into(image, session.rootfs)
             return
         template = await self._rootfs_template(image)
+        if self.rootfs_layout == "fuse-overlay":
+            await mount_overlay(template, session, timeout_s=self.start_timeout_s)
+            return
         await self.copy_tree(template, session.rootfs)
 
     async def _extract_into(self, image: ResolvedImage, rootfs: Path) -> None:
@@ -222,7 +257,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
                 expected_start_time=str(expected_start) if expected_start else None,
                 grace_s=self.stop_grace_s,
                 timeout_s=self.stop_timeout_s,
-            )
+            ) | await unmount_overlay(path)
 
 
 class SingularitySandbox(SessionSandbox):
@@ -301,6 +336,7 @@ class SingularitySandbox(SessionSandbox):
             "--no-eval",
             "--no-mount",
             "home,cwd,bind-paths",
+            *(["--userns"] if (session.path / OVERLAY_RECORD).exists() else []),
             "--writable",
             "--pid-file",
             str(session.path / PID_FILE),
@@ -400,19 +436,78 @@ class SingularitySandbox(SessionSandbox):
         )
 
     async def _stop_container(self, session: Session) -> None:
-        if not self._instance_may_exist:
-            return
-        async with locked(session.path / CONTROL_LOCK):
-            await stop_instance(
-                self._runtime,
-                self.id,
-                pid_file=session.path / PID_FILE,
-                expected_pid=self._instance_pid,
-                expected_start_time=self._instance_start_time,
-                grace_s=self._provider.stop_grace_s,
-                timeout_s=self._provider.stop_timeout_s,
-            )
-        self._instance_may_exist = False
+        if self._instance_may_exist:
+            async with locked(session.path / CONTROL_LOCK):
+                await stop_instance(
+                    self._runtime,
+                    self.id,
+                    pid_file=session.path / PID_FILE,
+                    expected_pid=self._instance_pid,
+                    expected_start_time=self._instance_start_time,
+                    grace_s=self._provider.stop_grace_s,
+                    timeout_s=self._provider.stop_timeout_s,
+                )
+            self._instance_may_exist = False
+        # Only once nothing runs on it: a session whose instance could not be stopped stays mounted.
+        await unmount_overlay(session.path)
+
+
+def _fuse_tools() -> tuple[str, str]:
+    mount = shutil.which("fuse-overlayfs")
+    unmount = shutil.which("fusermount3") or shutil.which("fusermount")
+    if mount is None or unmount is None:
+        raise SandboxStartError(
+            "the fuse-overlay layout needs fuse-overlayfs and fusermount3 (or fusermount) on PATH"
+        )
+    return mount, unmount
+
+
+async def mount_overlay(template: Path, session: Session, *, timeout_s: float) -> None:
+    """Mount ``session.rootfs`` as a fuse-overlayfs of ``template`` (read-only lower layer) and the session's own
+    ``overlay/upper``.  The record is written first, so a teardown or a janitor unmounts whatever may be mounted."""
+    mount, _ = _fuse_tools()
+    overlay = session.path / OVERLAY_DIR
+    upper, work = overlay / "upper", overlay / "work"
+    for directory in (upper, work, session.rootfs):
+        directory.mkdir(mode=0o700, parents=True)
+    for path in (template, upper, work):
+        if any(c in str(path) for c in ",:"):
+            raise SandboxStartError(f"fuse-overlayfs cannot take a path with ',' or ':': {path}")
+    record = {"mountpoint": str(session.rootfs), "lower": str(template), "upper": str(upper)}
+    (session.path / OVERLAY_RECORD).write_text(json.dumps(record, sort_keys=True) + "\n")
+    result = await run_process(
+        [mount, "-o", f"lowerdir={template},upperdir={upper},workdir={work}", str(session.rootfs)],
+        timeout_s=timeout_s,
+    )
+    if result.returncode != 0 or result.timed_out:
+        raise SandboxStartError(f"could not mount the overlay of {template}: {result.detail()}")
+
+
+def _mounted(path: Path) -> bool:
+    target = str(path).replace(" ", "\\040")
+    try:
+        with open("/proc/self/mountinfo") as stream:
+            return any(line.split(" ", 5)[4] == target for line in stream)
+    except OSError:
+        return False
+
+
+async def unmount_overlay(session_path: Path) -> bool:
+    """Unmount a session's fuse-overlay rootfs, if it has one that is mounted; whether one was.
+
+    Raises :class:`SandboxError` if it stays mounted, so the session is kept rather than deleted through it."""
+    record_path = session_path / OVERLAY_RECORD
+    if not record_path.exists():
+        return False
+    mountpoint = Path(json.loads(record_path.read_text())["mountpoint"])
+    if mountpoint.parent != session_path or not _mounted(mountpoint):
+        return False
+    _, unmount = _fuse_tools()
+    for args in (["-u"], ["-u", "-z"]):
+        result = await run_process([unmount, *args, str(mountpoint)], timeout_s=_UNMOUNT_TIMEOUT_S)
+        if not _mounted(mountpoint):
+            return True
+    raise SandboxError(f"could not unmount the overlay at {mountpoint}: {result.detail()}")
 
 
 def _template_ready(path: Path) -> bool:
