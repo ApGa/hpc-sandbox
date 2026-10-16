@@ -12,6 +12,7 @@ and /usr stay host paths.
 State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_PULL_FAILURES   fail this many pulls first (default 0)
   FAKE_SINGULARITY_PULL_DELAY      seconds each pull takes (default 0)
+  FAKE_SINGULARITY_PULL_REVISION   pulls write a different image, as after a tag moved
   FAKE_SINGULARITY_INSTANCE_EXITS  "1": instances exit right after starting
 """
 
@@ -101,7 +102,10 @@ def pull(args: list[str]) -> int:
     time.sleep(float(os.environ.get("FAKE_SINGULARITY_PULL_DELAY", "0")))
     if count < int(os.environ.get("FAKE_SINGULARITY_PULL_FAILURES", "0")):
         return fail(f"simulated pull failure for {uri}")
-    Path(out).write_bytes(MAGIC + json.dumps({"uri": uri}).encode())
+    image = {"uri": uri}
+    if revision := os.environ.get("FAKE_SINGULARITY_PULL_REVISION"):
+        image["revision"] = revision  # the tag moved
+    Path(out).write_bytes(MAGIC + json.dumps(image).encode())
     return 0
 
 

@@ -259,29 +259,33 @@ def import_uri(reference: str) -> str:
     enroot's ``registry#path`` spelling, bare references (``ubuntu:24.04``,
     ``ghcr.io/org/image:tag``) and enroot's ``dockerd://`` and ``podman://``.
     Docker Hub is spelled the way enroot expects (``docker://library/...``
-    without a registry). Raises ValueError for references enroot cannot
-    import, including digest pins, which enroot 3.x misparses.
+    without a registry). A digest pin (``image[:tag]@sha256:<hex>``) becomes
+    ``image:sha256:<hex>``: enroot 3.x reads ``@`` as a user name, but passes
+    a tag to the registry as given, and a registry serves a manifest by digest
+    where a tag would go. Raises ValueError for references enroot cannot import.
     """
     if reference.startswith(("dockerd://", "podman://")):
         return reference
     if "://" in reference and not reference.startswith(("docker://", "https://", "http://")):
         raise ValueError(f"enroot cannot import {reference!r}; use a docker:// reference")
     target = reference.split("://", 1)[1] if "://" in reference else reference
+    digest = ""
+    if match := DIGEST.search(target):
+        digest, target = f":sha256:{match.group(1)}", target[: match.start()]
+        name = max(target.rfind("/"), target.rfind("#")) + 1
+        target = target[:name] + target[name:].split(":", 1)[0]  # the digest decides, not a tag
     if "@sha256:" in target:
-        raise ValueError(
-            f"enroot cannot import by digest ({reference!r}); import the image once with "
-            "`enroot import` and pin the .sqsh file with an @sha256:<hex> suffix instead"
-        )
+        raise ValueError(f"invalid digest in {reference!r}: expected @sha256: and 64 hex digits")
     if target.endswith(".sif"):
         raise ValueError(f"{reference!r} is a SIF image; the enroot provider runs squashfs images")
     registry, separator, path = target.partition("#")
     if not separator:
         registry, separator, path = target.partition("/")
         if not separator or not ("." in registry or ":" in registry or registry == "localhost"):
-            return f"docker://{target}"
+            return f"docker://{target}{digest}"
     if registry in _DOCKER_HUB:
-        return f"docker://{path}"
-    return f"docker://{registry}#{path}"
+        return f"docker://{path}{digest}"
+    return f"docker://{registry}#{path}{digest}"
 
 
 class EnrootRuntime:
@@ -685,6 +689,7 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
             cache,
             stage_dir=self.scratch_root / "images" if stage_images else None,
             pull_timeout_s=start_timeout_s,
+            prepare=self._make_scratch_directories,
         )
         self.remap_root = remap_root
         self.gpus = gpus

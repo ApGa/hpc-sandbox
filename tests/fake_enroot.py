@@ -22,6 +22,7 @@ hpc-sandbox runs ``enroot start`` with a minimal environment. Knobs are files
 in that directory:
   import-failures   fail this many imports first (default 0)
   start-fails       start fails before entering the rootfs
+  image-revision    imports write a different image, as after a tag moved
 """
 
 from __future__ import annotations
@@ -135,7 +136,9 @@ def import_(args: list[str]) -> int:
     output = Path(options["--output"][0])
     if output.exists():
         return fail(f"File already exists: {output}")
-    write_image(output, {"uri": uri, "files": {"etc/os-release": "fake\n"}})
+    revision = knob("image-revision")  # the tag moved
+    release = f"fake {revision}\n" if revision else "fake\n"
+    write_image(output, {"uri": uri, "files": {"etc/os-release": release}})
     return 0
 
 

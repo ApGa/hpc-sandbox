@@ -119,3 +119,16 @@ def test_janitor_sweeps_every_installed_runtime(
     assert main(["janitor", *common(tmp_path)]) == 0
     report = json.loads(capsys.readouterr().out)
     assert sorted(report["removed"]) == sorted([singularity.name, enroot.name])
+
+
+def test_pull_fills_the_cache_and_refreshes_tags(tmp_path, fake_runtime, capsys, monkeypatch):
+    arguments = ["pull", "--runtime", "singularity", *common(tmp_path), "docker://example/task:1"]
+    assert main(arguments) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert Path(first["path"]).parent == tmp_path / "cache"
+    monkeypatch.setenv("FAKE_SINGULARITY_PULL_REVISION", "2")  # the tag moved
+    assert main(arguments) == 0
+    assert json.loads(capsys.readouterr().out) == first
+    assert main([*arguments, "--refresh"]) == 0
+    refreshed = json.loads(capsys.readouterr().out)
+    assert refreshed["sha256"] != first["sha256"] and len(fake_runtime.calls("pull")) == 2

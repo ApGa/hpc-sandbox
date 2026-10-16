@@ -73,6 +73,7 @@ the runtime underneath.
 |---|---|
 | `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the scratch and cache filesystems, free space, staging and reflink support, and what matters for the runtime: for Singularity/Apptainer the site settings (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices); for enroot whether namespaces can be created, whether imports can convert layer whiteouts, whether this process runs inside a container, and the site's `enroot.conf` and hooks. With `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
 | `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
+| `python -m hpc_sandbox pull [--refresh] IMAGE...` | Pulls images into the image cache unless cached, printing one JSON record (reference, path, SHA-256) per image. `--refresh` pulls tags again; sandboxes started afterwards get the new image. |
 | `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless `--runtime` names one, it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
 
 All commands take `--runtime auto|singularity|enroot` (default
@@ -87,14 +88,20 @@ What both providers share:
    a squashfs image for Singularity, a scheme the runtime cannot pull) raises
    `ValueError` before anything is created. A remote reference is pulled once
    into the image cache under a file lock, validated and published read-only.
-   The cache is keyed by reference, so a tag that moves keeps the image it
-   named when first pulled: pin images by digest (or by file content), or
-   delete the cached `uri-<hash>` file and its `.json` sidecar to pull again.
-   A local image path may carry an `@sha256:<hex>` suffix to pin the file's
-   content. Inside a batch job whose image cache is on another filesystem
-   (for example Lustre or NFS),
-   the image is staged to node-local scratch as `sha256-<digest>.<ext>`,
-   verified while copying.
+   Image files are cached under their own SHA-256 and never change; a
+   reference resolves through a small pointer file. A tag that moves keeps the
+   image it named when first pulled until it is refreshed with
+   `python -m hpc_sandbox pull --refresh IMAGE` (or
+   `await provider.images.pull(image, refresh=True)`), run once before the
+   sandboxes that should get the new image; running sandboxes keep theirs,
+   and earlier image files stay in the cache until deleted (enroot's squashfs
+   images are not byte-reproducible, so every refresh adds one). Pin images by
+   digest (`docker://repo@sha256:<hex>`, with either runtime) or by file
+   content for runs that must not change. A local image path may carry an
+   `@sha256:<hex>` suffix to pin the file's content. Inside a batch job whose
+   image cache is on another filesystem (for example Lustre or NFS), the image
+   is staged to node-local scratch as `sha256-<digest>.<ext>`, verified while
+   copying.
 2. **Session.** A private directory `sessions/hpcsb-<uuid>` (mode 0700) on
    node-local scratch (`sessions-enroot/hpcsb-<uuid>` for enroot), leased
    with `flock` and holding an owner record: the provider, owner PID and
@@ -157,8 +164,9 @@ What both providers share:
 
 - **Images.** `docker://repo:tag`, `docker://repo@sha256:...`, `oras://`,
   `library://` or a bare `repo:tag`, pulled as SIF and validated with
-  `sif list`; cached under the manifest digest when the reference has one
-  (pin images by digest for reproducible runs).
+  `sif list`; cached as `<cache>/sha256-<hex>.sif`, named by the pointer
+  `uri-<hash>.sif.json`, or `oci-<digest>.sif.json` for a digest-pinned
+  reference (pin images by digest for reproducible runs).
 - **Root filesystem.** `build --sandbox --fix-perms`. Bind targets are created
   inside it (refusing symlinks that would lead out of it) and a keep-alive
   `%startscript` is written into it: OCI-derived images ship an empty one, and
@@ -186,7 +194,8 @@ long-lived `enroot start` whose command is a keep-alive loop.
 
 - **Images.** `docker://repo:tag` (Docker's `registry/path` or enroot's
   `registry#path` spelling), a bare `repo:tag`, `dockerd://` and `podman://`,
-  imported with `enroot import` into `<cache>/uri-<hash>.sqsh`. Imports get
+  imported with `enroot import` into `<cache>/sha256-<hex>.sqsh`, named by the
+  pointer `uri-<hash>.sqsh.json` (or `oci-<digest>.sqsh.json`). Imports get
   the variables pulling needs and no others: `PATH`, home and locale, XDG
   directories, proxies, CA bundles, `SOURCE_DATE_EPOCH`, `ENROOT_*`, the
   Docker and Podman variables (`DOCKER_*`, `CONTAINER_HOST`, `CONTAINERS_*`,
@@ -197,9 +206,10 @@ long-lived `enroot start` whose command is a keep-alive loop.
   `TAR_OPTIONS=--delay-directory-restore` and use a wrapper around
   `enroot-aufs2ovlfs` that resolves whiteouts enroot 3.5 aborts on, so images
   that revisit read-only directories or shadow their own entries import.
-- **Digest pins.** Enroot 3.x misparses `@sha256:` references, so they raise
-  `ValueError`. To pin an image, import it once and pass the file with a
-  content pin, which is checked before every use:
+- **Digest pins.** `docker://repo[:tag]@sha256:<hex>` references work:
+  enroot 3.x reads `@` as a user name, so the provider imports them as
+  `repo:sha256:<hex>`, which enroot passes to the registry where a tag would
+  go. A local file can be pinned by content too, checked before every use:
 
   ```bash
   enroot import --output /shared/images/task.sqsh docker://registry#org/task:tag

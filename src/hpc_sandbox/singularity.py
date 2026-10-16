@@ -124,6 +124,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             cache,
             stage_dir=self.scratch_root / "images" if stage_images else None,
             pull_timeout_s=start_timeout_s,
+            prepare=self._make_scratch_directories,
         )
         self.stop_grace_s = stop_grace_s
         self.allow_network_none = allow_network_none

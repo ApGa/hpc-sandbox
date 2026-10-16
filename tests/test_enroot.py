@@ -245,7 +245,7 @@ async def test_spec_validation(enroot_provider, sqsh, tmp_path):
             SandboxSpec(image=str(sqsh), mounts=[Mount(str(tmp_path), "/var/tmp/x")])
         )
     with pytest.raises(ValueError, match="digest"):
-        await enroot_provider.start(SandboxSpec(image="docker://alpine@sha256:" + "a" * 64))
+        await enroot_provider.start(SandboxSpec(image="docker://alpine@sha256:abc"))
 
 
 async def test_network_none_has_only_an_up_loopback(enroot_provider, sqsh):
@@ -430,6 +430,16 @@ def test_import_uris():
     )
     assert import_uri("localhost:5000/image") == "docker://localhost:5000#image"
     assert import_uri("dockerd://image:1") == "dockerd://image:1"
+    digest = "sha256:" + "a" * 64
+    for reference, uri in (
+        (f"docker://alpine@{digest}", f"docker://alpine:{digest}"),
+        (f"alpine:3.20@{digest}", f"docker://alpine:{digest}"),
+        (f"docker://docker.io/library/ubuntu@{digest}", f"docker://library/ubuntu:{digest}"),
+        (f"nvcr.io/nvidia/pytorch:24.01-py3@{digest}", f"docker://nvcr.io#nvidia/pytorch:{digest}"),
+        (f"docker://nvcr.io#nvidia/pytorch@{digest}", f"docker://nvcr.io#nvidia/pytorch:{digest}"),
+        (f"localhost:5000/image:1@{digest}", f"docker://localhost:5000#image:{digest}"),
+    ):
+        assert import_uri(reference) == uri, reference
     for reference in ("docker://alpine@sha256:abc", "oras://registry/x", "/images/task.sif"):
         with pytest.raises(ValueError):
             import_uri(reference)
@@ -535,7 +545,7 @@ async def test_wrong_images_are_refused_before_anything_is_created(tmp_path, fak
         str(sif),
         str(renamed),
         "oras://registry/image:1",
-        "docker://x@sha256:" + "a" * 64,
+        "docker://x@sha256:abc",
     ):
         with pytest.raises(ValueError):
             await provider.start(SandboxSpec(image=image))
@@ -1092,3 +1102,35 @@ async def test_host_side_transfer_errors_stay_os_errors(enroot_provider, sqsh, t
     finally:
         locked.chmod(0o700)
         unreadable.chmod(0o600)
+
+
+async def test_digest_pinned_images_are_imported_by_digest(tmp_path, fake_enroot):
+    provider = make_enroot_provider(tmp_path)
+    digest = "b" * 64
+    sandbox = await provider.start(SandboxSpec(image=f"docker://example/task:1@sha256:{digest}"))
+    (pulled,) = fake_enroot.calls("import")
+    assert pulled["argv"][-1] == f"docker://example/task:sha256:{digest}"
+    assert (provider.images.cache_dir / f"oci-{digest}.sqsh.json").is_file()
+    await sandbox.stop()
+
+
+async def test_refreshed_tags_reach_new_sandboxes_only(tmp_path, fake_enroot):
+    provider = make_enroot_provider(tmp_path)
+    old = await provider.start(SandboxSpec(image="docker://example/task:1"))
+    release = "cat /etc/os-release"
+    fake_enroot.set("image-revision", "2")  # the tag moved
+    cached = await provider.start(SandboxSpec(image="docker://example/task:1"))
+    assert len(fake_enroot.calls("import")) == 1  # still the cached image
+    await provider.images.pull("docker://example/task:1", refresh=True)
+    assert len(fake_enroot.calls("import")) == 2
+    new = await provider.start(SandboxSpec(image="docker://example/task:1"))
+    assert (await new.exec(release)).stdout == "fake 2\n"
+    assert (await old.exec(release)).stdout == (await cached.exec(release)).stdout == "fake\n"
+    for sandbox in (old, cached, new):
+        await sandbox.stop()
+
+
+async def test_pulls_create_the_scratch_directories_they_need(tmp_path, fake_enroot):
+    provider = make_enroot_provider(tmp_path)
+    await provider.images.pull("docker://example/task:1")
+    assert provider.runtime.temp_dir.is_dir() and provider.runtime.cache_dir.is_dir()

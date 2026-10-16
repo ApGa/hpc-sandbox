@@ -1,4 +1,4 @@
-"""``python -m hpc_sandbox``: check a node, run one command in a sandbox, sweep sessions."""
+"""``python -m hpc_sandbox``: check a node, pull images, run one command, sweep sessions."""
 
 from __future__ import annotations
 
@@ -103,6 +103,17 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float, default=600.0, help="seconds (default 600)")
     run.set_defaults(handler=_run)
 
+    pull = commands.add_parser(
+        "pull", parents=[common], help="pull images into the cache: pull IMAGE [IMAGE...]"
+    )
+    pull.add_argument("references", nargs="+", metavar="IMAGE")
+    pull.add_argument(
+        "--refresh",
+        action="store_true",
+        help="pull tags again even if cached (sandboxes started afterwards get the new image)",
+    )
+    pull.set_defaults(handler=_pull)
+
     janitor = commands.add_parser(
         "janitor", parents=[common], help="stop and remove abandoned sessions on this node"
     )
@@ -175,6 +186,16 @@ async def _run(args: argparse.Namespace) -> int:
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     return result.exit_code
+
+
+async def _pull(args: argparse.Namespace) -> int:
+    images = _provider(args).images
+    for reference in args.references:
+        image = await images.pull(reference, refresh=args.refresh)
+        sha256 = image.sha256 or await images.digest(image.path)
+        record = {"reference": reference, "path": str(image.path), "sha256": sha256}
+        print(json.dumps(record), flush=True)
+    return 0
 
 
 async def _janitor(args: argparse.Namespace) -> int:

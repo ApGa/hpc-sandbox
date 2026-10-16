@@ -278,11 +278,15 @@ class SessionProvider(Generic[S]):
             if not Path(mount.source).exists():
                 raise ValueError(f"mount source does not exist: {mount.source!r}")
 
-    async def _prepare(self) -> None:
+    def _make_scratch_directories(self) -> None:
+        """Create the scratch directories; image pulls need them too."""
         for directory in self._scratch_directories():
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.scratch_root.stat().st_uid != os.getuid():
             raise SandboxError(f"scratch root {self.scratch_root} is owned by another user")
+
+    async def _prepare(self) -> None:
+        self._make_scratch_directories()
         if self._initial_sweep is None:
             self._initial_sweep = asyncio.ensure_future(self._sweep_abandoned())
         await asyncio.shield(self._initial_sweep)

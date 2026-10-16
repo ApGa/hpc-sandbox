@@ -5,17 +5,19 @@ Singularity and Apptainer, squashfs files for enroot) and accepts
 
 - a local image path (``/x/task.sif``, ``./task.sif``, ``file:///x/task.sif``),
   optionally pinned to the file's SHA-256 with an ``@sha256:<hex>`` suffix;
-- a remote reference (``docker://repo:tag``, a bare ``repo:tag`` and whatever
-  else the format's runtime can pull), pulled once into the image cache under a
-  file lock. Digest-pinned references are cached under their manifest digest,
-  tag references under a hash of the URI; pin references by digest for
-  reproducible runs where the runtime supports it.
+- a remote reference (``docker://repo:tag``, ``docker://repo@sha256:<hex>``, a
+  bare ``repo:tag`` and whatever else the format's runtime can pull), pulled
+  once into the image cache under a file lock.
 
-A pulled image is validated before it is atomically published read-only, next
-to a sidecar recording its own SHA-256. With a stage directory (node-local
-scratch), the image is then copied there, verified against that digest and
-used from there, so many sandbox starts read local disk instead of shared
-storage.
+A pulled image is validated, then published read-only under its own SHA-256
+(``sha256-<hex>.<ext>``), so cached image files never change. What a
+reference resolves to is a small pointer file next to it
+(``uri-<hash>.<ext>.json``, or ``oci-<digest>.<ext>.json`` for a
+digest-pinned reference), replaced atomically.
+A tag keeps the image it named when first pulled until :meth:`ImageStore.pull`
+refreshes it. With a stage directory (node-local scratch), the image is then
+copied there, verified against its digest and used from there, so many
+sandbox starts read local disk instead of shared storage.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -59,7 +62,7 @@ class ImageFormat(Protocol):
 
     @property
     def tool(self) -> str:
-        """The program that pulls images, recorded in each image's sidecar."""
+        """The program that pulls images, recorded in each image's pointer file."""
         ...
 
     def is_local(self, reference: str) -> bool:
@@ -179,6 +182,11 @@ def copy_and_hash(source: Path, target: Path) -> str:
     return digest.hexdigest()
 
 
+def _number(record: dict[str, object] | None, key: str) -> float:
+    value = record.get(key) if record else None
+    return float(value) if isinstance(value, int | float) else 0.0
+
+
 def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
     try:
         info = path.stat()
@@ -191,9 +199,8 @@ class ImageStore:
     """Resolve references to image files of one format.
 
     Pulled images are cached by reference, so a tag that moves keeps the image
-    it named when it was first pulled. To pull it again, delete its cached
-    ``uri-<hash>`` file and ``.json`` sidecar; better, pin images by digest
-    or by file content.
+    it named when it was first pulled, until ``pull(reference, refresh=True)``
+    pulls it again. Better, pin images by digest or by file content.
     """
 
     def __init__(
@@ -205,8 +212,10 @@ class ImageStore:
         pull_attempts: int = 3,
         pull_retry_delay_s: float = 2.0,
         pull_timeout_s: float = 1800.0,
+        prepare: Callable[[], None] | None = None,
     ) -> None:
         self.format = image_format
+        self.prepare = prepare  # run in a worker thread before each pull (scratch directories)
         self.cache_dir = cache_dir
         self.stage_dir = stage_dir
         self.pull_attempts = max(1, pull_attempts)
@@ -217,13 +226,29 @@ class ImageStore:
         self._digests: dict[tuple[int, int, int, int], str] = {}
 
     async def resolve(self, reference: str) -> ResolvedImage:
-        if self.format.is_local(reference):
-            path, sha256 = await self._local(reference)
-        else:
-            path, sha256 = await self._pulled(reference)
+        """The image file a sandbox starts from: pulled if needed, staged if configured."""
+        image = await self.pull(reference)
+        path, sha256 = image.path, image.sha256
         if self.stage_dir is not None and path.parent != self.stage_dir:
             sha256 = sha256 or await self.digest(path)
             path = await self._stage(path, sha256)
+        return ResolvedImage(reference, path, sha256)
+
+    async def pull(self, reference: str, *, refresh: bool = False) -> ResolvedImage:
+        """The cached image file for ``reference``, pulled unless it is cached already.
+
+        ``refresh`` pulls a remote reference again, for a tag that may have
+        moved; sandboxes that start afterwards get the new image, and those
+        already running keep theirs. A refresh takes a pull another process
+        started after it was asked for, so refreshes asked for while one pull
+        runs share the next one.
+        Digest-pinned and local references never change, so they are only
+        checked. Earlier image files stay in the cache until deleted.
+        """
+        if self.format.is_local(reference):
+            path, sha256 = await self._local(reference)
+        else:
+            path, sha256 = await self._pulled(reference, refresh=refresh)
         return ResolvedImage(reference, path, sha256)
 
     async def digest(self, path: Path) -> str:
@@ -256,26 +281,84 @@ class ImageStore:
             raise SandboxError(f"image {path} has SHA-256 {actual}, expected {pinned}")
         return path, pinned
 
-    async def _pulled(self, reference: str) -> tuple[Path, str | None]:
+    async def _pulled(self, reference: str, *, refresh: bool) -> tuple[Path, str]:
+        requested = time.time()
         uri = self.format.pull_uri(reference)
-        match = DIGEST.search(uri)
+        match = DIGEST.search(reference) or DIGEST.search(uri)
         key = (
             f"oci-{match.group(1)}"
             if match
             else f"uri-{hashlib.sha256(uri.encode()).hexdigest()[:40]}"
         )
-        target = self.cache_dir / f"{key}{self.format.suffix}"
-        if _stat_key(target) not in self._valid:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            async with locked(self.cache_dir / f"{key}.lock", private=False):
-                if not await self._is_valid(target):
-                    await self._pull(uri, target)
-        return target, self._recorded_digest(target)
+        refresh = refresh and match is None  # a digest always names the same image
+        if not refresh and (cached := await self._cached(key, uri)) is not None:
+            return cached
+        if self.prepare is not None:
+            await asyncio.to_thread(self.prepare)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        async with locked(self.cache_dir / f"{key}.lock", private=False):
+            # Another process may have pulled while this one waited; a refresh
+            # takes only a pull that started after it was requested.
+            started = _number(self._pointer(key), "started_at")
+            if (not refresh or started >= requested) and (
+                cached := await self._cached(key, uri, migrate=True)
+            ) is not None:
+                return cached
+            return await self._pull(uri, key)
 
-    async def _pull(self, uri: str, target: Path) -> None:
-        target.unlink(missing_ok=True)
+    async def _cached(
+        self, key: str, uri: str, *, migrate: bool = False
+    ) -> tuple[Path, str] | None:
+        """The valid image file ``key``'s pointer names, if any.
+
+        With ``migrate`` (under the key's lock), an image an earlier version
+        cached under the key itself is adopted instead.
+        """
+        pointer = self._pointer(key)
+        sha256 = pointer.get("sha256") if pointer else None
+        if isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256):
+            path = self._content_path(sha256)
+            if await self._is_valid(path):
+                return path, sha256
+        # Once a pointer exists, an earlier version's file is superseded.
+        return await self._migrate(key, uri) if migrate and pointer is None else None
+
+    async def _migrate(self, key: str, uri: str) -> tuple[Path, str] | None:
+        legacy = self.cache_dir / f"{key}{self.format.suffix}"
+        if not await self._is_valid(legacy):
+            return None
+        sha256 = await self.digest(legacy)
+        path = self._content_path(sha256)
+        if not await self._is_valid(path):
+            try:
+                os.link(legacy, path)
+            except FileExistsError:
+                pass
+            except OSError:  # e.g. another user's file, with fs.protected_hardlinks
+                await self._publish_copy(legacy, path, sha256)
+            if not await self._is_valid(path):
+                return None
+        # When that pull started is unknown, so any refresh pulls again.
+        record = {"source": uri, "sha256": sha256, "pulled_at": legacy.stat().st_mtime}
+        self._set_pointer(key, {**record, "started_at": 0, "runtime": self.format.tool})
+        return path, sha256
+
+    async def _publish_copy(self, source: Path, path: Path, sha256: str) -> None:
+        partial = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            if await asyncio.to_thread(copy_and_hash, source, partial) == sha256:
+                partial.chmod(0o444)
+                os.replace(partial, path)
+        finally:
+            partial.unlink(missing_ok=True)
+
+    def _content_path(self, sha256: str) -> Path:
+        return self.cache_dir / f"sha256-{sha256}{self.format.suffix}"
+
+    async def _pull(self, uri: str, key: str) -> tuple[Path, str]:
+        started = time.time()
         suffix = self.format.suffix
-        partial = target.with_name(f".{target.stem}.{os.getpid()}.{uuid.uuid4().hex}{suffix}")
+        partial = self.cache_dir / f".{key}.{os.getpid()}.{uuid.uuid4().hex}{suffix}"
         errors: list[str] = []
         try:
             for attempt in range(1, self.pull_attempts + 1):
@@ -285,18 +368,21 @@ class ImageStore:
                     # chmod and rename keep the stat identity, so the file stays
                     # known-valid (and its digest memoized) under its final name.
                     digest = await self.digest(partial)
-                    partial.chmod(0o444)
-                    os.replace(partial, target)
-                    self._write_sidecar(
-                        target,
+                    path = self._content_path(digest)
+                    if not await self._is_valid(path):  # else cached for another reference
+                        partial.chmod(0o444)
+                        os.replace(partial, path)
+                    self._set_pointer(
+                        key,
                         {
                             "source": uri,
                             "sha256": digest,
+                            "started_at": started,
                             "pulled_at": time.time(),
                             "runtime": self.format.tool,
                         },
                     )
-                    return
+                    return path, digest
                 status = "timed out" if result.timed_out else f"exited {result.returncode}"
                 detail = result.detail() or f"invalid {self.format.name}"
                 errors.append(f"attempt {attempt}: {status}: {detail}")
@@ -306,20 +392,25 @@ class ImageStore:
             partial.unlink(missing_ok=True)
         raise SandboxError(f"could not pull {uri}:\n" + "\n".join(errors))
 
-    @staticmethod
-    def _write_sidecar(image: Path, record: dict[str, object]) -> None:
-        sidecar = image.with_suffix(".json")
-        temporary = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-        os.replace(temporary, sidecar)
+    def _pointer_path(self, key: str) -> Path:
+        # Per format: providers of both formats may share a cache.
+        return self.cache_dir / f"{key}{self.format.suffix}.json"
 
-    @staticmethod
-    def _recorded_digest(image: Path) -> str | None:
+    def _pointer(self, key: str) -> dict[str, object] | None:
         try:
-            digest = json.loads(image.with_suffix(".json").read_text()).get("sha256")
-        except (OSError, json.JSONDecodeError, AttributeError):
+            record = json.loads(self._pointer_path(key).read_text())
+        except (OSError, json.JSONDecodeError):
             return None
-        return digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) else None
+        return record if isinstance(record, dict) else None
+
+    def _set_pointer(self, key: str, record: dict[str, object]) -> None:
+        pointer = self._pointer_path(key)
+        temporary = pointer.with_name(f".{pointer.name}.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            os.replace(temporary, pointer)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     async def _stage(self, source: Path, sha256: str) -> Path:
         """Copy ``source`` to node-local scratch as ``sha256-<digest><suffix>``, verified.
