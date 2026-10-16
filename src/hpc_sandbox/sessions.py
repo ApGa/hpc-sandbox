@@ -12,10 +12,17 @@ plus whatever the provider keeps next to them. A session is abandoned when
 nobody holds its lease and its recorded owner process is gone. The janitor
 asks the provider to stop what still runs for such a session, which proves
 process identities and fails closed on any ambiguity, and only then deletes it.
+
+A stopped session leaves the session root by one rename into ``.trash/``, under
+the janitor lock, and its files are deleted after the lock is released: no
+janitor can lease a session that is being deleted, and starts and other stops
+never wait for a deletion. A trash entry is named after the session and the
+process deleting it; janitors finish the deletions of processes that died.
 """
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
@@ -39,6 +46,7 @@ _NAME = re.compile(r"hpcsb-[0-9a-f]{32}")
 LEASE_FILE = ".lease"
 OWNER_FILE = "owner.json"
 JANITOR_LOCK = ".janitor.lock"
+TRASH_DIR = ".trash"
 
 # Stops what still runs for an abandoned session; see :func:`sweep`.
 Stopper = Callable[[Path, "dict[str, Any] | None"], Awaitable[bool]]
@@ -112,14 +120,72 @@ def open_session(root: Path, name: str) -> Session:
 
 
 def remove_session(session: Session) -> None:
-    """Delete a stopped session's directory, then drop its lease."""
+    """Delete a stopped session's directory and drop its lease.
+
+    rmtree unlinks the lease before the directory disappears, and a janitor
+    could then lease a fresh inode and take the half-deleted session for an
+    abandoned one. So the directory first leaves the session root by a rename
+    into the trash, under the janitor lock (one metadata operation), and is
+    deleted after the lock is released.
+    """
+    doomed = None
     try:
-        # rmtree unlinks the lease before the directory disappears; holding the
-        # janitor lock stops a janitor from leasing a fresh inode meanwhile.
         with locked_sync(session.path.parent / JANITOR_LOCK):
-            remove_tree(session.path)
+            doomed = move_to_trash(session.path)
     finally:
         session.release()
+    if doomed is not None:
+        remove_tree(doomed)
+
+
+def _owner_tag() -> str:
+    return f"{os.getpid()}-{procfs.start_time(os.getpid())}"
+
+
+def move_to_trash(path: Path, trash: Path | None = None) -> Path | None:
+    """Rename the session directory ``path`` (or a trash entry) into ``trash`` (default: the trash of the
+    session root ``path`` is in) under this process's tag; call with the janitor lock held.
+
+    Returns the new path, or None if ``path`` is gone.
+    """
+    trash = path.parent / TRASH_DIR if trash is None else trash
+    trash.mkdir(mode=0o700, exist_ok=True)
+    info = trash.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise SandboxError(f"refusing foreign trash directory {trash}")
+    target = trash / f"{path.name.split('.', 1)[0]}.{_owner_tag()}.{uuid.uuid4().hex[:8]}"
+    try:
+        os.rename(path, target)
+    except FileNotFoundError:
+        return None
+    return target
+
+
+def _claim_dead_trash(root: Path) -> list[Path]:
+    """Trash entries whose deleting process is gone, renamed under this process's tag; janitor lock held."""
+    trash = root / TRASH_DIR
+    claimed: list[Path] = []
+    try:
+        entries = list(trash.iterdir())
+    except OSError:
+        return claimed
+    for entry in entries:
+        parts = entry.name.split(".")
+        if len(parts) != 3 or not _NAME.fullmatch(parts[0]):
+            continue
+        pid, _, started = parts[1].partition("-")
+        if pid.isdigit() and procfs.identity_matches(int(pid), started):
+            continue  # still being deleted by its live owner
+        try:
+            info = entry.lstat()
+        except OSError:
+            continue
+        if entry.is_symlink() or info.st_uid != os.getuid():
+            continue
+        moved = move_to_trash(entry, trash)
+        if moved is not None:
+            claimed.append(moved)
+    return claimed
 
 
 def remove_tree(path: Path) -> None:
@@ -214,6 +280,7 @@ async def sweep(
     report = JanitorReport()
     if not root.is_dir():
         return report
+    doomed: list[Path] = []
     async with locked(root / JANITOR_LOCK):
         for path in sorted(root.iterdir()):
             if not _NAME.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
@@ -226,7 +293,16 @@ async def sweep(
                 owner = record_provider(_read_owner_record(path))
                 if owner != provider and (owner is not None or not claim_unknown):
                     continue
-            await _sweep_session(path, stop, labels, report)
+            await _sweep_session(path, stop, labels, report, doomed)
+        try:
+            doomed += _claim_dead_trash(root)
+        except (OSError, SandboxError) as error:
+            report.errors.append(f"could not claim the trash of {root}: {error}")
+    for path in doomed:
+        try:
+            await asyncio.to_thread(remove_tree, path)
+        except (OSError, SandboxError) as error:
+            report.errors.append(f"could not delete {path.name}: {error}")
     return report
 
 
@@ -235,6 +311,7 @@ async def _sweep_session(
     stop: Stopper,
     labels: Mapping[str, str] | None,
     report: JanitorReport,
+    doomed: list[Path],
 ) -> None:
     try:
         lease = open_lock_file(path / LEASE_FILE)
@@ -266,7 +343,9 @@ async def _sweep_session(
         )
         if await stop(path, record if bound else None):
             report.stopped.append(path.name)
-        remove_tree(path)
+        moved = move_to_trash(path)
+        if moved is not None:
+            doomed.append(moved)
         report.removed.append(path.name)
     except (OSError, SandboxError) as error:
         report.errors.append(f"could not clean {path.name}: {error}")
