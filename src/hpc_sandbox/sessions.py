@@ -17,7 +17,9 @@ A stopped session leaves the session root by one rename into ``.trash/``, under
 the janitor lock, and its files are deleted after the lock is released: no
 janitor can lease a session that is being deleted, and starts and other stops
 never wait for a deletion. A trash entry is named after the session and the
-process deleting it; janitors finish the deletions of processes that died.
+process deleting it; janitors finish the deletions of processes that died
+(:data:`TRASH_GRACE_S` after the entry was moved, so that an ``rm`` the process
+left running is not raced).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import re
 import shutil
 import socket
 import stat
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -47,6 +50,24 @@ LEASE_FILE = ".lease"
 OWNER_FILE = "owner.json"
 JANITOR_LOCK = ".janitor.lock"
 TRASH_DIR = ".trash"
+# How long after a trash entry was moved a janitor may take over its deletion.
+TRASH_GRACE_S = 600.0
+# sh -c DELETE_SCRIPT hpc-sandbox-delete TREE: delete a trash entry the way remove_tree does (refusing directories
+# this uid does not own, restoring owner access first), without following links or crossing into other mounts.
+# sh -c DELETE_SCRIPT hpc-sandbox-delete TREE [LOG]: delete a trash entry as remove_tree does (refusing
+# directories this uid does not own, restoring owner access first), without following links or crossing into other
+# mounts; LOG, where the caller sends its errors, is removed when it succeeds.
+DELETE_SCRIPT = r"""
+tree=$1; log=${2:-}
+foreign=$(find "$tree" -xdev -type d ! -uid "$(id -u)" -print 2>/dev/null | head -n 1)
+if [ -n "$foreign" ]; then
+    echo "hpc-sandbox: refusing to delete $tree: $foreign is not owned by this uid" >&2
+    exit 3
+fi
+chmod -R u+rwX -- "$tree" 2>/dev/null
+rm -rf --one-file-system -- "$tree" || exit
+if [ -n "$log" ]; then rm -f -- "$log"; fi
+"""
 
 # Stops what still runs for an abandoned session; see :func:`sweep`.
 Stopper = Callable[[Path, "dict[str, Any] | None"], Awaitable[bool]]
@@ -128,14 +149,21 @@ def remove_session(session: Session) -> None:
     into the trash, under the janitor lock (one metadata operation), and is
     deleted after the lock is released.
     """
+    doomed = trash_session(session)
+    if doomed is not None:
+        remove_tree(doomed)
+
+
+def trash_session(session: Session) -> Path | None:
+    """Move a stopped session into the trash under the janitor lock and drop its lease; the caller deletes the
+    returned trash entry (None: the session directory is gone already)."""
     doomed = None
     try:
         with locked_sync(session.path.parent / JANITOR_LOCK):
             doomed = move_to_trash(session.path)
     finally:
         session.release()
-    if doomed is not None:
-        remove_tree(doomed)
+    return doomed
 
 
 def _owner_tag() -> str:
@@ -170,6 +198,10 @@ def _claim_dead_trash(root: Path) -> list[Path]:
     except OSError:
         return claimed
     for entry in entries:
+        if entry.name.startswith(".") and entry.name.endswith(".log"):
+            if not (trash / entry.name[1:-4]).exists():
+                entry.unlink(missing_ok=True)  # the error log of a deletion that ended
+            continue
         parts = entry.name.split(".")
         if len(parts) != 3 or not _NAME.fullmatch(parts[0]):
             continue
@@ -182,6 +214,8 @@ def _claim_dead_trash(root: Path) -> list[Path]:
             continue
         if entry.is_symlink() or info.st_uid != os.getuid():
             continue
+        if time.time() - info.st_ctime < TRASH_GRACE_S:
+            continue  # an rm its owner left running may still be deleting it
         moved = move_to_trash(entry, trash)
         if moved is not None:
             claimed.append(moved)

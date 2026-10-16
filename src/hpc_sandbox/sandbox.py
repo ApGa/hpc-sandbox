@@ -20,6 +20,7 @@ import posixpath
 import re
 import shlex
 import stat
+import subprocess
 import threading
 import time
 import uuid
@@ -35,14 +36,15 @@ from .images import ImageStore, ResolvedImage
 from .paths import default_scratch_root
 from .process import TIMEOUT_EXIT_CODE, ProcessResult, kill_tree, run_process
 from .sessions import (
+    DELETE_SCRIPT,
     JanitorReport,
     Session,
     labels_match,
     new_instance_name,
     open_session,
-    remove_session,
     remove_tree,
     sweep,
+    trash_session,
 )
 from .types import (
     CWD_ERROR_EXIT_CODE,
@@ -78,6 +80,11 @@ TRANSFER_DIR = ".hpc-sandbox-transfer"
 # How long removing a transfer's files may take: code in the sandbox can keep
 # refilling them, and the session's removal takes care of what is left.
 _TRANSFER_CLEANUP_S = 60.0
+# sh -c _DETACH DELETE_SCRIPT TREE LOG: start the deletion in the background and return at once; the deletion is
+# reparented to init, and its errors go to LOG, which it removes when it succeeds.
+_DETACH = '/bin/sh -c "$0" hpc-sandbox-delete "$1" "$2" </dev/null >/dev/null 2>"$2" &'
+# Trash entries this process started deleting (wait_for_deletions).
+_DELETIONS: set[Path] = set()
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROBE_SCRIPT = """\
 set -e
@@ -219,6 +226,40 @@ class SessionProvider(Generic[S]):
     def _session_roots(self) -> list[tuple[Path, bool]]:
         """Directories janitors sweep, and whether they claim sessions of no known provider."""
         return [(self.session_root, True)]
+
+    async def wait_for_deletions(self, timeout_s: float = 300.0) -> bool:
+        """Wait until the session files of the sandboxes this process stopped are deleted; False on timeout."""
+        deadline = time.monotonic() + timeout_s
+        while _DELETIONS:
+            _DELETIONS.difference_update(
+                [path for path in list(_DELETIONS) if not os.path.lexists(path)]
+            )
+            if not _DELETIONS:
+                break
+            if time.monotonic() > deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
+    def _delete_in_background(self, path: Path) -> None:
+        """Delete a trash entry with ``rm`` in a detached process, so that a stop returns once its session left the
+        session root, and the deletion holds no lock, worker thread or GIL here. The process outlives this one if
+        need be; if it is killed, a janitor finishes the deletion."""
+        stderr_path = path.parent / f".{path.name}.log"
+        try:
+            subprocess.run(
+                ["/bin/sh", "-c", _DETACH, DELETE_SCRIPT, str(path), str(stderr_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            log.warning("hpc-sandbox: could not start deleting %s: %s", path, error)
+            return
+        _DELETIONS.add(path)
 
     async def copy_tree(self, source: Path, target: Path) -> None:
         """``cp -a --reflink=auto``: near-free on reflink filesystems, a full copy otherwise."""
@@ -760,8 +801,10 @@ class SessionSandbox:
         if session is None:
             return
         await self._stop_container(session)
-        await asyncio.to_thread(remove_session, session)
+        doomed = await asyncio.to_thread(trash_session, session)
         self._session = None
+        if doomed is not None:
+            self._provider._delete_in_background(doomed)
 
 
 async def _in_thread(

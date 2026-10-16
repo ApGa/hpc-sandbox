@@ -1,4 +1,4 @@
-"""Stopped sessions leave the session root under the janitor lock and are deleted after it."""
+"""Stopped sessions leave the session root under the janitor lock and are deleted after it, in the background."""
 
 from __future__ import annotations
 
@@ -25,28 +25,33 @@ def janitor_lock_held(root: Path) -> bool:
         os.close(descriptor)
 
 
-async def test_stopped_sessions_are_deleted_outside_the_janitor_lock(
+async def test_a_stop_moves_the_session_out_and_deletes_it_in_the_background(
     tmp_path, sif, fake_runtime, monkeypatch
 ):
     provider = make_provider(tmp_path)
     sandbox = await provider.start(SandboxSpec(image=str(sif)))
-    seen: list[tuple[Path, bool]] = []
-    original = sessions.remove_tree
+    # Tasks leave directories they took the owner's permissions from; the deletion restores them first.
+    result = await sandbox.exec("mkdir -p locked/inner && touch locked/inner/f && chmod 000 locked")
+    assert result.exit_code == 0, result.stderr
+    moved: list[tuple[Path, bool]] = []
+    original = sessions.move_to_trash
 
-    def recording(path: Path) -> None:
-        seen.append((path, janitor_lock_held(provider.session_root)))
-        original(path)
+    def recording(path: Path, trash: Path | None = None) -> Path | None:
+        moved.append((path, janitor_lock_held(provider.session_root)))
+        return original(path, trash)
 
-    monkeypatch.setattr(sessions, "remove_tree", recording)
+    monkeypatch.setattr(sessions, "move_to_trash", recording)
     session = sandbox.session_dir
     await sandbox.stop()
     assert session is not None and not session.exists()
-    assert seen and all(path.parent.name == TRASH_DIR for path, _ in seen)
-    assert not any(held for _, held in seen)
+    assert moved == [(session, True)]
+    await provider.wait_for_deletions()
     assert list((provider.session_root / TRASH_DIR).iterdir()) == []
 
 
-async def test_janitors_finish_the_deletions_of_dead_processes_only(tmp_path, sif, fake_runtime):
+async def test_janitors_finish_the_deletions_of_dead_processes_only(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
     provider = make_provider(tmp_path)
     trash = provider.session_root / TRASH_DIR
     trash.mkdir(parents=True)
@@ -56,7 +61,13 @@ async def test_janitors_finish_the_deletions_of_dead_processes_only(tmp_path, si
     live_tag = f"{os.getpid()}-{sessions.procfs.start_time(os.getpid())}"
     live = trash / f"hpcsb-{'b' * 32}.{live_tag}.abcdef12"
     (live / "rootfs").mkdir(parents=True)
+    recent = trash / f"hpcsb-{'c' * 32}.999999999-1.abcdef12"
+    (recent / "rootfs").mkdir(parents=True)
     report = await provider.reap()
     assert not report.errors
-    assert not dead.exists()
+    assert dead.exists() and recent.exists()  # within the grace period: an rm may still be at work
+    monkeypatch.setattr(sessions, "TRASH_GRACE_S", 0.0)
+    report = await provider.reap()
+    assert not report.errors
+    assert not dead.exists() and not recent.exists()
     assert live.exists()
