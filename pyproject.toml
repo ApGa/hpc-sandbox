@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hpc-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rootless HPC sandboxes on Singularity/Apptainer instances and enroot containers"
 license = "MIT"
 license-files = ["LICENSE"]
