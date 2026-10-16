@@ -1141,6 +1141,42 @@ async def test_a_missing_working_directory_fails_the_command_not_the_sandbox(
         await sandbox.download("", tmp_path / "everything")
 
 
+async def test_commands_get_the_images_environment_and_none_of_the_hosts(
+    tmp_path, fake_enroot, monkeypatch
+):
+    image = fake_enroot.make_sqsh(
+        tmp_path / "images" / "env.sqsh",
+        {"etc/environment": "PATH=/opt/image/bin:/usr/bin:/bin\nFROM_IMAGE=image\nSET=image\n"},
+    )
+    monkeypatch.setenv("PATH", f"/host-only/bin:{os.environ['PATH']}")
+    host_only = {
+        "HPCS_CANARY": "1",
+        "TERM": "xterm-host",
+        "https_proxy": "http://user:secret@proxy:3128",
+        "USER": "host-user",
+        "LOGNAME": "host-user",
+    }
+    for name, value in host_only.items():
+        monkeypatch.setenv(name, value)
+    provider = make_enroot_provider(tmp_path)
+    sandbox = await provider.start(
+        SandboxSpec(image=str(image), env={"SET": "spec", "BOTH": "spec", "FROM_SPEC": "spec"})
+    )
+    output = (await sandbox.exec("env", env={"BOTH": "call", "PER_CALL": "call"})).stdout
+    env = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    assert env["PATH"] == "/opt/image/bin:/usr/bin:/bin"
+    assert (env["FROM_IMAGE"], env["SET"], env["BOTH"], env["FROM_SPEC"], env["PER_CALL"]) == (
+        "image",  # the image's ENV
+        "spec",  # which the spec overrides
+        "call",  # which the call overrides
+        "spec",
+        "call",
+    )
+    assert env["HOME"] == "/root" and not host_only.keys() & env.keys()
+    assert "host-only" not in output and "secret" not in output
+    await sandbox.stop()
+
+
 async def test_downloads_keep_only_symlinks_inside_what_they_copy(
     enroot_provider, sqsh, tmp_path, caplog
 ):

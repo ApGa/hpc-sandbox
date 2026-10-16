@@ -333,3 +333,24 @@ async def test_names_a_shell_reserves_do_not_stop_commands(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, env={"FROM_SPEC": "1"}))
     result = await sandbox.exec('echo "$FROM_SPEC"', env=reserved)
     assert (result.exit_code, result.stdout) == (0, "1\n"), result.stderr
+
+
+async def test_commands_get_the_images_path_and_none_of_the_hosts_variables(provider, monkeypatch):
+    await provider.images.resolve(IMAGE)  # pulled with the real proxy settings
+    monkeypatch.setenv("PATH", f"/host-only/bin:{os.environ['PATH']}")
+    monkeypatch.setenv("HPCS_CANARY", "1")
+    monkeypatch.setenv("https_proxy", "http://user:secret@proxy:3128")
+    spec = SandboxSpec(image=IMAGE, env={"FROM_SPEC": "spec", "BOTH": "spec"})
+    sandbox = await provider.start(spec)
+    output = (await sandbox.exec("env", env={"BOTH": "call"})).stdout
+    env = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    assert (env.get("FROM_SPEC"), env.get("BOTH")) == ("spec", "call")
+    for host_only in ("/host-only", "HPCS_CANARY", "secret"):
+        assert host_only not in output, host_only
+    if RUNTIME == "enroot":  # the init holds the image's environment: every command gets it
+        init = (await sandbox.exec("tr '\\0' '\\n' < /proc/1/environ")).stdout
+        image_env = dict(line.split("=", 1) for line in init.splitlines() if "=" in line)
+        shell_state = {"PWD", "OLDPWD", "SHLVL", "_", "HOME"}
+        assert image_env.keys() - shell_state, init
+        for key, value in image_env.items():
+            assert key in shell_state or env.get(key) == value, (key, value, env.get(key))
