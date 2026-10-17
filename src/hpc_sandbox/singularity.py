@@ -3,13 +3,14 @@
 Each sandbox is one persistent instance started from a private, writable root
 filesystem directory:
 
-- the image is extracted with ``build --sandbox --fix-perms`` once per node
-  into a template on node-local scratch, and each sandbox's session directory
-  gets a copy of it (``cp -a --reflink=auto``: a reflink clone on XFS or Btrfs,
-  a plain copy elsewhere), so no loop devices, overlays or ``--fakeroot`` are
-  needed and the size of the writable layer is bounded only by the scratch
-  filesystem (unlike ``--writable-tmpfs``, which many sites cap at a few tens
-  of MiB);
+- the image is extracted with ``build --sandbox --fix-perms`` into the
+  sandbox's session directory on node-local scratch, or, with
+  ``rootfs_templates``, once per node into a template that each sandbox's
+  session gets a copy of (``cp -a --reflink=auto``: a reflink clone on XFS or
+  Btrfs, a plain copy elsewhere), so no loop devices, overlays or
+  ``--fakeroot`` are needed and the size of the writable layer is bounded
+  only by the scratch filesystem (unlike ``--writable-tmpfs``, which many
+  sites cap at a few tens of MiB);
 - the instance runs with ``--cleanenv --containall --no-home --no-eval
   --no-mount home,cwd,bind-paths`` and session-private ``/tmp`` and
   ``/var/tmp`` binds, as the calling user;

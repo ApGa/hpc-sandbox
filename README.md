@@ -195,16 +195,28 @@ What both providers share:
    `cp -a --reflink=auto` (near free on reflink filesystems), after a `sync`.
    Processes and memory are not captured; take snapshots while the sandbox is
    quiescent. Snapshots live on the node that took them; their metadata
-   records `remap_root` and `container_uid` like the owner record.
+   records `remap_root` and `container_uid` like the owner record. A snapshot
+   of a fuse-overlay sandbox (see Singularity) holds only what the sandbox
+   wrote, its upper layer, and names the template it lies over; it restores
+   over that template, with the fuse-overlay layout.
 7. **Teardown and janitors.** `stop()` kills running commands, stops the
    container, re-proving process identities before signalling anything, and
-   deletes the session. Teardown is shielded from cancellation. A janitor
-   considers only `hpcsb-<uuid>` sessions under its root whose lease is free
-   and whose owner process is dead, optionally filtered by labels, and leaves
-   sessions that belong to another provider; it fails closed (reports and
-   leaves the session) whenever identities disagree. Each provider sweeps
-   abandoned sessions before its first start that finds the janitor lock free
-   (a start never waits for it; janitors and `reap()` do).
+   moves the session into the session root's `.trash` under the janitor lock.
+   A detached `rm` deletes it once the stop returned: one deletion at a time
+   per session root, at the lowest CPU priority, holding an flock on its trash
+   entry (while 16 of a process's deletions are pending, its stops delete
+   their sessions themselves). `await provider.wait_for_deletions()` waits for
+   the deletions the process started; call it before a process or a Slurm
+   step ends, which kills them (`hpc-sandbox run` and `doctor` do). Teardown
+   is shielded from cancellation. A janitor considers only `hpcsb-<uuid>`
+   sessions under its root whose lease is free and whose owner process is
+   dead, optionally filtered by labels, and leaves sessions that belong to
+   another provider; it fails closed (reports and leaves the session)
+   whenever identities disagree, and never deletes through a mount point. It
+   takes over the trash entries no deletion holds once the process that moved
+   them died (a minute later if it lives). Each provider sweeps abandoned
+   sessions before its first start that finds the janitor lock free (a start
+   never waits for it; janitors and `reap()` do).
 
 ### Singularity CE / Apptainer
 
@@ -213,10 +225,28 @@ What both providers share:
   `sif list`; cached as `<cache>/sha256-<hex>.sif`, named by the pointer
   `uri-<hash>.sif.json`, or `oci-<digest>.sif.json` for a digest-pinned
   reference (pin images by digest for reproducible runs).
-- **Root filesystem.** `build --sandbox --fix-perms`. Bind targets are created
-  inside it (refusing symlinks that would lead out of it) and a keep-alive
-  `%startscript` is written into it: OCI-derived images ship an empty one, and
-  an instance whose startscript exits is removed at once.
+- **Root filesystem.** `build --sandbox --fix-perms` into the session. Bind
+  targets are created inside it (refusing symlinks that would lead out of it)
+  and a keep-alive `%startscript` is written into it: OCI-derived images ship
+  an empty one, and an instance whose startscript exits is removed at once.
+  With `rootfs_templates=True` each image is extracted once per node, into
+  `templates/` on scratch, and each sandbox gets a copy of it
+  (`cp -a --reflink=auto`); a copy creates as many inodes as an extraction,
+  and on XFS 64-128 copies at once took longer than as many extractions.
+- **fuse-overlay layout.** With `rootfs_layout="fuse-overlay"` (or
+  `HPC_SANDBOX_ROOTFS_LAYOUT=fuse-overlay` for a whole job) the rootfs is a
+  `fuse-overlayfs` mount made by your uid: the node's template of the image is
+  the read-only lower layer, and the session's `overlay/upper` holds what the
+  sandbox writes, with Docker's semantics (whiteouts, opaque and renamed
+  directories). The instance runs it unprivileged (`--userns --writable`), so
+  a start and a stop cost the same whatever the image's size (64 sandboxes of
+  an 870 MB image started in 0.6 s and stopped in 2 s on ABCI), and deleting a
+  session deletes only what its sandbox wrote. File operations go through
+  FUSE: metadata-heavy ones (`find`, many small files) are slower than on a
+  copy; Python imports are not. GPUs, `cgroup_limits` and `--fakeroot` need
+  the copy layout, and pod services always get one. A stop unmounts the
+  overlay once the instance is gone; janitors unmount those of abandoned
+  sessions, and those a killed job left dead on the node wherever they lie.
 - **Instance.** `instance start --cleanenv --containall --no-home --no-eval
   --no-mount home,cwd,bind-paths --writable --pid-file ...` with
   session-private `/tmp` and `/var/tmp` binds, `/etc/resolv.conf` read-only
@@ -441,6 +471,8 @@ Options both providers take:
 | `allow_network_none` | False | Permit `network="none"` (`--net --network none`); only where users may create network namespaces. Adds the `network_none` capability. |
 | `gpu` | None | `"nv"` or `"rocm"` (`--nv` / `--rocm`); adds the `gpu` capability. |
 | `cgroup_limits` | False | Pass `cpus` and `memory_mb` as `--cpus` / `--memory` where rootless cgroups work. Otherwise `cpus` is advisory. |
+| `rootfs_layout` | `$HPC_SANDBOX_ROOTFS_LAYOUT`, else `"copy"` | `"copy"` or `"fuse-overlay"` (see Singularity). `"fuse-overlay"` given with `gpu`, `cgroup_limits`, `--fakeroot` or `rootfs_templates=False` raises `ValueError`; the variable leaves such a provider on `"copy"`. |
+| `rootfs_templates` | True with fuse-overlay, else False | Extract each image once per node into a template; the copy layout then copies it into each sandbox. |
 
 `EnrootProvider` only:
 
@@ -505,6 +537,17 @@ Singularity CE / Apptainer:
   `--containall` exposes only the GPUs `NVIDIA_VISIBLE_DEVICES` names, so the
   provider sets it to `all` (inside a Slurm allocation, the allocated GPUs)
   unless it is already set.
+- **fuse-overlay** needs `fuse-overlayfs` and `fusermount3` (or `fusermount`)
+  on `PATH`, and `/dev/fuse`. Each overlay counts towards fusermount's
+  `mount_max` (`/etc/fuse.conf`, 1000 by default), which caps the FUSE mounts
+  of every user on the node; a killed job's overlays stay mounted, dead, until
+  a janitor or a provider's first start on the node unmounts them.
+- **Templates are never evicted.** Every image version used on a node keeps
+  an extracted rootfs in `templates/` on scratch, next to its staged SIF. A
+  per-job scratch root goes with the job; on one that outlives jobs, keep
+  age-based cleaners such as systemd-tmpfiles out of `templates/`: a
+  template that lost its marker is extracted again, but one that lost other
+  files is not noticed.
 - **Variables passed despite `--cleanenv`.** The runtime passes `TERM` and the
   proxy variables into containers regardless (proxy URLs may hold
   credentials), so the provider removes them from its environment for
@@ -587,6 +630,7 @@ slirp4netns is found.
 
 ## Not yet
 
+- evicting templates, and an overlay layout for enroot;
 - an ext3 overlay mode as an alternative to rootfs directories;
 - memory snapshots, and per-node PID namespaces inside one shared sandbox;
 - for pods: snapshots, GPUs, services that switch to other users (that needs
