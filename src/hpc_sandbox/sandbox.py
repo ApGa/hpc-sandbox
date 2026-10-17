@@ -302,6 +302,9 @@ class SessionProvider(Generic[S]):
         """Private directories created below the scratch root before the first start."""
         return [self.scratch_root, self.session_root, self.snapshot_root]
 
+    #: The snapshot formats this provider restores (``metadata["format"]``).
+    snapshot_formats: tuple[str, ...] = (SNAPSHOT_FORMAT,)
+
     async def _launch(
         self,
         spec: SandboxSpec,
@@ -373,7 +376,10 @@ class SessionProvider(Generic[S]):
 
     def _snapshot_dir(self, snapshot: SandboxSnapshot) -> Path:
         path = Path(snapshot.path)
-        if snapshot.provider != self.name or snapshot.metadata.get("format") != SNAPSHOT_FORMAT:
+        if (
+            snapshot.provider != self.name
+            or snapshot.metadata.get("format") not in self.snapshot_formats
+        ):
             raise ValueError(f"snapshot {snapshot.id} was not taken by this provider")
         if path.parent != self.snapshot_root or path.name != snapshot.id or not path.is_dir():
             raise ValueError(f"snapshot {snapshot.id} is not in {self.snapshot_root}")
@@ -531,11 +537,8 @@ class SessionSandbox:
         target = self._provider.snapshot_root / snapshot_id
         target.mkdir(mode=0o700)
         try:
-            for source, name in (
-                (session.rootfs, "rootfs"),
-                (session.tmp, "tmp"),
-                (session.var_tmp, "var-tmp"),
-            ):
+            snapshot_format, rootfs_metadata = await self._snapshot_rootfs(target)
+            for source, name in ((session.tmp, "tmp"), (session.var_tmp, "var-tmp")):
                 await self._provider.copy_tree(source, target / name)
             await asyncio.to_thread(remove_tree, target / "tmp" / TRANSFER_DIR)
             await asyncio.to_thread(self._snapshot_files, target)
@@ -545,12 +548,13 @@ class SessionSandbox:
                 path=str(target),
                 image=self.spec.image,
                 metadata={
-                    "format": SNAPSHOT_FORMAT,
+                    "format": snapshot_format,
                     "created_at": time.time(),
                     "source_sandbox": self.id,
                     "workdir": self.spec.workdir,
                     "labels": dict(self.spec.labels),
                     **self._user(),
+                    **rootfs_metadata,
                 },
             )
             (target / "snapshot.json").write_text(json.dumps(asdict(snapshot), indent=2) + "\n")
@@ -619,6 +623,13 @@ class SessionSandbox:
 
     def _prepare_snapshot(self) -> None:
         """Make the rootfs copyable before a snapshot; runs in a worker thread."""
+
+    async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
+        """Copy the root filesystem into the snapshot directory ``target``; returns the snapshot's format and the
+        metadata a restore needs.  The whole rootfs, by default."""
+        assert self._session is not None
+        await self._provider.copy_tree(self._session.rootfs, target / "rootfs")
+        return SNAPSHOT_FORMAT, {}
 
     def _snapshot_files(self, target: Path) -> None:
         """Add provider files to the snapshot directory ``target``; runs in a worker thread."""

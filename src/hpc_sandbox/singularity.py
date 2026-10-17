@@ -33,7 +33,9 @@ image is the read-only lower layer and the session's ``overlay/upper`` holds
 what the sandbox writes, with Docker's semantics (whiteouts, opaque and renamed
 directories). The instance runs it unprivileged (``--userns --writable``), so
 a start and a stop cost the same whatever the image's size, and deleting a
-session deletes only what its sandbox wrote. File operations in the sandbox go
+session deletes only what its sandbox wrote. A snapshot is a copy of the upper
+layer and names the template it lies over; a restore mounts a copy of it over
+that template, so neither copies the image. File operations in the sandbox go
 through FUSE: metadata-heavy ones (``find``, many small files) are slower than
 on a copy. GPUs, cgroup limits and ``--fakeroot`` need the copy layout.
 """
@@ -49,6 +51,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -60,13 +63,14 @@ from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import ContainerRuntime, instance_pid
 from .sandbox import (
     RESERVED_TARGETS,
+    SNAPSHOT_FORMAT,
     SessionProvider,
     SessionSandbox,
     make_owner_writable,
     poll,
 )
 from .sessions import Session, remove_tree
-from .types import SandboxError, SandboxStartError
+from .types import SandboxError, SandboxSnapshot, SandboxStartError
 
 KEEPALIVE_STARTSCRIPT = """\
 #!/bin/sh
@@ -89,6 +93,8 @@ OVERLAY_DIR = (
 OVERLAY_RECORD = (
     "fuse-overlay.json"  # <session>/fuse-overlay.json: the mount, for teardown and janitors
 )
+#: A snapshot of a fuse-overlay sandbox: its upper layer (``upper/``), and the template it lies over (``lower``).
+OVERLAY_SNAPSHOT_FORMAT = "hpc-sandbox/fuse-overlay-v1"
 _PID_WAIT_S = 5.0
 _UNMOUNT_TIMEOUT_S = 30.0
 
@@ -105,6 +111,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     """
 
     name = "singularity"
+    snapshot_formats = (SNAPSHOT_FORMAT, OVERLAY_SNAPSHOT_FORMAT)
     network_none_hint = (
         "network 'none' needs allow_network_none=True; setuid Singularity reserves "
         "network namespaces for root unless the site permits them"
@@ -204,6 +211,47 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             return
         await self.copy_tree(template, session.rootfs)
 
+    async def restore(self, snapshot: SandboxSnapshot, spec: Any) -> SingularitySandbox:
+        """Start a sandbox for ``spec`` whose files come from ``snapshot``; a fuse-overlay sandbox's snapshot
+        (its upper layer) is mounted over the template it was taken over, with a copy of that upper layer."""
+        if snapshot.metadata.get("format") != OVERLAY_SNAPSHOT_FORMAT:
+            return await super().restore(snapshot, spec)
+        self._check(spec)
+        source = self._snapshot_dir(snapshot)
+        if snapshot.image != spec.image:
+            raise ValueError(f"snapshot {snapshot.id} is of {snapshot.image!r}, not {spec.image!r}")
+        if self.rootfs_layout != "fuse-overlay":
+            raise ValueError(
+                f"snapshot {snapshot.id} is of a fuse-overlay sandbox; restore it with rootfs_layout='fuse-overlay'"
+            )
+        lower = self._snapshot_lower(snapshot)
+        await self._prepare()
+        return await self._launch(
+            spec, partial(self._restore_overlay, source, lower), restored=True
+        )
+
+    def _snapshot_lower(self, snapshot: SandboxSnapshot) -> Path:
+        """The template a fuse-overlay snapshot lies over: one of this node's complete templates, or ValueError."""
+        lower = Path(str(snapshot.metadata.get("lower", "")))
+        templates = self.scratch_root / TEMPLATE_DIR
+        if (
+            lower.name != "rootfs"
+            or lower.parent.parent != templates
+            or not _template_ready(lower.parent)
+        ):
+            raise ValueError(
+                f"snapshot {snapshot.id} lies over {str(lower)!r}, which is not a template of this node "
+                f"(in {templates})"
+            )
+        return lower
+
+    async def _restore_overlay(self, source: Path, lower: Path, session: Session) -> None:
+        (session.path / OVERLAY_DIR).mkdir(mode=0o700)
+        await self.copy_tree(source / "upper", session.path / OVERLAY_DIR / "upper")
+        await mount_overlay(lower, session, timeout_s=self.start_timeout_s, upper_exists=True)
+        for name, target in (("tmp", session.tmp), ("var-tmp", session.var_tmp)):
+            await self.copy_tree(source / name, target)
+
     async def _extract_into(self, image: ResolvedImage, rootfs: Path) -> None:
         result = await self.runtime.run(
             "build",
@@ -301,6 +349,17 @@ class SingularitySandbox(SessionSandbox):
 
     def _watch_root(self) -> int | None:
         return self._instance_pid
+
+    async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
+        """A fuse-overlay sandbox's snapshot is its upper layer, what it wrote over the node's template (which
+        never changes); a copy-layout sandbox's is its whole rootfs."""
+        assert self._session is not None
+        record_path = self._session.path / OVERLAY_RECORD
+        if not record_path.exists():
+            return await super()._snapshot_rootfs(target)
+        record = json.loads(record_path.read_text())
+        await self._provider.copy_tree(Path(record["upper"]), target / "upper")
+        return OVERLAY_SNAPSHOT_FORMAT, {"lower": record["lower"]}
 
     def _prepare_rootfs(self) -> None:
         """Install the keep-alive startscript, mount points and private tmp dirs."""
@@ -472,13 +531,16 @@ def _fuse_tools() -> tuple[str, str]:
     return mount, unmount
 
 
-async def mount_overlay(template: Path, session: Session, *, timeout_s: float) -> None:
+async def mount_overlay(
+    template: Path, session: Session, *, timeout_s: float, upper_exists: bool = False
+) -> None:
     """Mount ``session.rootfs`` as a fuse-overlayfs of ``template`` (read-only lower layer) and the session's own
-    ``overlay/upper``.  The record is written first, so a teardown or a janitor unmounts whatever may be mounted."""
+    ``overlay/upper``, new or (``upper_exists``, a restore) already filled.  The record is written first, so a
+    teardown or a janitor unmounts whatever may be mounted."""
     mount, _ = _fuse_tools()
     overlay = session.path / OVERLAY_DIR
     upper, work = overlay / "upper", overlay / "work"
-    for directory in (upper, work, session.rootfs):
+    for directory in (work, session.rootfs) if upper_exists else (upper, work, session.rootfs):
         directory.mkdir(mode=0o700, parents=True)
     for path in (template, upper, work):
         if any(c in str(path) for c in ",:"):

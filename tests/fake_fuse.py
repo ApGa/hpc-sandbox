@@ -1,7 +1,8 @@
 """Stand-ins for ``fuse-overlayfs`` and ``fusermount3``, used by the unit tests.
 
-``fuse-overlayfs -o lowerdir=L,upperdir=U,workdir=W MOUNTPOINT`` copies L into MOUNTPOINT (the fake singularity
-then runs commands on it as on any rootfs) and records the mount; ``fusermount3 -u [-z] MOUNTPOINT`` drops the
+``fuse-overlayfs -o lowerdir=L,upperdir=U,workdir=W MOUNTPOINT`` copies L, then what U holds, into MOUNTPOINT (the
+fake singularity then runs commands on it as on any rootfs; what they write stays there, not in U) and records the
+mount; ``fusermount3 -u [-z] MOUNTPOINT`` drops the
 record. Every invocation is appended to $FAKE_SINGULARITY_STATE/fuse-calls.jsonl, and the mounts are files in
 $FAKE_SINGULARITY_STATE/mounts/. FAKE_FUSE_MOUNT_FAILS=1 makes mounts fail.
 """
@@ -36,6 +37,7 @@ def main(argv: list[str]) -> int:
         options = dict(item.split("=", 1) for item in args[args.index("-o") + 1].split(","))
         mountpoint = args[-1]
         shutil.copytree(options["lowerdir"], mountpoint, symlinks=True, dirs_exist_ok=True)
+        shutil.copytree(options["upperdir"], mountpoint, symlinks=True, dirs_exist_ok=True)
         record_path(mountpoint).write_text(json.dumps({"mountpoint": mountpoint, **options}))
         return 0
     mountpoint = args[-1]

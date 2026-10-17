@@ -18,6 +18,7 @@ image that has ``nvidia-smi`` or ``rocm-smi`` available through the runtime.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import os
 import shutil
@@ -121,6 +122,52 @@ async def test_snapshot_and_restore(provider):
     await sandbox.exec("echo v2 > /app/state")
     restored = await provider.restore(snapshot, spec)
     assert (await restored.exec("cat /app/state /tmp/note")).stdout == "v1\nnote\n"
+    await provider.delete_snapshot(snapshot)
+
+
+# Every path of the root filesystem (but the kernel's and the private tmp dirs) with its mode and type, the size
+# and link target of what is not a directory (a directory's size depends on how it was built), and the contents of
+# the files the change below writes: busybox's find, stat and xargs suffice.
+FINGERPRINT = r"""
+skip='( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /run )'
+find / -xdev $skip -prune -o -type d -print | sort | tr '\n' '\0' | xargs -0 stat -c '%n %a %F'
+find / -xdev $skip -prune -o ! -type d -print | sort | tr '\n' '\0' | xargs -0 stat -c '%n %a %F %s %N'
+cat /etc/hpc-probe /app/delta/f1 /app/delta/f2 2>&1
+"""
+CHANGE = r"""
+set -e
+mkdir -p /app/delta
+echo one > /app/delta/f1 && echo two > /app/delta/f2 && chmod 640 /app/delta/f1
+ln -s /app/delta/f1 /app/link && mkfifo /app/fifo
+echo probe >> /etc/hpc-probe
+set -- $(ls -d /etc/*/ /usr/*/ | head -3)
+rm -rf "$1"                                   # an image directory, deleted
+mv "$2" "${2%/}-moved"                        # one renamed
+rm -rf "$3" && mkdir "$3" && echo only > "$3/only"   # one replaced by a new one
+"""
+
+
+async def test_a_restore_shows_what_the_sandbox_deleted_renamed_and_replaced(provider):
+    """Whatever the layout keeps of a sandbox (a copy of its rootfs, or what it wrote over the image), a restore
+    shows exactly its files: image directories deleted, renamed and replaced, links, a FIFO and modes."""
+    spec = SandboxSpec(image=IMAGE)
+    sandbox = await provider.start(spec)
+    changed = await sandbox.exec(CHANGE)
+    assert changed.exit_code == 0, changed.stderr
+    before = await sandbox.exec(FINGERPRINT)
+    assert before.exit_code == 0, before.stderr
+    snapshot = await sandbox.snapshot()
+    restored = await provider.restore(snapshot, spec)
+    after = await restored.exec(FINGERPRINT)
+    assert after.exit_code == 0, after.stderr
+    difference = "\n".join(
+        difflib.unified_diff(
+            before.stdout.splitlines(), after.stdout.splitlines(), lineterm="", n=0
+        )
+    )
+    assert after.stdout == before.stdout, difference[:3000]
+    fresh = await provider.start(spec)  # and the image itself is untouched
+    assert (await fresh.exec("cat /etc/hpc-probe; ls /app")).stdout == ""
     await provider.delete_snapshot(snapshot)
 
 
