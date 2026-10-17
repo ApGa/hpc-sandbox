@@ -107,7 +107,7 @@ async def test_snapshots_of_fuse_overlay_sandboxes_restore_as_copies(
         await provider.delete_snapshot(snapshot)
 
 
-async def test_pod_services_get_copies(tmp_path, sif, fake_runtime, fake_fuse):
+async def test_pod_services_get_the_copy_layout(tmp_path, sif, fake_runtime, fake_fuse):
     if reason := namespaces_unavailable():
         pytest.skip(reason)
     provider = make_provider(tmp_path, rootfs_layout="fuse-overlay")
@@ -115,9 +115,11 @@ async def test_pod_services_get_copies(tmp_path, sif, fake_runtime, fake_fuse):
     try:
         service = await pod.start_service(ServiceSpec("main", SandboxSpec(image=str(sif))))
         assert (await service.exec("cat /app/hello.txt")).stdout == "hello\n"
-        assert service.session_dir is not None
-        assert not (service.session_dir / OVERLAY_RECORD).exists()
+        session = service.session_dir
+        assert session is not None and not (session / OVERLAY_RECORD).exists()
         assert fuse_calls(fake_fuse) == []
+        # Extracted, as the copy layout does unless templates are asked for.
+        assert [call[-2] for call in fake_runtime.calls("build")] == [str(session / "rootfs")]
     finally:
         await pod.stop()
 
