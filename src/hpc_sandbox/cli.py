@@ -188,12 +188,14 @@ async def _run(args: argparse.Namespace) -> int:
         memory_mb=args.memory_mb,
         labels=_pairs(args.label, "--label"),
     )
-    sandbox = await provider.start(spec)
     try:
-        result = await sandbox.exec(command, timeout_s=args.timeout)
-    finally:
-        await sandbox.stop()
-        await provider.wait_for_deletions(_DELETION_WAIT_S)  # the end of a Slurm step kills them
+        sandbox = await provider.start(spec)
+        try:
+            result = await sandbox.exec(command, timeout_s=args.timeout)
+        finally:
+            await sandbox.stop()
+    finally:  # a failed start's session too: the end of a Slurm step kills its deletion
+        await provider.wait_for_deletions(_DELETION_WAIT_S)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     return result.exit_code
@@ -227,7 +229,11 @@ async def _janitor(args: argparse.Namespace) -> int:
     report = JanitorReport()
     for runtime in _janitor_runtimes(args):
         args.runtime = runtime
-        swept = await _provider(args).reap(labels)
+        try:
+            swept = await _provider(args).reap(labels)
+        except (ValueError, SandboxError) as error:  # one runtime's setup spares no other
+            report.errors.append(f"could not sweep the {runtime} sessions: {error}")
+            continue
         report.stopped += swept.stopped
         report.removed += swept.removed
         report.live += swept.live
@@ -430,6 +436,7 @@ async def _smoke(report: _Report, provider: SessionProvider[Any], image: str) ->
         sandbox = await provider.start(SandboxSpec(image=image, labels={"hpc-sandbox": "doctor"}))
     except SandboxError as error:
         report.line("FAIL", "sandbox start", str(error))
+        await provider.wait_for_deletions(_DELETION_WAIT_S)  # what its cleanup left to delete
         return
     report.line("ok", "sandbox start", f"{sandbox.id} in {time.monotonic() - started:.1f} s")
     try:

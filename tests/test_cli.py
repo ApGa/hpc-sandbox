@@ -125,6 +125,45 @@ def test_janitor_sweeps_every_installed_runtime(
     assert sorted(report["removed"]) == sorted([singularity.name, enroot.name])
 
 
+def test_a_janitor_sweeps_the_other_runtimes_when_one_cannot_be_set_up(
+    tmp_path, sqsh, fake_runtime, fake_enroot, capsys, monkeypatch
+):
+    import asyncio
+
+    from conftest import make_enroot_provider
+
+    async def abandon():
+        provider = make_enroot_provider(tmp_path)
+        session = await _abandon(provider, sqsh)
+        sandbox = next(iter(provider.sandboxes))
+        await sandbox._stop_container(sandbox._session)  # its processes die with their owner
+        return session
+
+    enroot = asyncio.run(abandon())
+    monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse")  # a typo only Singularity reads
+    assert main(["janitor", *common(tmp_path)]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == [enroot.name]
+    assert len(report["errors"]) == 1 and "singularity" in report["errors"][0]
+
+
+def test_run_waits_for_deletions_even_when_the_start_failed(
+    tmp_path, sif, fake_runtime, capsys, monkeypatch
+):
+    from hpc_sandbox.sandbox import SessionProvider
+
+    waited = []
+
+    async def waiting(self, timeout_s: float = 300.0) -> bool:
+        waited.append(timeout_s)
+        return True
+
+    monkeypatch.setattr(SessionProvider, "wait_for_deletions", waiting)
+    monkeypatch.setenv("FAKE_SINGULARITY_INSTANCE_EXITS", "1")
+    assert main(["run", str(sif), *common(tmp_path), "--", "true"]) != 0
+    assert waited
+
+
 def test_pull_fills_the_cache_and_refreshes_tags(tmp_path, fake_runtime, capsys, monkeypatch):
     arguments = ["pull", "--runtime", "singularity", *common(tmp_path), "docker://example/task:1"]
     assert main(arguments) == 0
