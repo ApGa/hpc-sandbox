@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ from hpc_sandbox import (
     SandboxProvider,
     SandboxSpec,
     SandboxStartError,
+    SingularityProvider,
 )
 from hpc_sandbox.enroot import AUFS2OVLFS_WRAPPER, KEEPALIVE, import_uri
 from hpc_sandbox.process import run_process
@@ -588,6 +590,22 @@ def test_singularity_option_names_are_accepted(tmp_path, fake_enroot):
     for options in ({"gpu": "rocm"}, {"gpu": "nv", "gpus": "0"}, {"cgroup_limits": True}):
         with pytest.raises(ValueError):
             provider(**options)
+
+
+def test_every_singularity_option_name_is_an_enroot_option():
+    singularity = set(inspect.signature(SingularityProvider).parameters)
+    assert singularity <= set(inspect.signature(EnrootProvider).parameters)
+
+
+def test_rootfs_options_mean_the_copy_layout(tmp_path, fake_enroot, monkeypatch):
+    # Singularity's site-wide default does not reach enroot.
+    monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")
+    make_enroot_provider(tmp_path)
+    make_enroot_provider(tmp_path, rootfs_layout="copy", rootfs_templates=True)
+    make_enroot_provider(tmp_path, rootfs_templates=False)
+    for layout in ("fuse-overlay", "overlay"):
+        with pytest.raises(ValueError, match="enroot create"):
+            make_enroot_provider(tmp_path, rootfs_layout=layout)
 
 
 async def test_network_none_can_be_turned_off(tmp_path, sqsh):
