@@ -25,6 +25,7 @@ a deletion longer than :data:`TRASH_GRACE_S`.
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import json
 import os
@@ -33,6 +34,7 @@ import shutil
 import signal
 import socket
 import stat
+import subprocess
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -43,6 +45,7 @@ from typing import Any
 
 from . import procfs
 from .locks import locked, locked_sync, open_lock_file, try_locked
+from .process import run_process
 from .types import SandboxError
 
 SCHEMA = "hpc-sandbox/session-v1"
@@ -53,6 +56,11 @@ OWNER_FILE = "owner.json"
 JANITOR_LOCK = ".janitor.lock"
 _KILL_WAIT_S = 5.0
 TRASH_DIR = ".trash"
+# Deletions of one session root wait for this lock, to run one at a time.
+DELETIONS_LOCK = ".deletions.lock"
+# A full scratch (blocks, inodes or quota): no room even to move a session into the trash.
+_NO_ROOM = (errno.ENOSPC, errno.EDQUOT)
+_DELETE_TIMEOUT_S = 3600.0
 # How long after a trash entry was moved a janitor may take over its deletion while the process that moved it
 # lives, if no deletion holds it: that process may be about to start one.
 TRASH_GRACE_S = 60.0
@@ -128,9 +136,17 @@ def open_session(root: Path, name: str) -> Session:
     The janitor lock makes publication and leasing atomic for janitors: a crash
     before the lease is taken leaves a directory the next janitor recovers.
     """
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    prepare_session_root(root)
     with locked_sync(root / JANITOR_LOCK):
         return _lease(root, name)
+
+
+def prepare_session_root(root: Path) -> None:
+    """Create a session root with its trash and deletion lock, so that a stop
+    on a scratch filled meanwhile needs no new inode."""
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (root / TRASH_DIR).mkdir(mode=0o700, exist_ok=True)
+    os.close(open_lock_file(root / DELETIONS_LOCK))
 
 
 def _lease(root: Path, name: str) -> Session:
@@ -184,10 +200,11 @@ def move_to_trash(path: Path, trash: Path | None = None) -> Path | None:
     return target
 
 
-def _claim_dead_trash(root: Path) -> list[Path]:
-    """Trash entries whose deleting process is gone, renamed under this process's tag; janitor lock held."""
+def _claim_dead_trash(root: Path) -> list[tuple[Path, int | None]]:
+    """Trash entries no deletion holds whose mover is gone (or late), renamed under this process's tag
+    and held; janitor lock held."""
     trash = root / TRASH_DIR
-    claimed: list[Path] = []
+    claimed: list[tuple[Path, int | None]] = []
     try:
         entries = list(trash.iterdir())
     except OSError:
@@ -204,15 +221,23 @@ def _claim_dead_trash(root: Path) -> list[Path]:
             info = entry.lstat()
         except OSError:
             continue
-        if entry.is_symlink() or info.st_uid != os.getuid() or _being_deleted(entry):
+        if info.st_uid != os.getuid() or stat.S_ISLNK(info.st_mode):
             continue
+        if not stat.S_ISDIR(info.st_mode):
+            entry.unlink(missing_ok=True)  # no session's: left where one was by older versions
+            continue
+        held = hold_trash_entry(entry)
+        if held is None:
+            continue  # a deletion holds it
         pid, _, started = parts[1].partition("-")
         owner_alive = pid.isdigit() and procfs.identity_matches(int(pid), started)
-        if owner_alive and time.time() - info.st_ctime < TRASH_GRACE_S:
-            continue  # its owner may be about to delete it
-        moved = move_to_trash(entry, trash)
-        if moved is not None:
-            claimed.append(moved)
+        moved = None
+        if not owner_alive or time.time() - info.st_ctime >= TRASH_GRACE_S:
+            moved = move_to_trash(entry, trash)  # else its owner may be about to delete it
+        if moved is None:
+            os.close(held)
+        else:
+            claimed.append((moved, held))
     return claimed
 
 
@@ -224,7 +249,7 @@ async def create_session(root: Path, name: str) -> Session:
     few metadata operations on local scratch, so that the node-wide lock is
     never held while a busy executor gets to a worker thread.
     """
-    await asyncio.to_thread(root.mkdir, mode=0o700, parents=True, exist_ok=True)
+    await asyncio.to_thread(prepare_session_root, root)
     async with locked(root / JANITOR_LOCK):
         return _lease(root, name)
 
@@ -242,42 +267,58 @@ async def trash_session_awaiting(session: Session) -> Path | None:
     doomed = None
     try:
         async with locked(session.path.parent / JANITOR_LOCK):
-            doomed = move_to_trash(session.path)
+            try:
+                doomed = move_to_trash(session.path)
+            except OSError as error:
+                if error.errno not in _NO_ROOM:
+                    raise
+                # No room even for that: delete it where it is, as the lease and the lock
+                # keep janitors away.
+                await delete_tree(session.path)
     finally:
         session.release()
     return doomed
 
 
-def delete_trash_entry(path: Path) -> None:
-    """:func:`remove_tree` of a trash entry, holding it as a detached deletion does, so that janitors leave it be."""
+def hold_trash_entry(entry: Path) -> int | None:
+    """An open descriptor of the trash entry ``entry`` holding its lock, which tells janitors that a
+    deletion has it; None if it is gone or held already."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except FileNotFoundError:
-        return
+        descriptor = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except OSError:
         os.close(descriptor)
-        return  # someone else deletes it
-    try:
-        remove_tree(path)
-    finally:
-        os.close(descriptor)
+        return None
+    return descriptor
 
 
 def _being_deleted(entry: Path) -> bool:
     """Whether a deletion holds the trash entry ``entry``."""
+    held = hold_trash_entry(entry)
+    if held is not None:
+        os.close(held)
+    return held is None and entry.is_dir()
+
+
+async def delete_trash_entry(path: Path, held: int | None) -> None:
+    """Delete a trash entry that ``held`` holds (see :func:`hold_trash_entry`), then let it go."""
     try:
-        descriptor = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return True
+        await delete_tree(path)
     finally:
-        os.close(descriptor)
-    return False
+        if held is not None:
+            os.close(held)
+
+
+async def delete_tree(path: Path) -> None:
+    """Delete ``path`` as :data:`DELETE_SCRIPT` does, in a child process: no worker thread, and no
+    limit on the tree's depth."""
+    argv = ["/bin/sh", "-c", DELETE_SCRIPT, "hpc-sandbox-delete", str(path)]
+    result = await run_process(argv, timeout_s=_DELETE_TIMEOUT_S)
+    if result.returncode != 0 or result.timed_out:
+        raise SandboxError(f"could not delete {path}: {result.detail()}")
 
 
 def remove_tree(path: Path) -> None:
@@ -315,12 +356,20 @@ def remove_tree(path: Path) -> None:
         if not isinstance(error, FileNotFoundError):
             raise error
 
-    for directory, directories, _files in os.walk(path, onerror=fail):
-        for name in directories:
-            make_traversable(Path(directory) / name)
-    while os.path.lexists(path):
-        with suppress(FileNotFoundError):  # another deletion removed an entry first: go on
-            shutil.rmtree(path)
+    try:
+        for directory, directories, _files in os.walk(path, onerror=fail):
+            for name in directories:
+                make_traversable(Path(directory) / name)
+        while os.path.lexists(path):
+            with suppress(FileNotFoundError):  # another deletion removed an entry first: go on
+                shutil.rmtree(path)
+    except RecursionError:  # deeper than Python recurses: rm walks it without limit
+        argv = ["/bin/sh", "-c", DELETE_SCRIPT, "hpc-sandbox-delete", str(path)]
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_DELETE_TIMEOUT_S, check=False
+        )
+        if result.returncode != 0:
+            raise SandboxError(f"could not delete {path}: {result.stderr.strip()}") from None
 
 
 @dataclass
@@ -387,7 +436,7 @@ async def sweep(
     report = JanitorReport()
     if not root.is_dir():
         return report
-    doomed: list[Path] = []
+    doomed: list[tuple[Path, int | None]] = []
     janitor = locked(root / JANITOR_LOCK) if wait else try_locked(root / JANITOR_LOCK)
     async with janitor as held:
         if held is False:
@@ -408,9 +457,9 @@ async def sweep(
             doomed += _claim_dead_trash(root) if delete else []
         except (OSError, SandboxError) as error:
             report.errors.append(f"could not claim the trash of {root}: {error}")
-    for path in doomed:
+    for path, held in doomed:
         try:
-            await asyncio.to_thread(delete_trash_entry, path)
+            await delete_trash_entry(path, held)
         except (OSError, SandboxError) as error:
             report.errors.append(f"could not delete {path.name}: {error}")
     return report
@@ -421,7 +470,7 @@ async def _sweep_session(
     stop: Stopper,
     labels: Mapping[str, str] | None,
     report: JanitorReport,
-    doomed: list[Path] | None,
+    doomed: list[tuple[Path, int | None]] | None,
 ) -> None:
     try:
         lease = open_lock_file(path / LEASE_FILE)
@@ -455,9 +504,15 @@ async def _sweep_session(
             report.stopped.append(path.name)
         if doomed is None:  # stop only
             return
-        moved = move_to_trash(path)
+        try:
+            moved = move_to_trash(path)
+        except OSError as error:
+            if error.errno not in _NO_ROOM:
+                raise
+            await delete_tree(path)  # no room to move it: here, under its lease and the lock
+            moved = None
         if moved is not None:
-            doomed.append(moved)
+            doomed.append((moved, hold_trash_entry(moved)))
         report.removed.append(path.name)
     except (OSError, SandboxError) as error:
         report.errors.append(f"could not clean {path.name}: {error}")

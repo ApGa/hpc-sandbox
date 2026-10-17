@@ -449,13 +449,13 @@ async def test_the_pods_janitor_deletes_nothing_under_the_pod_roots_lock(
     pod_id = result.stdout.split()[0]
     await asyncio.sleep(0.5)  # the parent-death signals
     deleted = []
-    original = sessions.remove_tree
+    original = sessions.delete_tree
 
-    def recording(path: Path) -> None:
+    async def recording(path: Path) -> None:
         deleted.append((path.name.split(".")[0], janitor_lock_held(provider.pod_root)))
-        original(path)
+        await original(path)
 
-    monkeypatch.setattr(sessions, "remove_tree", recording)
+    monkeypatch.setattr(sessions, "delete_tree", recording)
     report = await provider.reap()
     assert pod_id in report.removed and not report.errors
     # The pod goes whole, services and all, once its root's janitor lock is released.

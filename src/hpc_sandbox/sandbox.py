@@ -34,15 +34,18 @@ from typing import TYPE_CHECKING, Any, Generic, NoReturn, Self, TypeVar
 
 from . import memory, procfs, safefs
 from .images import ImageStore, ResolvedImage
+from .locks import open_lock_file
 from .paths import default_scratch_root
 from .process import TIMEOUT_EXIT_CODE, ProcessResult, kill_tree, run_process
 from .sessions import (
     DELETE_SCRIPT,
+    DELETIONS_LOCK,
     JanitorReport,
     Session,
     Stopper,
     create_session,
     delete_trash_entry,
+    hold_trash_entry,
     kill_exact,
     labels_match,
     new_instance_name,
@@ -88,16 +91,16 @@ TRANSFER_DIR = ".hpc-sandbox-transfer"
 # How long removing a transfer's files may take: code in the sandbox can keep
 # refilling them, and the session's removal takes care of what is left.
 _TRANSFER_CLEANUP_S = 60.0
-# sh -c _DETACH DELETE_SCRIPT TREE LOG LOCK: start the deletion in the background and return at once. The deletion
-# is reparented to init, holds an flock on TREE from the start (janitors leave such an entry alone), and its errors go
-# to the caller's stderr, the file LOG (removed when it succeeds) or nowhere. Deletions of one session root run one
-# at a time (LOCK) and at the lowest CPU priority: in parallel they slowed starts, whose extractions or copies create
-# the same kind of metadata the deletions remove. Each path stays one argument, whatever characters it holds.
+# sh -c _DETACH DELETE_SCRIPT TREE LOG QUEUE: start TREE's deletion in the background and return at once; the
+# deletion is reparented to init. It inherits two open descriptors: TREE's, whose lock the caller took (janitors leave
+# a held entry alone) and which it keeps until it ends, and, if one could be opened, the descriptor QUEUE of the
+# session root's deletion lock. Deletions of one root run one at a time behind that lock and at the lowest CPU
+# priority: in parallel they slowed starts, whose extractions or copies create the metadata the deletions remove.
+# Errors go to the caller's stderr: LOG, which the deletion removes when it succeeds, or nowhere. Each path stays
+# one argument, whatever characters it holds.
 _DETACH = (
-    "if command -v flock >/dev/null 2>&1; then "
-    'set -- flock "$1" flock "$3" /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; '
-    'else set -- /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; fi; '
-    'nice -n 19 "$@" </dev/null >/dev/null &'
+    '( if [ -n "$3" ] && command -v flock >/dev/null 2>&1; then flock "$3"; fi; '
+    'exec nice -n 19 /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2" ) </dev/null >/dev/null &'
 )
 # Trash entries this process started deleting (wait_for_deletions).
 _DELETIONS: set[Path] = set()
@@ -148,15 +151,18 @@ def _deleted(path: Path) -> bool:
     return not os.path.lexists(path) and not os.path.lexists(_deletion_log(path))
 
 
-async def _detach_deletion(path: Path) -> None:
+async def _detach_deletion(path: Path, held: int) -> None:
+    """Hand the trash entry ``path``, and ``held``, its locked descriptor, to a detached deletion."""
     log_path: Path | None = _deletion_log(path)
-    # Next to the janitor lock, in the session root.
-    lock_path = path.parent.parent / ".deletions.lock"
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
         stderr = os.open(log_path, flags, 0o600)
     except OSError:  # a full scratch: the deletion it needs must start all the same
         stderr, log_path = subprocess.DEVNULL, None
+    try:  # the session root's, next to its janitor lock
+        queue: int | None = open_lock_file(path.parent.parent / DELETIONS_LOCK)
+    except (OSError, SandboxError):
+        queue = None  # no queue to wait in, then
     try:
         process = await asyncio.create_subprocess_exec(
             "/bin/sh",
@@ -165,29 +171,33 @@ async def _detach_deletion(path: Path) -> None:
             DELETE_SCRIPT,
             str(path),
             str(log_path or ""),
-            str(lock_path),
+            "" if queue is None else str(queue),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=stderr,
             start_new_session=True,
+            pass_fds=(held,) if queue is None else (held, queue),
         )
-        async with asyncio.timeout(_DETACH_TIMEOUT_S):
-            await process.wait()
     except OSError as error:
         log.warning("hpc-sandbox: deleting %s here: %s", path, error)
-        await _delete_here(path)
+        await _delete_here(path, held)
         return
+    finally:
+        for descriptor in (stderr, queue):
+            if descriptor is not None and descriptor != subprocess.DEVNULL:
+                os.close(descriptor)
+    os.close(held)  # the deletion holds it now
+    try:
+        async with asyncio.timeout(_DETACH_TIMEOUT_S):
+            await process.wait()
     except TimeoutError:
         log.warning("hpc-sandbox: deleting %s did not start within %s s", path, _DETACH_TIMEOUT_S)
-    finally:
-        if stderr != subprocess.DEVNULL:
-            os.close(stderr)
     _DELETIONS.add(path)
 
 
-async def _delete_here(path: Path) -> None:
+async def _delete_here(path: Path, held: int) -> None:
     try:
-        await asyncio.to_thread(delete_trash_entry, path)
+        await delete_trash_entry(path, held)
     except (OSError, SandboxError) as error:
         log.warning("hpc-sandbox: could not delete %s: %s", path, error)
 
@@ -412,12 +422,16 @@ class SessionProvider(Generic[S]):
         """Delete a trash entry with ``rm`` in a detached process, so that a stop returns once its session left the
         session root, and the deletion holds no lock, worker thread or GIL here. The process outlives this one if
         need be; if it is killed, a janitor finishes the deletion. A cancelled caller still starts it. While too
-        many of this process's deletions are pending, the caller deletes the entry itself, at its own priority."""
+        many of this process's deletions are pending, the caller waits for an ``rm`` of its own, at its own
+        priority."""
         _DELETIONS.difference_update([done for done in list(_DELETIONS) if _deleted(done)])
+        held = hold_trash_entry(path)
+        if held is None:
+            return  # gone, or another deletion has it
         if len(_DELETIONS) >= _DELETION_BACKLOG:
-            await asyncio.shield(_delete_here(path))
+            await asyncio.shield(_delete_here(path, held))
         else:
-            await asyncio.shield(_detach_deletion(path))
+            await asyncio.shield(_detach_deletion(path, held))
 
     async def copy_tree(self, source: Path, target: Path) -> None:
         """``cp -a --reflink=auto``: near-free on reflink filesystems, a full copy otherwise."""
@@ -1029,8 +1043,8 @@ class SessionSandbox:
         if session is None:
             return
         await self._stop_container(session)
-        self._session = None
         await self._discard(session)
+        self._session = None  # only now: a stop() after a failed one retries
 
     async def _discard(self, session: Session) -> None:
         """Take a stopped session out of the session root at once; its files go in the background."""

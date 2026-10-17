@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import os
 import shutil
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from conftest import in_mount_namespace, make_provider
+from test_janitor import crashed_sandboxes
 
 from hpc_sandbox import SandboxSpec, sessions
 from hpc_sandbox import sandbox as sandbox_module
@@ -216,3 +218,129 @@ async def test_finished_deletions_are_forgotten(tmp_path, sif, fake_runtime):
         await asyncio.sleep(0.05)
     await second.stop()
     assert deleted not in _DELETIONS
+
+
+def test_a_full_scratch_still_moves_and_deletes_what_stops(tmp_path):
+    # A task filled the scratch: no inode is left for a trash, a log or a lock file.
+    script = """
+import asyncio, subprocess, sys, time
+from pathlib import Path
+from hpc_sandbox import sessions
+from hpc_sandbox import sandbox as sandbox_module
+scratch = Path(sys.argv[1])
+subprocess.run(["mount", "-t", "tmpfs", "-o", "size=16m,nr_inodes=64", "tmpfs", str(scratch)], check=True)
+root = scratch / "sessions"
+async def main():
+    session = await sessions.create_session(root, sessions.new_instance_name())
+    rootfs = session.path / "rootfs"
+    rootfs.mkdir()
+    count = 0
+    try:
+        while True:
+            (rootfs / f"f{count}").touch()
+            count += 1
+    except OSError:
+        pass
+    doomed = await sessions.trash_session_awaiting(session)
+    await sandbox_module._detach_deletion(doomed, sessions.hold_trash_entry(doomed))
+    deadline = time.monotonic() + 30
+    while doomed.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    print(count > 0, doomed.exists(), sorted(p.name for p in (root / ".trash").iterdir()))
+asyncio.run(main())
+"""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    assert in_mount_namespace(script, str(scratch)).split() == ["True", "False", "[]"]
+
+
+async def test_with_no_room_for_the_move_a_stop_deletes_the_session_in_place(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    provider = make_provider(tmp_path)
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    session = sandbox.session_dir
+    assert session is not None
+
+    def full(path: Path, trash: Path | None = None) -> Path | None:
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(path))
+
+    monkeypatch.setattr(sessions, "move_to_trash", full)
+    await sandbox.stop()
+    assert not session.exists()
+
+
+async def test_with_no_room_for_the_move_a_janitor_deletes_the_session_in_place(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    (name,) = await crashed_sandboxes(tmp_path, sif, "a")
+    provider = make_provider(tmp_path)
+
+    def full(path: Path, trash: Path | None = None) -> Path | None:
+        raise OSError(errno.EDQUOT, os.strerror(errno.EDQUOT), str(path))
+
+    monkeypatch.setattr(sessions, "move_to_trash", full)
+    report = await provider.reap()
+    assert (report.removed, report.errors) == ([name], [])
+    assert not (provider.session_root / name).exists()
+
+
+async def test_a_stop_that_failed_to_discard_its_session_is_retried(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    provider = make_provider(tmp_path)
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    session = sandbox.session_dir
+    assert session is not None
+    original, calls = sessions.move_to_trash, []
+
+    def failing_once(path: Path, trash: Path | None = None) -> Path | None:
+        calls.append(path)
+        if len(calls) == 1:
+            raise OSError(errno.EIO, os.strerror(errno.EIO), str(path))
+        return original(path, trash)
+
+    monkeypatch.setattr(sessions, "move_to_trash", failing_once)
+    with pytest.raises(OSError):
+        await sandbox.stop()
+    assert session.exists()
+    await sandbox.stop()
+    assert await provider.wait_for_deletions(30)
+    assert not session.exists() and len(calls) == 2
+
+
+async def test_janitors_hold_what_they_delete_and_clear_files_left_in_the_trash(
+    tmp_path, fake_runtime, monkeypatch
+):
+    provider = make_provider(tmp_path)
+    trash = provider.session_root / TRASH_DIR
+    trash.mkdir(parents=True)
+    dead = trash / f"hpcsb-{'a' * 32}.999999999-1.abcdef12"
+    (dead / "rootfs").mkdir(parents=True)
+    stray = trash / f"hpcsb-{'e' * 32}.999999999-1.abcdef12"
+    stray.write_text("")  # what flock(1) once created where an entry had been
+    held = []
+    original = sessions.delete_tree
+
+    async def checking(path: Path) -> None:
+        held.append(sessions._being_deleted(path))
+        await original(path)
+
+    monkeypatch.setattr(sessions, "delete_tree", checking)
+    report = await provider.reap()
+    assert not report.errors and held == [True]
+    assert list(trash.iterdir()) == []
+
+
+def test_trees_deeper_than_python_recurses_are_removed(tmp_path):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    parent = os.open(tree, os.O_RDONLY)
+    for _ in range(1500):
+        os.mkdir("d", dir_fd=parent)
+        child = os.open("d", os.O_RDONLY, dir_fd=parent)
+        os.close(parent)
+        parent = child
+    os.close(parent)
+    remove_tree(tree)
+    assert not tree.exists()
