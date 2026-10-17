@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from conftest import make_provider
 
-from hpc_sandbox import SandboxSpec
+from hpc_sandbox import SandboxSpec, procfs
 from hpc_sandbox.singularity import TEMPLATE_DIR, TEMPLATE_MARKER
 
 
@@ -69,5 +72,88 @@ async def test_a_failed_extraction_publishes_no_template(tmp_path, sif, fake_run
     try:
         assert (await sandbox.exec("cat hello.txt")).stdout == "hello\n"
         assert len([path for path in root.iterdir() if path.is_dir()]) == 1
+    finally:
+        await sandbox.stop()
+
+
+async def test_a_template_that_lost_its_marker_is_extracted_again(tmp_path, sif, fake_runtime):
+    provider = make_provider(tmp_path, rootfs_templates=True)
+    await (await provider.start(SandboxSpec(image=str(sif)))).stop()
+    root = provider.scratch_root / TEMPLATE_DIR
+    (template,) = [path for path in root.iterdir() if path.is_dir()]
+    (
+        template / TEMPLATE_MARKER
+    ).unlink()  # as an age-based cleaner, or a removal cut short, leaves it
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    try:
+        assert (await sandbox.exec("cat hello.txt")).stdout == "hello\n"
+        assert len(fake_runtime.calls("build")) == 2
+        assert [path.name for path in root.iterdir() if path.is_dir()] == [template.name]
+        assert (template / TEMPLATE_MARKER).is_file()
+    finally:
+        await sandbox.stop()
+
+
+def dead_pid() -> int:
+    return int(subprocess.run(["sh", "-c", "echo $$"], capture_output=True, check=True).stdout)
+
+
+def rewrite_in_place(path: Path, old: bytes, new: bytes) -> None:
+    """Rewrite ``path`` keeping its inode, size and mtime, as ``cp -p`` or ``rsync -t`` over it may."""
+    before = path.stat()
+    with open(path, "r+b") as stream:
+        content = stream.read()
+        stream.seek(0)
+        stream.write(content.replace(old, new))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+async def test_janitors_delete_extractions_of_dead_processes_that_no_overlay_uses(
+    tmp_path, fake_runtime
+):
+    provider = make_provider(tmp_path, rootfs_templates=True)
+    root = provider.scratch_root / TEMPLATE_DIR
+    gone = dead_pid()
+    abandoned = root / f".sha256-{'a' * 64}.{gone}-1.0123abcd"
+    used = root / f".sha256-{'b' * 64}.{gone}-1.4567cdef"
+    mine = root / f".sha256-{'c' * 64}.{os.getpid()}-{procfs.start_time(os.getpid())}.89abcdef"
+    for path in (abandoned, used, mine):
+        (path / "rootfs" / "etc").mkdir(parents=True)
+    # A fuse-overlayfs holding the directory open, as one keeps its lower layer.
+    holder = "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print(1, flush=True); time.sleep(60)"
+    overlay = await asyncio.create_subprocess_exec(
+        "bash",
+        "-c",
+        'exec -a fuse-overlayfs "$0" -c "$1" "$2"',
+        sys.executable,
+        holder,
+        str(used / "rootfs"),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert overlay.stdout is not None and await overlay.stdout.readline() == b"1\n"
+        report = await provider.reap()
+        assert report.errors == []
+        assert (abandoned.exists(), used.exists(), mine.exists()) == (False, True, True)
+    finally:
+        overlay.kill()
+        await overlay.wait()
+    await provider.reap()
+    assert not used.exists() and mine.exists()
+
+
+async def test_a_template_of_an_image_rewritten_in_place_is_not_reused(tmp_path, sif, fake_runtime):
+    provider = make_provider(tmp_path, rootfs_templates=True)
+    await (await provider.start(SandboxSpec(image=str(sif)))).stop()
+    rewrite_in_place(sif, b': "hello', b': "howdy')
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    try:
+        assert (await sandbox.exec("cat hello.txt")).stdout == "howdy\n"
     finally:
         await sandbox.stop()
