@@ -3,11 +3,13 @@
 Each sandbox is one persistent instance started from a private, writable root
 filesystem directory:
 
-- the image is extracted with ``build --sandbox --fix-perms`` into the
-  sandbox's session directory on node-local scratch, so no loop devices,
-  overlays or ``--fakeroot`` are needed and the size of the writable layer is
-  bounded only by the scratch filesystem (unlike ``--writable-tmpfs``, which
-  many sites cap at a few tens of MiB);
+- the image is extracted with ``build --sandbox --fix-perms`` once per node
+  into a template on node-local scratch, and each sandbox's session directory
+  gets a copy of it (``cp -a --reflink=auto``: a reflink clone on XFS or Btrfs,
+  a plain copy elsewhere), so no loop devices, overlays or ``--fakeroot`` are
+  needed and the size of the writable layer is bounded only by the scratch
+  filesystem (unlike ``--writable-tmpfs``, which many sites cap at a few tens
+  of MiB);
 - the instance runs with ``--cleanenv --containall --no-home --no-eval
   --no-mount home,cwd,bind-paths`` and session-private ``/tmp`` and
   ``/var/tmp`` binds, as the calling user;
@@ -15,23 +17,41 @@ filesystem directory:
   identities, and session directories are leased, so teardown and janitors
   stop only what they can prove is theirs and never use
   ``instance stop --all``. Unprivileged instance metadata is kept per user,
-  not per job, so this matters on shared nodes;
+  not per job, so this matters on shared nodes. Starting and stopping one
+  instance hold that instance's own control lock, so instances start and
+  stop in parallel;
 - every runtime call has a timeout, networking is the host's by default, and
   memory is guarded by a PSS watchdog because users rarely get cgroups.
 
 OCI-derived images ship an empty ``%startscript``, and an instance whose
 startscript exits is removed at once, so a keep-alive startscript is written
 into the extracted rootfs.
+
+With ``rootfs_layout="fuse-overlay"`` a sandbox's root filesystem is not a copy
+but a ``fuse-overlayfs`` mount, made by this user: the node's template of the
+image is the read-only lower layer and the session's ``overlay/upper`` holds
+what the sandbox writes, with Docker's semantics (whiteouts, opaque and renamed
+directories). The instance runs it unprivileged (``--userns --writable``), so
+a start and a stop cost the same whatever the image's size, and deleting a
+session deletes only what its sandbox wrote. A snapshot is a copy of the upper
+layer and names the template it lies over; a restore mounts a copy of it over
+that template, so neither copies the image. File operations in the sandbox go
+through FUSE: metadata-heavy ones (``find``, many small files) are slower than
+on a copy. GPUs, cgroup limits and ``--fakeroot`` need the copy layout.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import shutil
 import signal
 import stat
 import time
+import uuid
 from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -39,17 +59,18 @@ from . import procfs
 from .images import ImageStore, ResolvedImage, SifImages
 from .locks import locked
 from .paths import default_image_cache, should_stage
-from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult
+from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import ContainerRuntime, instance_pid
 from .sandbox import (
     RESERVED_TARGETS,
+    SNAPSHOT_FORMAT,
     SessionProvider,
     SessionSandbox,
     make_owner_writable,
     poll,
 )
-from .sessions import Session
-from .types import SandboxError, SandboxStartError
+from .sessions import Session, remove_tree
+from .types import SandboxError, SandboxSnapshot, SandboxStartError
 
 KEEPALIVE_STARTSCRIPT = """\
 #!/bin/sh
@@ -63,7 +84,19 @@ done
 """
 PID_FILE = "instance.pid"
 CONTROL_LOCK = ".instance-control.lock"
+TEMPLATE_DIR = "templates"
+TEMPLATE_MARKER = ".complete"
+ROOTFS_LAYOUTS = ("copy", "fuse-overlay")
+OVERLAY_DIR = (
+    "overlay"  # <session>/overlay/{upper,work}: the writable layer of a fuse-overlay rootfs
+)
+OVERLAY_RECORD = (
+    "fuse-overlay.json"  # <session>/fuse-overlay.json: the mount, for teardown and janitors
+)
+#: A snapshot of a fuse-overlay sandbox: its upper layer (``upper/``), and the template it lies over (``lower``).
+OVERLAY_SNAPSHOT_FORMAT = "hpc-sandbox/fuse-overlay-v1"
 _PID_WAIT_S = 5.0
+_UNMOUNT_TIMEOUT_S = 30.0
 
 
 class SingularityProvider(SessionProvider["SingularitySandbox"]):
@@ -78,6 +111,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     """
 
     name = "singularity"
+    snapshot_formats = (SNAPSHOT_FORMAT, OVERLAY_SNAPSHOT_FORMAT)
     network_none_hint = (
         "network 'none' needs allow_network_none=True; setuid Singularity reserves "
         "network namespaces for root unless the site permits them"
@@ -101,6 +135,8 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         extra_start_args: Sequence[str] = (),
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT,
         memory_poll_s: float = 1.0,
+        rootfs_templates: bool | None = None,
+        rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
     ) -> None:
         super().__init__(
             scratch_root=scratch_root,
@@ -137,28 +173,136 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             | ({"network_none"} if allow_network_none else set())
             | ({"gpu"} if gpu else set())
         )
+        layout = rootfs_layout or os.environ.get("HPC_SANDBOX_ROOTFS_LAYOUT") or "copy"
+        if layout not in ROOTFS_LAYOUTS:
+            raise ValueError(f"rootfs_layout must be one of {ROOTFS_LAYOUTS}, not {layout!r}")
+        if layout == "fuse-overlay":
+            fakeroot = any(arg in ("--fakeroot", "-f") for arg in extra_start_args)
+            conflict = (
+                "GPUs, cgroup limits and --fakeroot need rootfs_layout='copy'"
+                if gpu or cgroup_limits or fakeroot
+                else "it needs rootfs_templates"
+                if rootfs_templates is False
+                else None
+            )
+            if conflict and rootfs_layout is not None:
+                raise ValueError(f"the fuse-overlay layout runs unprivileged instances: {conflict}")
+            if conflict:  # a site-wide default this provider cannot take
+                layout = "copy"
+        self.rootfs_layout = layout
+        # A copy of a template creates as many inodes as an extraction: on XFS, 64-128 copies at once took longer
+        # than 64-128 extractions (reflinks update refcounts too), so the copy layout extracts per sandbox unless
+        # asked; the fuse-overlay layout needs the template as its lower layer.
+        self.rootfs_templates = (
+            layout == "fuse-overlay" if rootfs_templates is None else rootfs_templates
+        )
 
     def _scratch_directories(self) -> list[Path]:
         assert self.runtime.tmp_dir is not None and self.runtime.cache_dir is not None
         return [*super()._scratch_directories(), self.runtime.tmp_dir, self.runtime.cache_dir]
 
     async def _extract(self, image: ResolvedImage, session: Session) -> None:
+        if not self.rootfs_templates:
+            await self._extract_into(image, session.rootfs)
+            return
+        template = await self._rootfs_template(image)
+        if self.rootfs_layout == "fuse-overlay":
+            await mount_overlay(template, session, timeout_s=self.start_timeout_s)
+            return
+        await self.copy_tree(template, session.rootfs)
+
+    async def restore(self, snapshot: SandboxSnapshot, spec: Any) -> SingularitySandbox:
+        """Start a sandbox for ``spec`` whose files come from ``snapshot``; a fuse-overlay sandbox's snapshot
+        (its upper layer) is mounted over the template it was taken over, with a copy of that upper layer."""
+        if snapshot.metadata.get("format") != OVERLAY_SNAPSHOT_FORMAT:
+            return await super().restore(snapshot, spec)
+        self._check(spec)
+        source = self._snapshot_dir(snapshot)
+        if snapshot.image != spec.image:
+            raise ValueError(f"snapshot {snapshot.id} is of {snapshot.image!r}, not {spec.image!r}")
+        if self.rootfs_layout != "fuse-overlay":
+            raise ValueError(
+                f"snapshot {snapshot.id} is of a fuse-overlay sandbox; restore it with rootfs_layout='fuse-overlay'"
+            )
+        lower = self._snapshot_lower(snapshot)
+        await self._prepare()
+        return await self._launch(
+            spec, partial(self._restore_overlay, source, lower), restored=True
+        )
+
+    def _snapshot_lower(self, snapshot: SandboxSnapshot) -> Path:
+        """The template a fuse-overlay snapshot lies over: one of this node's complete templates, or ValueError."""
+        lower = Path(str(snapshot.metadata.get("lower", "")))
+        templates = self.scratch_root / TEMPLATE_DIR
+        if (
+            lower.name != "rootfs"
+            or lower.parent.parent != templates
+            or not _template_ready(lower.parent)
+        ):
+            raise ValueError(
+                f"snapshot {snapshot.id} lies over {str(lower)!r}, which is not a template of this node "
+                f"(in {templates})"
+            )
+        return lower
+
+    async def _restore_overlay(self, source: Path, lower: Path, session: Session) -> None:
+        (session.path / OVERLAY_DIR).mkdir(mode=0o700)
+        await self.copy_tree(source / "upper", session.path / OVERLAY_DIR / "upper")
+        await mount_overlay(lower, session, timeout_s=self.start_timeout_s, upper_exists=True)
+        for name, target in (("tmp", session.tmp), ("var-tmp", session.var_tmp)):
+            await self.copy_tree(source / name, target)
+
+    async def _extract_into(self, image: ResolvedImage, rootfs: Path) -> None:
         result = await self.runtime.run(
             "build",
             "--sandbox",
             "--fix-perms",
-            str(session.rootfs),
+            str(rootfs),
             str(image.path),
             timeout_s=self.start_timeout_s,
         )
         if result.returncode != 0 or result.timed_out:
             raise SandboxStartError(f"could not extract {image.path}: {result.detail()}")
-        await asyncio.to_thread(make_owner_writable, session.rootfs)
+        await asyncio.to_thread(make_owner_writable, rootfs)
+
+    async def _rootfs_template(self, image: ResolvedImage) -> Path:
+        """This node's extracted root filesystem of ``image``, which every sandbox of it copies.
+
+        Extracted once per image file, under a lock per image, and published by
+        a rename once complete. Like a staged image, a template is trusted later
+        when it is a private directory of this uid holding its marker. No
+        sandbox ever runs on it or mounts it: each gets a copy (reflinked where
+        the filesystem can), so nothing a sandbox writes reaches the template.
+        """
+        key = f"sha256-{image.sha256}" if image.sha256 else _stat_name(image.path)
+        root = self.scratch_root / TEMPLATE_DIR
+        final = root / key
+        if _template_ready(final):
+            return final / "rootfs"
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        async with locked(root / f"{key}.lock"):
+            if _template_ready(final):
+                return final / "rootfs"
+            work = root / f".{key}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+            work.mkdir(mode=0o700)
+            try:
+                await self._extract_into(image, work / "rootfs")
+                marker = {
+                    "image": str(image.path),
+                    "reference": image.reference,
+                    "sha256": image.sha256,
+                }
+                (work / TEMPLATE_MARKER).write_text(json.dumps(marker, sort_keys=True) + "\n")
+                os.rename(work, final)
+            except BaseException:
+                await asyncio.shield(asyncio.to_thread(remove_tree, work))
+                raise
+        return final / "rootfs"
 
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
         if record is not None and record.get("instance_pid_file") != str(path / PID_FILE):
             record = None
-        async with locked(path.parent / CONTROL_LOCK):
+        async with locked(path / CONTROL_LOCK):
             if record is None and await self.runtime.instance_record(path.name) is not None:
                 raise SandboxError("instance is running but its owner record is not bound to it")
             expected_pid = record.get("instance_pid") if record else None
@@ -171,7 +315,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
                 expected_start_time=str(expected_start) if expected_start else None,
                 grace_s=self.stop_grace_s,
                 timeout_s=self.stop_timeout_s,
-            )
+            ) | await unmount_overlay(path)
 
 
 class SingularitySandbox(SessionSandbox):
@@ -205,6 +349,17 @@ class SingularitySandbox(SessionSandbox):
 
     def _watch_root(self) -> int | None:
         return self._instance_pid
+
+    async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
+        """A fuse-overlay sandbox's snapshot is its upper layer, what it wrote over the node's template (which
+        never changes); a copy-layout sandbox's is its whole rootfs."""
+        assert self._session is not None
+        record_path = self._session.path / OVERLAY_RECORD
+        if not record_path.exists():
+            return await super()._snapshot_rootfs(target)
+        record = json.loads(record_path.read_text())
+        await self._provider.copy_tree(Path(record["upper"]), target / "upper")
+        return OVERLAY_SNAPSHOT_FORMAT, {"lower": record["lower"]}
 
     def _prepare_rootfs(self) -> None:
         """Install the keep-alive startscript, mount points and private tmp dirs."""
@@ -250,6 +405,7 @@ class SingularitySandbox(SessionSandbox):
             "--no-eval",
             "--no-mount",
             "home,cwd,bind-paths",
+            *(["--userns"] if (session.path / OVERLAY_RECORD).exists() else []),
             "--writable",
             "--pid-file",
             str(session.path / PID_FILE),
@@ -290,7 +446,7 @@ class SingularitySandbox(SessionSandbox):
         assert self._session is not None
         session, provider = self._session, self._provider
         pid_file = session.path / PID_FILE
-        async with locked(provider.session_root / CONTROL_LOCK):
+        async with locked(session.path / CONTROL_LOCK):
             # Cancellation can arrive after the runtime created the instance but
             # before its result reaches us, so cleanup must assume it exists.
             self._instance_may_exist = True
@@ -349,19 +505,102 @@ class SingularitySandbox(SessionSandbox):
         )
 
     async def _stop_container(self, session: Session) -> None:
-        if not self._instance_may_exist:
-            return
-        async with locked(self._provider.session_root / CONTROL_LOCK):
-            await stop_instance(
-                self._runtime,
-                self.id,
-                pid_file=session.path / PID_FILE,
-                expected_pid=self._instance_pid,
-                expected_start_time=self._instance_start_time,
-                grace_s=self._provider.stop_grace_s,
-                timeout_s=self._provider.stop_timeout_s,
-            )
-        self._instance_may_exist = False
+        if self._instance_may_exist:
+            async with locked(session.path / CONTROL_LOCK):
+                await stop_instance(
+                    self._runtime,
+                    self.id,
+                    pid_file=session.path / PID_FILE,
+                    expected_pid=self._instance_pid,
+                    expected_start_time=self._instance_start_time,
+                    grace_s=self._provider.stop_grace_s,
+                    timeout_s=self._provider.stop_timeout_s,
+                )
+            self._instance_may_exist = False
+        # Only once nothing runs on it: a session whose instance could not be stopped stays mounted.
+        await unmount_overlay(session.path)
+
+
+def _fuse_tools() -> tuple[str, str]:
+    mount = shutil.which("fuse-overlayfs")
+    unmount = shutil.which("fusermount3") or shutil.which("fusermount")
+    if mount is None or unmount is None:
+        raise SandboxStartError(
+            "the fuse-overlay layout needs fuse-overlayfs and fusermount3 (or fusermount) on PATH"
+        )
+    return mount, unmount
+
+
+async def mount_overlay(
+    template: Path, session: Session, *, timeout_s: float, upper_exists: bool = False
+) -> None:
+    """Mount ``session.rootfs`` as a fuse-overlayfs of ``template`` (read-only lower layer) and the session's own
+    ``overlay/upper``, new or (``upper_exists``, a restore) already filled.  The record is written first, so a
+    teardown or a janitor unmounts whatever may be mounted."""
+    mount, _ = _fuse_tools()
+    overlay = session.path / OVERLAY_DIR
+    upper, work = overlay / "upper", overlay / "work"
+    for directory in (work, session.rootfs) if upper_exists else (upper, work, session.rootfs):
+        directory.mkdir(mode=0o700, parents=True)
+    for path in (template, upper, work):
+        if any(c in str(path) for c in ",:"):
+            raise SandboxStartError(f"fuse-overlayfs cannot take a path with ',' or ':': {path}")
+    record = {"mountpoint": str(session.rootfs), "lower": str(template), "upper": str(upper)}
+    (session.path / OVERLAY_RECORD).write_text(json.dumps(record, sort_keys=True) + "\n")
+    result = await run_process(
+        [mount, "-o", f"lowerdir={template},upperdir={upper},workdir={work}", str(session.rootfs)],
+        timeout_s=timeout_s,
+    )
+    if result.returncode != 0 or result.timed_out:
+        raise SandboxStartError(f"could not mount the overlay of {template}: {result.detail()}")
+
+
+def _mounted(path: Path) -> bool:
+    target = str(path).replace(" ", "\\040")
+    try:
+        with open("/proc/self/mountinfo") as stream:
+            return any(line.split(" ", 5)[4] == target for line in stream)
+    except OSError:
+        return False
+
+
+async def unmount_overlay(session_path: Path) -> bool:
+    """Unmount a session's fuse-overlay rootfs, if it has one that is mounted; whether one was.
+
+    Raises :class:`SandboxError` if it stays mounted, so the session is kept rather than deleted through it."""
+    record_path = session_path / OVERLAY_RECORD
+    if not record_path.exists():
+        return False
+    mountpoint = Path(json.loads(record_path.read_text())["mountpoint"])
+    if mountpoint.parent != session_path or not _mounted(mountpoint):
+        return False
+    _, unmount = _fuse_tools()
+    for args in (["-u"], ["-u", "-z"]):
+        result = await run_process([unmount, *args, str(mountpoint)], timeout_s=_UNMOUNT_TIMEOUT_S)
+        if not _mounted(mountpoint):
+            return True
+    raise SandboxError(f"could not unmount the overlay at {mountpoint}: {result.detail()}")
+
+
+def _template_ready(path: Path) -> bool:
+    """Whether ``path`` is a complete template: a private directory of this uid with its marker."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and not stat.S_IMODE(info.st_mode) & 0o077
+        and (path / TEMPLATE_MARKER).is_file()
+        and (path / "rootfs").is_dir()
+    )
+
+
+def _stat_name(path: Path) -> str:
+    """A template name for an image file whose digest is unknown: its stat identity."""
+    info = path.stat()
+    return f"stat-{info.st_dev}-{info.st_ino}-{info.st_size}-{info.st_mtime_ns}"
 
 
 def make_mount_point(rootfs: Path, target: str, *, directory: bool) -> None:

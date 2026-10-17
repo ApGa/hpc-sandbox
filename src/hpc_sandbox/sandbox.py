@@ -19,7 +19,9 @@ import os
 import posixpath
 import re
 import shlex
+import signal
 import stat
+import subprocess
 import threading
 import time
 import uuid
@@ -35,14 +37,15 @@ from .images import ImageStore, ResolvedImage
 from .paths import default_scratch_root
 from .process import TIMEOUT_EXIT_CODE, ProcessResult, kill_tree, run_process
 from .sessions import (
+    DELETE_SCRIPT,
     JanitorReport,
     Session,
     labels_match,
     new_instance_name,
     open_session,
-    remove_session,
     remove_tree,
     sweep,
+    trash_session,
 )
 from .types import (
     CWD_ERROR_EXIT_CODE,
@@ -78,6 +81,18 @@ TRANSFER_DIR = ".hpc-sandbox-transfer"
 # How long removing a transfer's files may take: code in the sandbox can keep
 # refilling them, and the session's removal takes care of what is left.
 _TRANSFER_CLEANUP_S = 60.0
+# sh -c _DETACH DELETE_SCRIPT TREE LOG LOCK: start the deletion in the background and return at once; the deletion is
+# reparented to init, and its errors go to LOG, which it removes when it succeeds. Deletions of one session root run
+# one at a time (LOCK) and at the lowest CPU priority: in parallel they slowed starts, whose extractions or copies
+# create the same kind of metadata the deletions remove. Each path stays one argument, whatever characters it holds.
+_DETACH = (
+    "log=$2; "
+    'if command -v flock >/dev/null 2>&1; then set -- flock "$3" /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; '
+    'else set -- /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; fi; '
+    'nice -n 19 "$@" </dev/null >/dev/null 2>"$log" &'
+)
+# Trash entries this process started deleting (wait_for_deletions).
+_DELETIONS: set[Path] = set()
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROBE_SCRIPT = """\
 set -e
@@ -148,6 +163,7 @@ class SessionProvider(Generic[S]):
         self.memory_poll_s = memory_poll_s
         self._sandboxes: set[S] = set()
         self._initial_sweep: asyncio.Future[None] | None = None
+        self._swept = False
 
     @property
     def session_root(self) -> Path:
@@ -210,6 +226,7 @@ class SessionProvider(Generic[S]):
                 provider=self.name,
                 claim_unknown=claim_unknown,
             )
+            assert swept is not None  # it waits for the janitor lock
             report.stopped += swept.stopped
             report.removed += swept.removed
             report.live += swept.live
@@ -219,6 +236,50 @@ class SessionProvider(Generic[S]):
     def _session_roots(self) -> list[tuple[Path, bool]]:
         """Directories janitors sweep, and whether they claim sessions of no known provider."""
         return [(self.session_root, True)]
+
+    async def wait_for_deletions(self, timeout_s: float = 300.0) -> bool:
+        """Wait until the session files of the sandboxes this process stopped are deleted; False on timeout."""
+        deadline = time.monotonic() + timeout_s
+        while _DELETIONS:
+            _DELETIONS.difference_update(
+                [path for path in list(_DELETIONS) if not os.path.lexists(path)]
+            )
+            if not _DELETIONS:
+                break
+            if time.monotonic() > deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
+    def _delete_in_background(self, path: Path) -> None:
+        """Delete a trash entry with ``rm`` in a detached process, so that a stop returns once its session left the
+        session root, and the deletion holds no lock, worker thread or GIL here. The process outlives this one if
+        need be; if it is killed, a janitor finishes the deletion."""
+        stderr_path = path.parent / f".{path.name}.log"
+        # The lock sits next to the janitor lock, in the session root.
+        lock_path = path.parent.parent / ".deletions.lock"
+        try:
+            subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    _DETACH,
+                    DELETE_SCRIPT,
+                    str(path),
+                    str(stderr_path),
+                    str(lock_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            log.warning("hpc-sandbox: could not start deleting %s: %s", path, error)
+            return
+        _DELETIONS.add(path)
 
     async def copy_tree(self, source: Path, target: Path) -> None:
         """``cp -a --reflink=auto``: near-free on reflink filesystems, a full copy otherwise."""
@@ -245,6 +306,9 @@ class SessionProvider(Generic[S]):
     def _scratch_directories(self) -> list[Path]:
         """Private directories created below the scratch root before the first start."""
         return [self.scratch_root, self.session_root, self.snapshot_root]
+
+    #: The snapshot formats this provider restores (``metadata["format"]``).
+    snapshot_formats: tuple[str, ...] = (SNAPSHOT_FORMAT,)
 
     async def _launch(
         self,
@@ -294,18 +358,35 @@ class SessionProvider(Generic[S]):
 
     async def _prepare(self) -> None:
         self._make_scratch_directories()
-        if self._initial_sweep is None:
-            self._initial_sweep = asyncio.ensure_future(self._sweep_abandoned())
-        await asyncio.shield(self._initial_sweep)
+        if not self._swept:
+            if self._initial_sweep is None or self._initial_sweep.done():
+                self._initial_sweep = asyncio.ensure_future(self._sweep_abandoned())
+            await asyncio.shield(self._initial_sweep)
 
     async def _sweep_abandoned(self) -> None:
-        """Recover sessions left by crashed processes, once per provider."""
+        """Recover sessions left by crashed processes, once per provider.
+
+        It sweeps at the provider's first start that finds no other process
+        holding the janitor lock of its session roots: a start never waits for
+        that lock. With a provider per rollout and hundreds of rollouts starting
+        on one node, each start's sweep queued behind the other sweeps and
+        behind every session opened and stopped meanwhile.
+        """
+        swept = True
         for root, claim_unknown in self._session_roots():
             report = await sweep(
-                root, self._stop_abandoned, provider=self.name, claim_unknown=claim_unknown
+                root,
+                self._stop_abandoned,
+                provider=self.name,
+                claim_unknown=claim_unknown,
+                wait=False,
             )
+            if report is None:  # another process holds the janitor lock: sweep at a later start
+                swept = False
+                continue
             for error in report.errors:
                 log.warning("hpc-sandbox janitor: %s", error)
+        self._swept = swept
 
     async def _copy_snapshot(self, source: Path, session: Session) -> None:
         for name, target in (
@@ -317,7 +398,10 @@ class SessionProvider(Generic[S]):
 
     def _snapshot_dir(self, snapshot: SandboxSnapshot) -> Path:
         path = Path(snapshot.path)
-        if snapshot.provider != self.name or snapshot.metadata.get("format") != SNAPSHOT_FORMAT:
+        if (
+            snapshot.provider != self.name
+            or snapshot.metadata.get("format") not in self.snapshot_formats
+        ):
             raise ValueError(f"snapshot {snapshot.id} was not taken by this provider")
         if path.parent != self.snapshot_root or path.name != snapshot.id or not path.is_dir():
             raise ValueError(f"snapshot {snapshot.id} is not in {self.snapshot_root}")
@@ -475,11 +559,8 @@ class SessionSandbox:
         target = self._provider.snapshot_root / snapshot_id
         target.mkdir(mode=0o700)
         try:
-            for source, name in (
-                (session.rootfs, "rootfs"),
-                (session.tmp, "tmp"),
-                (session.var_tmp, "var-tmp"),
-            ):
+            snapshot_format, rootfs_metadata = await self._snapshot_rootfs(target)
+            for source, name in ((session.tmp, "tmp"), (session.var_tmp, "var-tmp")):
                 await self._provider.copy_tree(source, target / name)
             await asyncio.to_thread(remove_tree, target / "tmp" / TRANSFER_DIR)
             await asyncio.to_thread(self._snapshot_files, target)
@@ -489,12 +570,13 @@ class SessionSandbox:
                 path=str(target),
                 image=self.spec.image,
                 metadata={
-                    "format": SNAPSHOT_FORMAT,
+                    "format": snapshot_format,
                     "created_at": time.time(),
                     "source_sandbox": self.id,
                     "workdir": self.spec.workdir,
                     "labels": dict(self.spec.labels),
                     **self._user(),
+                    **rootfs_metadata,
                 },
             )
             (target / "snapshot.json").write_text(json.dumps(asdict(snapshot), indent=2) + "\n")
@@ -563,6 +645,13 @@ class SessionSandbox:
 
     def _prepare_snapshot(self) -> None:
         """Make the rootfs copyable before a snapshot; runs in a worker thread."""
+
+    async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
+        """Copy the root filesystem into the snapshot directory ``target``; returns the snapshot's format and the
+        metadata a restore needs.  The whole rootfs, by default."""
+        assert self._session is not None
+        await self._provider.copy_tree(self._session.rootfs, target / "rootfs")
+        return SNAPSHOT_FORMAT, {}
 
     def _snapshot_files(self, target: Path) -> None:
         """Add provider files to the snapshot directory ``target``; runs in a worker thread."""
@@ -674,7 +763,12 @@ class SessionSandbox:
             note = f"hpc-sandbox: command timed out after {timeout_s:g} s"
             return ExecResult(TIMEOUT_EXIT_CODE, stdout, _append(stderr, note), timed_out=True)
         if kills:
-            return ExecResult(137, stdout, _append(stderr, kills[-1].message()))
+            # The watchdog killed something in this command's tree. When that ended the command itself, it exits
+            # 137; when it ended only processes the command started (a harness's runaway tool), the command's
+            # own exit stands. Either way the kill is noted.
+            killed_itself = result.returncode in (137, -signal.SIGKILL)
+            code = 137 if killed_itself else result.returncode
+            return ExecResult(code, stdout, _append(stderr, kills[-1].message()))
         if result.returncode != 0 and not self._container_alive():
             self._mark_lost(stderr)
         return ExecResult(result.returncode, stdout, stderr)
@@ -760,8 +854,10 @@ class SessionSandbox:
         if session is None:
             return
         await self._stop_container(session)
-        await asyncio.to_thread(remove_session, session)
+        doomed = await asyncio.to_thread(trash_session, session)
         self._session = None
+        if doomed is not None:
+            self._provider._delete_in_background(doomed)
 
 
 async def _in_thread(

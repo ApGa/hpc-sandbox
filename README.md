@@ -164,10 +164,19 @@ What both providers share:
    file replaces an existing file.
 5. **Memory.** With `memory_mb`, a watchdog samples the proportional set size
    of the container's processes and of every running command once a second.
-   On a breach it kills the largest process, like the kernel OOM killer, and
-   the command that owned it returns 137 with an explanation in stderr; a
-   harness running in the same sandbox survives a runaway tool call. This is
-   a sampled guard, not a cgroup: usage can overshoot between samples.
+   On a breach it follows the memory down from the largest process subtree (a
+   process and all its descendants), into the child subtree that holds the
+   most as long as that child alone holds the excess, and kills the subtree
+   where it stops: the command that ran away, whether one process grew or a
+   pool of workers did (`make -j`, `pytest -n`, joblib's `n_jobs=-1`), each
+   smaller than the process that started it. A small process beside the
+   memory is never taken for it because a small excess would fit in it. When
+   no single subtree holds the excess, it kills the largest one and samples
+   again. A harness running in the same sandbox survives a runaway tool call
+   unless it holds the excess itself. The command whose tree held the victim
+   gets the explanation in stderr, and returns 137 if the kill ended it, else
+   its own exit code. This is a sampled guard, not a cgroup: usage can
+   overshoot between samples.
 6. **Snapshots** copy the rootfs and the private tmp directories with
    `cp -a --reflink=auto` (near free on reflink filesystems), after a `sync`.
    Processes and memory are not captured; take snapshots while the sandbox is
@@ -180,7 +189,8 @@ What both providers share:
    and whose owner process is dead, optionally filtered by labels, and leaves
    sessions that belong to another provider; it fails closed (reports and
    leaves the session) whenever identities disagree. Each provider sweeps
-   abandoned sessions before its first start.
+   abandoned sessions before its first start that finds the janitor lock free
+   (a start never waits for it; janitors and `reap()` do).
 
 ### Singularity CE / Apptainer
 
@@ -333,9 +343,11 @@ Options both providers take:
 options works for both runtimes: `gpu="nv"` means `gpus="all"`;
 `allow_network_none=False` refuses `network="none"`, which is otherwise
 always available because every enroot sandbox has its own network namespace;
-`stop_grace_s` is ignored because enroot sandboxes are stopped with SIGKILL.
-`gpu="rocm"`, `cgroup_limits=True` and a setting given under both names raise
-`ValueError`.
+`stop_grace_s` is ignored because enroot sandboxes are stopped with SIGKILL,
+and `rootfs_templates` because `enroot create` extracts each sandbox's root
+filesystem from its image, which is the copy layout (`rootfs_layout="copy"`).
+`gpu="rocm"`, `cgroup_limits=True`, `rootfs_layout="fuse-overlay"` and a
+setting given under both names raise `ValueError`.
 
 Default scratch root: `$HPC_SANDBOX_SCRATCH`, else `$PBS_LOCALDIR/hpc-sandbox`,
 else `/local/$PBS_JOBID/hpc-sandbox` when it exists, else

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 import os
 import sys
@@ -8,8 +10,10 @@ from pathlib import Path
 from conftest import FakeRuntime, make_provider
 
 from hpc_sandbox import SandboxSpec
+from hpc_sandbox.locks import open_lock_file
 from hpc_sandbox.process import run_process
 from hpc_sandbox.procfs import owned_live_start_time
+from hpc_sandbox.sessions import JANITOR_LOCK
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 CRASH = """\
@@ -79,6 +83,26 @@ async def test_janitor_filters_by_labels(tmp_path, sif, fake_runtime):
 async def test_a_new_provider_sweeps_abandoned_sessions_on_first_start(tmp_path, sif, fake_runtime):
     (name,) = await crashed_sandboxes(tmp_path, sif, "a")
     provider = make_provider(tmp_path)
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    try:
+        assert not (provider.session_root / name).exists()
+    finally:
+        await sandbox.stop()
+
+
+async def test_a_start_never_waits_for_the_janitor_lock_to_sweep(tmp_path, sif, fake_runtime):
+    """While another process holds the janitor lock, a first start neither sweeps nor waits; a later
+    start of the same provider sweeps."""
+    (name,) = await crashed_sandboxes(tmp_path, sif, "a")
+    provider = make_provider(tmp_path)
+    held = open_lock_file(provider.session_root / JANITOR_LOCK)  # its own open file: another holder
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        # What start() does before anything else.
+        await asyncio.wait_for(provider._prepare(), timeout=10)
+        assert (provider.session_root / name).is_dir()
+    finally:
+        os.close(held)
     sandbox = await provider.start(SandboxSpec(image=str(sif)))
     try:
         assert not (provider.session_root / name).exists()

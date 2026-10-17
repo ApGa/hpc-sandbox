@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import suppress
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 
 from hpc_sandbox import EnrootProvider, SingularityProvider
 from hpc_sandbox.enroot import ANCHOR_SCRIPT
+from hpc_sandbox.sandbox import _DELETIONS
 
 FAKE = Path(__file__).with_name("fake_singularity.py")
 FAKE_ENROOT = Path(__file__).with_name("fake_enroot.py")
@@ -33,6 +35,9 @@ _ISOLATED_ENV = (
     "FAKE_SINGULARITY_PULL_FAILURES",
     "FAKE_SINGULARITY_PULL_DELAY",
     "FAKE_SINGULARITY_INSTANCE_EXITS",
+    "FAKE_SINGULARITY_START_DELAY",
+    "FAKE_FUSE_MOUNT_FAILS",
+    "HPC_SANDBOX_ROOTFS_LAYOUT",
     "ENROOT_CACHE_PATH",
     "ENROOT_TEMP_PATH",
     "ENROOT_DATA_PATH",
@@ -119,6 +124,18 @@ async def provider(tmp_path: Path, fake_runtime: FakeRuntime) -> AsyncIterator[S
     yield provider
     for sandbox in provider.sandboxes:
         await sandbox.stop()
+
+
+@pytest.fixture(autouse=True)
+def _background_deletions_finish() -> Iterator[None]:
+    """Stopped sandboxes are deleted in the background: let those deletions end within their test."""
+    yield
+    deadline = time.monotonic() + 60
+    while _DELETIONS and time.monotonic() < deadline:
+        _DELETIONS.difference_update(
+            [path for path in list(_DELETIONS) if not os.path.lexists(path)]
+        )
+        time.sleep(0.05)
 
 
 @functools.cache
