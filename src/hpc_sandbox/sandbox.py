@@ -358,7 +358,7 @@ class SessionProvider(Generic[S]):
             report.removed += swept.removed
             report.live += swept.live
             report.errors += swept.errors
-        report.errors += await self._sweep_node()
+        report.errors += await self._node_errors()
         return report
 
     def _swept_roots(self) -> list[tuple[Path, bool, Stopper]]:
@@ -405,6 +405,12 @@ class SessionProvider(Generic[S]):
     async def _sweep_node(self) -> list[str]:
         """Recover what abandoned sessions left outside any session root; returns errors."""
         return []
+
+    async def _node_errors(self) -> list[str]:
+        try:
+            return await self._sweep_node()
+        except Exception as error:  # noqa: BLE001 - never fatal to a start or a reap
+            return [f"could not sweep the node: {error!r}"]
 
     async def wait_for_deletions(self, timeout_s: float = 300.0) -> bool:
         """Wait until the session files of the sandboxes this process stopped are deleted; False on timeout."""
@@ -539,7 +545,7 @@ class SessionProvider(Generic[S]):
                 continue
             for error in report.errors:
                 log.warning("hpc-sandbox janitor: %s", error)
-        for error in await self._sweep_node():
+        for error in await self._node_errors():
             log.warning("hpc-sandbox janitor: %s", error)
         self._swept = swept
 

@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import errno
 import json
 import logging
 import os
@@ -54,6 +53,7 @@ import re
 import shutil
 import signal
 import stat
+import sys
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -110,9 +110,12 @@ OVERLAY_FSTYPE = "fuse.fuse-overlayfs"
 OVERLAY_DAEMON = "fuse-overlayfs"
 _SESSION_ROOTFS = re.compile(r".*/hpcsb-[0-9a-f]{32}(\.[0-9]+-[0-9]+\.[0-9a-f]{8})?/rootfs")
 # An extraction of a template, or a damaged template moved aside, by process PID started at START.
-_EXTRACTION = re.compile(r"\.(?P<key>.+)\.(?P<pid>[0-9]+)-(?P<start>[0-9]+)\.[0-9a-f]{8}")
+_EXTRACTION = re.compile(
+    r"\.(?P<key>.+)\.(?P<pid>[0-9]+)-(?P<start>[0-9]+)\.[0-9a-f]{8}(?P<damaged>\.damaged)?"
+)
 _PID_WAIT_S = 5.0
 _UNMOUNT_TIMEOUT_S = 30.0
+_PROBE_TIMEOUT_S = 5.0  # a live daemon answers statfs at once; a stopped one never does
 
 
 class SingularityProvider(SessionProvider["SingularitySandbox"]):
@@ -319,7 +322,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             if _template_ready(final):
                 return final / "rootfs"
             if os.path.lexists(final):
-                damaged = root / _extraction_name(key)
+                damaged = root / f"{_extraction_name(key)}.damaged"
                 os.rename(final, damaged)
             work = root / _extraction_name(key)
             work.mkdir(mode=0o700)
@@ -569,12 +572,19 @@ class SingularitySandbox(SessionSandbox):
 
 def _fuse_tools() -> tuple[str, str]:
     mount = shutil.which("fuse-overlayfs")
-    unmount = shutil.which("fusermount3") or shutil.which("fusermount")
-    if mount is None or unmount is None:
+    if mount is None:
         raise SandboxStartError(
             "the fuse-overlay layout needs fuse-overlayfs and fusermount3 (or fusermount) on PATH"
         )
-    return mount, unmount
+    return mount, _fusermount()
+
+
+def _fusermount() -> str:
+    """What unmounts an overlay: a janitor needs only this, not fuse-overlayfs."""
+    unmount = shutil.which("fusermount3") or shutil.which("fusermount")
+    if unmount is None:
+        raise SandboxError("unmounting a fuse-overlay needs fusermount3 (or fusermount) on PATH")
+    return unmount
 
 
 async def mount_overlay(
@@ -610,8 +620,22 @@ def _mounted(path: Path) -> bool:
     looked up, since a mount whose daemon died answers nothing.
     """
     target = os.path.join(os.path.realpath(path.parent), path.name)
-    with open("/proc/self/mountinfo") as stream:
-        return any(_unescape(line.split(" ", 5)[4]) == target for line in stream)
+    return any(mountpoint == target for mountpoint, _, _ in _mounts(_mountinfo()))
+
+
+def _mountinfo() -> str:
+    """This mount namespace's mount table, whatever bytes its paths hold."""
+    return os.fsdecode(Path("/proc/self/mountinfo").read_bytes())
+
+
+def _mounts(mountinfo: str) -> list[tuple[str, str, list[str]]]:
+    """Each mount's point (unescaped), device (major:minor) and type, source and options."""
+    mounts = []
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) > 4 and "-" in fields:
+            mounts.append((_unescape(fields[4]), fields[2], fields[fields.index("-") + 1 :]))
+    return mounts
 
 
 def _unescape(field: str) -> str:
@@ -627,7 +651,7 @@ async def unmount_overlay(session_path: Path) -> bool:
     mountpoint = session_path / "rootfs"  # where mount_overlay mounts, whatever the record says
     if not _mounted(mountpoint):
         return False
-    _, unmount = _fuse_tools()
+    unmount = _fusermount()
     for args in (["-u"], ["-u", "-z"]):
         result = await run_process([unmount, *args, str(mountpoint)], timeout_s=_UNMOUNT_TIMEOUT_S)
         if not _mounted(mountpoint):
@@ -638,57 +662,62 @@ async def unmount_overlay(session_path: Path) -> bool:
 async def unmount_dead_overlays() -> list[str]:
     """Unmount this user's session overlays whose fuse-overlayfs died, wherever they lie; returns errors.
 
-    A killed job takes its fuse-overlayfs processes with it but leaves their
-    mounts in the node's mount table, where they count towards fusermount's
-    ``mount_max`` (FUSE mounts of every user on the node), and its scratch
-    root is often per job, so no janitor sweeps its sessions again. An overlay
-    is dead when nobody holds its session's lease, no fuse-overlayfs of this
-    user serves it and it answers ``ENOTCONN``.
+    A fuse-overlayfs killed with SIGKILL (a job or step whose processes Slurm
+    kills, a crash) leaves its mount in the node's mount table, where it
+    counts towards fusermount's ``mount_max`` (FUSE mounts of every user on the
+    node); with a per-job scratch root, no janitor sweeps its session again.
+    An overlay is dead when nobody holds its session's lease, no fuse-overlayfs
+    of this user serves its device, and ``statfs`` of it fails with
+    ``ENOTCONN``: never ``stat``, which the kernel answers from fuse-overlayfs's
+    attribute cache, valid for decades. Probes run in a child process with a
+    time limit, since one of a stopped daemon's mount would wait for it.
     """
-    dead = await asyncio.to_thread(lambda: _dead_overlays(Path("/proc/self/mountinfo").read_text()))
+    mountinfo = await asyncio.to_thread(_mountinfo)
+    candidates = await asyncio.to_thread(_unserved_overlays, mountinfo)
+    dead = [mountpoint for mountpoint in candidates if await _disconnected(mountpoint)]
     if not dead:
         return []
-    unmount = shutil.which("fusermount3") or shutil.which("fusermount")
-    if unmount is None:
-        return [f"cannot unmount {len(dead)} dead overlays: fusermount3 is not on PATH"]
+    try:
+        unmount = _fusermount()
+    except SandboxError as error:
+        return [f"cannot unmount {len(dead)} dead overlays: {error}"]
     errors = []
     for mountpoint in dead:
         result = await run_process([unmount, "-u", "-z", mountpoint], timeout_s=_UNMOUNT_TIMEOUT_S)
-        if result.returncode != 0 or result.timed_out:
+        if (result.returncode != 0 or result.timed_out) and _mounted(Path(mountpoint)):
             errors.append(f"could not unmount the dead overlay at {mountpoint}: {result.detail()}")
     return errors
 
 
-def _dead_overlays(mountinfo: str) -> list[str]:
+def _unserved_overlays(mountinfo: str) -> list[str]:
+    """This user's session overlays that nobody's lease holds and no fuse-overlayfs of this user serves."""
+    mounts = _mounts(mountinfo)
     owner = f"user_id={os.getuid()}"
-    candidates = []
-    for line in mountinfo.splitlines():
-        fields = line.split()
-        if "-" not in fields:
-            continue
-        kind = fields[fields.index("-") + 1 :]
-        mountpoint = _unescape(fields[4])
-        if (
-            len(kind) == 3
-            and kind[0] == OVERLAY_FSTYPE
-            and owner in kind[2].split(",")
-            and _SESSION_ROOTFS.fullmatch(mountpoint)
-            and not leased(Path(mountpoint).parent)
-        ):
-            candidates.append(mountpoint)
-    if not candidates:
-        return []
-    served = _served_overlays()
-    dead = []
-    for mountpoint in candidates:
-        if mountpoint in served:
-            continue
-        try:
-            os.stat(mountpoint)  # a live daemon answers; a dead one's mount cannot
-        except OSError as error:
-            if error.errno == errno.ENOTCONN:
-                dead.append(mountpoint)
-    return dead
+    served_paths = _served_overlays()
+    served = {device for mountpoint, device, _ in mounts if mountpoint in served_paths}
+    return [
+        mountpoint
+        for mountpoint, device, kind in mounts
+        if len(kind) == 3
+        and kind[0] == OVERLAY_FSTYPE
+        and owner in kind[2].split(",")
+        and _SESSION_ROOTFS.fullmatch(mountpoint)
+        and device not in served  # a mount shows up at every place it propagated to
+        and not leased(Path(mountpoint).parent)
+    ]
+
+
+async def _disconnected(mountpoint: str) -> bool:
+    """Whether ``mountpoint``'s FUSE daemon is gone: its ``statfs`` fails with ``ENOTCONN``."""
+    probe = (
+        "import errno, os, sys\n"
+        "try:\n    os.statvfs(sys.argv[1])\n"
+        "except OSError as error:\n    sys.exit(3 if error.errno == errno.ENOTCONN else 1)"
+    )
+    result = await run_process(
+        [sys.executable, "-I", "-S", "-c", probe, mountpoint], timeout_s=_PROBE_TIMEOUT_S
+    )
+    return result.returncode == 3 and not result.timed_out
 
 
 def _served_overlays() -> set[str]:
@@ -739,15 +768,17 @@ def _extraction_name(key: str) -> str:
 
 
 def _remove_abandoned_extractions(root: Path) -> list[str]:
-    """Delete the extractions and damaged templates in ``root`` whose process died; returns errors."""
+    """Delete the extractions in ``root`` whose process died, and the damaged templates; returns errors."""
     try:
         names = [entry.name for entry in os.scandir(root)]
     except OSError:
         return []
     abandoned = []
-    for name in names:
+    for name in names:  # damaged templates once unused, whoever moved them aside
         match = _EXTRACTION.fullmatch(name)
-        if match and not procfs.identity_matches(int(match["pid"]), match["start"]):
+        if match and (
+            match["damaged"] or not procfs.identity_matches(int(match["pid"]), match["start"])
+        ):
             abandoned.append(root / name)
     return _remove_extractions(abandoned) if abandoned else []
 

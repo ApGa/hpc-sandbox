@@ -217,8 +217,8 @@ def tmpfs_bytes(pid: int) -> int | None:
     readable (a setuid runtime's own processes are not); None if none is.
     """
     for candidate in (pid, *descendants([pid])):
-        try:
-            mountinfo = Path(f"/proc/{candidate}/mountinfo").read_text()
+        try:  # whatever bytes its paths hold
+            mountinfo = os.fsdecode(Path(f"/proc/{candidate}/mountinfo").read_bytes())
         except OSError:
             continue
         used = 0

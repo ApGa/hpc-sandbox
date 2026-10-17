@@ -74,7 +74,9 @@ def sshfs(tmp_path: Path) -> Iterator[Callable[[Path], int]]:
         """Mount at ``mountpoint``; the PID of its daemon."""
         mountpoint.mkdir(parents=True)
         source = f"localhost:{served}"
-        command = [binary, "-o", f"ssh_command={wrapper}", source, str(mountpoint)]
+        # fuse-overlayfs's own attribute timeouts: stat answers from cache for decades.
+        timeouts = "attr_timeout=1000000000,entry_timeout=1000000000"
+        command = [binary, "-o", f"ssh_command={wrapper}", "-o", timeouts, source, str(mountpoint)]
         subprocess.run(command, check=True, timeout=30)
         mounted.append(mountpoint)
         (daemon,) = [
@@ -183,6 +185,8 @@ async def test_janitors_unmount_dead_overlays_wherever_they_lie(tmp_path, sshfs,
     leased = sessions / f"hpcsb-{'d' * 32}" / "rootfs"  # its owner unmounts it
     other = tmp_path / "not-a-session" / "rootfs"
     daemons = {path: sshfs(path) for path in (dead, trashed, live, leased, other)}
+    for path in daemons:
+        os.stat(path)  # as every sandbox's start does: the root's attributes are cached
     lease = os.open(leased.parent / ".lease", os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(lease, fcntl.LOCK_EX)
     try:
@@ -202,6 +206,48 @@ async def test_janitors_unmount_dead_overlays_wherever_they_lie(tmp_path, sshfs,
         }
     finally:
         os.close(lease)
+
+
+def test_a_served_overlay_is_live_wherever_it_shows_up(monkeypatch):
+    # A mount listed again where a bind of its parent propagated it.
+    served, other = (f"/scratch/sessions/hpcsb-{c * 32}/rootfs" for c in "ab")
+    kind = f"- fuse.fuse-overlayfs fuse-overlayfs rw,user_id={os.getuid()},group_id=0"
+    mountinfo = "\n".join(
+        [
+            f"100 50 0:77 / {served} rw {kind}",
+            f"101 60 0:77 / /bound{served} rw {kind}",
+            f"102 50 0:78 / {other} rw {kind}",
+        ]
+    )
+    monkeypatch.setattr(singularity_module, "_served_overlays", lambda: {served})
+    monkeypatch.setattr(singularity_module, "leased", lambda path: False)
+    assert singularity_module._unserved_overlays(mountinfo) == [other]
+
+
+def test_mount_points_that_are_not_utf_8_break_nothing(tmp_path):
+    script = """
+import asyncio, os, subprocess, sys
+from pathlib import Path
+from hpc_sandbox import procfs, singularity
+odd = os.path.join(os.fsencode(sys.argv[1]), b"caf\\xe9")
+os.mkdir(odd)
+subprocess.run([b"mount", b"-t", b"tmpfs", b"tmpfs", odd], check=True)
+mounted = singularity._mounted(Path(os.fsdecode(odd)))
+print(mounted, asyncio.run(singularity.unmount_dead_overlays()), procfs.tmpfs_bytes(os.getpid()) is not None)
+"""
+    assert in_mount_namespace(script, str(tmp_path)).split() == ["True", "[]", "True"]
+
+
+async def test_janitors_unmount_overlays_without_fuse_overlayfs_on_path(
+    tmp_path, sif, fake_runtime, fake_fuse, monkeypatch
+):
+    monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")
+    (name,) = await crashed_sandboxes(tmp_path, sif, "a")
+    (tmp_path / "bin" / "fuse-overlayfs").unlink()  # the job had it from a module; not the janitor
+    session = make_provider(tmp_path).session_root / name
+    report = await make_provider(tmp_path).reap()
+    assert (report.removed, report.errors) == ([name], [])
+    assert ["fusermount3", "-u", str(session / "rootfs")] in fuse_calls(fake_fuse)
 
 
 async def test_janitors_and_first_starts_look_for_dead_overlays(

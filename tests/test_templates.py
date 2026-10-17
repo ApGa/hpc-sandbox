@@ -157,3 +157,32 @@ async def test_a_template_of_an_image_rewritten_in_place_is_not_reused(tmp_path,
         assert (await sandbox.exec("cat hello.txt")).stdout == "howdy\n"
     finally:
         await sandbox.stop()
+
+
+async def test_a_damaged_template_goes_once_no_overlay_uses_it(tmp_path, sif, fake_runtime):
+    provider = make_provider(tmp_path, rootfs_templates=True)
+    await (await provider.start(SandboxSpec(image=str(sif)))).stop()
+    root = provider.scratch_root / TEMPLATE_DIR
+    (template,) = [path for path in root.iterdir() if path.is_dir()]
+    (template / TEMPLATE_MARKER).unlink()
+    # A fuse-overlayfs still has it as its lower layer when it is moved aside.
+    holder = "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print(1, flush=True); time.sleep(60)"
+    overlay = await asyncio.create_subprocess_exec(
+        "bash",
+        "-c",
+        'exec -a fuse-overlayfs "$0" -c "$1" "$2"',
+        sys.executable,
+        holder,
+        str(template / "rootfs"),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert overlay.stdout is not None and await overlay.stdout.readline() == b"1\n"
+        await (await provider.start(SandboxSpec(image=str(sif)))).stop()
+        damaged = [path for path in root.iterdir() if path.name.endswith(".damaged")]
+        assert len(damaged) == 1  # kept while in use
+    finally:
+        overlay.kill()
+        await overlay.wait()
+    report = await provider.reap()  # this process, which moved it aside, lives on
+    assert report.errors == [] and not damaged[0].exists()
