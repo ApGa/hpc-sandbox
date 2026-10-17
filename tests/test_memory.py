@@ -235,6 +235,19 @@ def test_a_pool_dies_whole_even_when_one_worker_would_do():
     assert killed(processes, limit=1200 * MB) == [20, 100, 101, 102]
 
 
+def test_processes_that_mark_themselves_go_first_only_as_the_kernel_would_take_them():
+    # A browser's renderers set their oom_score_adj to 300; a tool runs away elsewhere.
+    browser = [proc(50, None, 1, exec_root=50), proc(51, 50, 200, exec_root=50)]
+    browser += [proc(52 + i, 51, 150, exec_root=50, adj=300) for i in range(4)]
+    tool = [proc(60, None, 1, exec_root=60), proc(61, 60, 1344, exec_root=60)]
+    assert killed(sandbox(*browser, *tool), 2048 * MB) == [61]  # 1344 MB beats 150 + 614 MB
+    # The same tool in the browser's exec, and a smaller one: then a renderer is the one.
+    inside = [*browser, proc(61, 50, 1344, exec_root=50)]
+    assert killed(sandbox(*inside), 2048 * MB) == [61]
+    small = [proc(60, None, 1, exec_root=60), proc(61, 60, 500, exec_root=60)]
+    assert killed(sandbox(*browser, *small), 1300 * MB) in ([52], [53], [54], [55])
+
+
 def test_an_oom_score_adj_every_process_inherited_changes_nothing():
     for adj in (1000, 500, -997):
         processes = [proc(1, None, 1, adj=adj, protected=True)]

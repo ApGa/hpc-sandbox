@@ -180,9 +180,11 @@ What both providers share:
    A `ProcessPoolExecutor`'s owner goes with its pool too (it would have got
    `BrokenProcessPool`): the process tree cannot tell the two apart. Like the
    kernel's OOM killer, it may kill a larger idle process before a smaller one
-   that is growing; a process with a higher `oom_score_adj` than its parent
-   (`choom -n 1000 -- cmd`, or a browser's renderers, which mark themselves)
-   goes first, and a value every process inherited changes nothing. The
+   that is growing. A process with a higher `oom_score_adj` than its parent
+   (`choom -n 1000 -- cmd`) goes first when what it holds, plus a thousandth
+   of the limit per point, outweighs the branch the memory leads to; as the
+   kernel scores each process alone, marks never add up (a browser's renderers
+   mark themselves), and a value every process inherited changes nothing. The
    branch dies whole, with whatever it forks meanwhile; its root is killed,
    never stopped, so its parent sees a kill. A command the watchdog killed
    returns 137; one whose descendants it killed keeps its own exit status (or

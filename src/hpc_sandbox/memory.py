@@ -188,18 +188,31 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
     def killable(process: _Process) -> bool:
         return not process.protected and not shielded(process)
 
-    def weight(process: _Process) -> int:
+    def bonus(process: _Process) -> int:
+        """What an oom_score_adj above or below its parent's adds to a process, as the
+        kernel's OOM killer counts it (a thousandth of the limit per point)."""
         if shielded(process):
             return 0
         parent = by_pid.get(process.parent) if process.parent is not None else None
-        bonus = (process.adj - parent.adj) * limit_bytes // 1000 if parent else 0
-        return max(0, process.pss_bytes + bonus) if bonus < 0 else process.pss_bytes + bonus
+        return (process.adj - parent.adj) * limit_bytes // 1000 if parent else 0
 
-    branch: dict[int, int] = {}  # weight of each process's subtree
+    def mark(process: _Process) -> int:
+        """How much more a process marked as a preferred victim weighs."""
+        return max(bonus(process), 0)
+
+    def weight(process: _Process) -> int:
+        """A process's own weight with its mark: what the kernel would score it."""
+        if shielded(process):
+            return 0
+        return max(0, process.pss_bytes + bonus(process))
+
+    branch: dict[int, int] = {}  # memory of each process's subtree; marks lower it, never raise it
     freed: dict[int, int] = {}  # PSS that killing each subtree frees
     for process in reversed(processes):  # children before parents
         below = children[process.pid]
-        branch[process.pid] = weight(process) + sum(branch[kid.pid] for kid in below)
+        branch[process.pid] = (
+            weight(process) - mark(process) + sum(branch[kid.pid] for kid in below)
+        )
         own = process.pss_bytes if killable(process) else 0
         freed[process.pid] = own + sum(freed[kid.pid] for kid in below)
 
@@ -233,25 +246,31 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
         parent waits for it and learns that it was killed, as a grader, a subprocess
         call or a test runner learns that a command it ran was."""
         own = kind(process)
-        if (
-            own is None and FORK_SERVER_MARKER in process.command
-        ):  # the server; its children copy it
-            return len(children[process.pid]) > 1
+        if own is None and FORK_SERVER_MARKER in process.command:
+            return len(children[process.pid]) > 1  # the server, which its children copy
         return own is not None and sum(kind(kid) == own for kid in children[process.parent]) > 1
 
     top = candidates(None)
     if not top:
         return []  # nothing that may be killed holds memory
     node = max(top, key=lambda kid: branch[kid.pid])
+    # A process marked as a preferred victim goes first wherever it is when what it
+    # holds and its mark outweigh the branch the memory leads to. Marks never add up
+    # (a browser's renderers mark themselves): the kernel scores each process alone.
+    preferred = [p for p in processes if mark(p) and killable(p) and freed[p.pid]]
+    best = max(preferred, key=lambda p: branch[p.pid] + mark(p), default=None)
+    if best is not None and branch[best.pid] + mark(best) > branch[node.pid]:
+        node = best
     while kids := candidates(node.pid):
         marked = [  # more exposed than the node, and outweighing it or enough on their own
             kid
             for kid in kids
-            if node.adj < kid.adj and (weight(node) < branch[kid.pid] or freed[kid.pid] >= excess)
+            if node.adj < kid.adj
+            and (weight(node) < branch[kid.pid] + mark(kid) or freed[kid.pid] >= excess)
         ]
         heaviest = max(kids, key=lambda kid: freed[kid.pid])
         if marked:
-            node = max(marked, key=lambda kid: branch[kid.pid])  # a preferred victim
+            node = max(marked, key=lambda kid: branch[kid.pid] + mark(kid))  # a preferred victim
         elif freed[heaviest.pid] >= excess:
             node = heaviest  # it holds the breach on its own
         else:
