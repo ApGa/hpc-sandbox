@@ -171,22 +171,22 @@ What both providers share:
    the most while that child alone holds the excess over the limit. So the
    command that ran away dies and a harness survives a tool command it started,
    whatever their sizes; when the memory is spread over several children, their
-   parent's branch dies whole. The victim is never one of several workers of
-   a pool (fork copies of their parent, or children multiprocessing spawned or
-   its fork server forked), which could leave a `multiprocessing.Pool` waiting
-   forever: the pool's owner goes, with every worker. A lone child dies alone,
-   so a harness that runs code in a child and joins it learns that the child
-   was killed, as a grader or a test runner learns that a command it ran was.
-   A `ProcessPoolExecutor`'s owner goes with its pool too (it would have got
-   `BrokenProcessPool`): the process tree cannot tell the two apart. Like the
-   kernel's OOM killer, it may kill a larger idle process before a smaller one
-   that is growing. A process with a higher `oom_score_adj` than its parent
-   (`choom -n 1000 -- cmd`) goes first when what it holds, plus a thousandth
-   of the limit per point, outweighs the branch the memory leads to; as the
-   kernel scores each process alone, marks never add up (a browser's renderers
-   mark themselves), and a value every process inherited changes nothing. The
-   branch dies whole, with whatever it forks meanwhile; its root is killed,
-   never stopped, so its parent sees a kill. A command the watchdog killed
+   parent's branch dies whole. As with the kernel's OOM killer, a pool's worker
+   that holds the excess alone dies alone: a harness that runs code in
+   children it joins (`multiprocessing.Process`, with a `Manager` or several
+   at once, as code-eval graders do) learns that one was killed, and so do a
+   `ProcessPoolExecutor` and joblib, but a `multiprocessing.Pool`, which never
+   notices a lost worker, waits for its task until the command times out. The
+   process tree cannot tell a pool from such a harness. It may also kill a
+   larger idle process before a smaller one that is growing. A process with a
+   higher `oom_score_adj` than its parent (`choom -n 1000 -- cmd`) goes first
+   when what it holds, plus a thousandth of the limit per point, outweighs the
+   branch the memory leads to; as the kernel scores each process alone, marks
+   never add up (a browser's renderers mark themselves), and a value every
+   process inherited changes nothing. The branch dies whole, with what it
+   forks meanwhile (but for a process its root moves into a new session in the
+   instant before the kill, which stays watched); its root is killed, never
+   stopped, so its parent sees a kill. A command the watchdog killed
    returns 137; one whose descendants it killed keeps its own exit status (or
    times out). Either way the explanation is appended to stderr and recorded
    in `Sandbox.memory_kills`, with the processes the branch held (`pids`) and

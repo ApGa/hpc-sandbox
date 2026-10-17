@@ -136,26 +136,37 @@ FORKSERVER = (
 )
 
 
-def test_pools_of_two_or_uneven_pools_die_whole():
-    parent = proc(20, 10, 10, command=POOL)
-    two = sandbox(proc(10, 2, 257), parent, *pool(20, 100, 2, 600, command=POOL))
-    assert killed(two) == [20, 100, 101]
-    uneven = [proc(100, 20, 900, command=POOL), proc(101, 20, 100, command=POOL)]
-    processes = sandbox(proc(10, 2, 257), parent, *uneven)
-    assert killed(processes) == [20, 100, 101]
+def test_a_pool_worker_that_holds_the_excess_dies_alone_as_with_the_kernel():
+    # A multiprocessing.Pool then waits for its task until the command times out; a harness
+    # running code in children it joins learns that one was killed (see below).
+    owner = proc(20, 10, 10, command=POOL)
+    workers = [proc(100, 20, 900, command=POOL), proc(101, 20, 100, command=POOL)]
+    assert killed(sandbox(proc(10, 2, 257), owner, *workers)) == [100]
+    # Spread over the pool, the memory takes the owner with every worker.
+    spread = pool(20, 100, 3, 400, command=POOL)
+    assert killed(sandbox(proc(10, 2, 257), owner, *spread)) == [20, 100, 101, 102]
 
 
-def test_spawned_and_forkserver_pools_die_with_their_owner():
+def test_a_harness_running_code_in_children_with_a_manager_survives_a_leak():
+    # human-eval's check_correctness, four at once: a Manager's server and a Process each.
+    harness = proc(10, 2, 120, command=HARNESS)
+    servers = [proc(20 + i, 10, 10, command=HARNESS) for i in range(4)]
+    children = [proc(30 + i, 10, 400 if i == 2 else 30, command=HARNESS) for i in range(4)]
+    assert killed(sandbox(harness, *servers, *children), 300 * MB) == [32]
+
+
+def test_a_pool_that_holds_the_excess_together_dies_with_its_owner_or_its_fork_server():
     owner = proc(20, 10, 30, command=POOL)
     spawned = sandbox(proc(10, 2, 257), owner, *pool(20, 100, 2, 750, command=SPAWNED))
     assert killed(spawned) == [20, 100, 101]
-    # The fork server forks the workers; its owner waits on them.
+    # The fork server forks the workers and goes with them: its owner learns of it
+    # (BrokenProcessPool, for a ProcessPoolExecutor).
     server = [proc(30, 20, 10, command=FORKSERVER), *pool(30, 100, 3, 500, command=FORKSERVER)]
     tracker = proc(
         40, 20, 5, command="python3 -c from multiprocessing.resource_tracker import main;main(8)"
     )
     processes = sandbox(proc(10, 2, 257), owner, *server, tracker)
-    assert killed(processes) == [20, 30, 40, 100, 101, 102]
+    assert killed(processes) == [30, 100, 101, 102]
 
 
 def test_a_lone_child_dies_alone_and_its_parent_learns_of_it():
@@ -227,12 +238,6 @@ def test_a_runaway_tool_in_a_test_worker_dies_alone():
     xdist = "python3 -c import sys;exec(eval(sys.stdin.readline()))"
     leaking = [proc(30, 10, 900, command=xdist), *pool(10, 31, 3, 50, command=xdist)]
     assert killed(sandbox(proc(10, 2, 100, command="pytest -n 4"), *leaking)) == [30]
-
-
-def test_a_pool_dies_whole_even_when_one_worker_would_do():
-    workers = pool(20, 100, 3, 400, command=POOL)
-    processes = sandbox(proc(10, 2, 257), proc(20, 10, 10, command=POOL), *workers)
-    assert killed(processes, limit=1200 * MB) == [20, 100, 101, 102]
 
 
 def test_processes_that_mark_themselves_go_first_only_as_the_kernel_would_take_them():
@@ -320,16 +325,16 @@ def test_a_bystander_smaller_than_the_hog_survives_a_small_excess():
     assert killed(processes, 3053 * MB) == [3]
 
 
-def test_of_two_hogs_under_a_harness_one_goes_unless_they_are_a_pool():
-    for tools in (("", ""), ("python3 sol.py 1", "python3 sol.py 2"), ("python3 sol.py",) * 2):
-        names = {2: HARNESS, 3: tools[0], 4: tools[1]}
-        rows = ((1, None, 1), (2, 1, 200), (3, 2, 2000), (4, 2, 1900))
-        assert killed(tree(*rows, protected=(1,), commands=names), 4000 * MB) == [3], tools
-    # Two copies of the harness are a pool, as two of multiprocessing.Pool's fork workers
-    # are: one killed alone would leave the pool waiting for it forever.
-    names = {2: HARNESS, 3: HARNESS, 4: HARNESS}
+def test_of_two_hogs_under_a_harness_one_goes():
     rows = ((1, None, 1), (2, 1, 200), (3, 2, 2000), (4, 2, 1900))
-    assert killed(tree(*rows, protected=(1,), commands=names), 4000 * MB) == [2, 3, 4]
+    for tools in (
+        ("", ""),
+        ("python3 sol.py 1", "python3 sol.py 2"),
+        ("python3 sol.py", "python3 sol.py"),
+        (HARNESS, HARNESS),  # two forked copies of the harness
+    ):
+        names = {2: HARNESS, 3: tools[0], 4: tools[1]}
+        assert killed(tree(*rows, protected=(1,), commands=names), 4000 * MB) == [3], tools
 
 
 PYTHON = "/usr/bin/python3"
@@ -351,7 +356,11 @@ if sys.argv[1] == "os.fork":
         os._exit(0)
     print("harness alive, child exit", os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
 else:
-    child = multiprocessing.get_context("fork").Process(target=leak)
+    context = multiprocessing.get_context("fork")
+    if sys.argv[1] == "manager":  # as human-eval's check_correctness does
+        manager = context.Manager()
+        results = manager.list()
+    child = context.Process(target=leak)
     child.start()
     child.join(30)
     print("harness alive, child exit", child.exitcode)
@@ -363,7 +372,7 @@ async def test_a_harness_learns_that_the_child_it_joins_was_killed(tmp_path, fak
     provider = make_provider(tmp_path)
     sandbox = await provider.start(SandboxSpec(image=str(sif), memory_mb=300))
     try:
-        for how in ("multiprocessing", "os.fork"):
+        for how in ("multiprocessing", "os.fork", "manager"):
             command = [PYTHON, "-c", HARNESS_JOINS_A_CHILD, how]
             result = await sandbox.exec(command, timeout_s=60)
             assert result.exit_code == 0, (how, result.stdout, result.stderr)

@@ -818,7 +818,7 @@ class SessionSandbox:
     def _watch_root(self) -> int | None:
         """Host PID whose process tree the memory watchdog charges to the sandbox.
 
-        The root and its direct children are never killed.
+        Of it, only what :meth:`_own_processes` recorded at start is never killed.
         """
         return None
 

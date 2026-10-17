@@ -15,28 +15,33 @@ background by earlier ones) and descends into the child branch that holds
 the most while that child alone holds the excess over the limit. So the
 command that ran away dies and a harness survives a tool command it started,
 whatever their sizes; when the memory is spread over several children, their
-parent's branch dies whole. The victim is never one worker of a pool
-(children running the very same command line, or multiprocessing's and
-joblib's workers), which could leave the pool waiting for it forever: the
-pool's owner goes, with every worker. Like the kernel's OOM killer, it may
-kill a larger idle process before a smaller one that is growing; a child more
-exposed than its parent (a higher ``oom_score_adj``) that outweighs the
-parent or holds the excess goes first.
+parent's branch dies whole. As with the kernel's OOM killer, a pool's worker
+that holds the excess alone dies alone, so a harness that runs code in
+children it joins (with a ``multiprocessing.Manager``, or several at once)
+learns that one was killed, while a ``multiprocessing.Pool``, which never
+notices a lost worker, waits for its task until the command times out
+(``concurrent.futures`` and joblib raise an error instead): the process tree
+cannot tell the two apart. It may also kill a larger idle process before a
+smaller one that is growing.
 
 ``oom_score_adj`` counts the way the kernel's OOM killer counts it, relative to
 the parent's value, so that what every process inherited changes nothing:
-where a process raised it, its branch weighs ``oom_score_adj / 1000`` of the
-limit more (once, not again for each child that inherits it). A harness that
-starts its tool commands with ``choom -n 1000 -- cmd`` (or writes
-``/proc/self/oom_score_adj``) makes them preferred victims here and under the
-kernel alike. A process that lowered it only weighs less itself. One at
-``-1000`` below what the sandbox inherited, which takes privileges on the host
-to set, is never killed.
+where a process raised it, that process weighs ``oom_score_adj / 1000`` of the
+limit more, for itself alone, as the kernel scores each process alone (the
+renderers of a browser, which mark themselves, do not add up). It goes first,
+wherever it is, when what its branch holds plus its mark outweighs the branch
+the memory leads to, and before its siblings when it outweighs its parent or
+holds the excess. A harness that starts its tool commands with
+``choom -n 1000 -- cmd`` (or writes ``/proc/self/oom_score_adj``) makes them
+preferred victims here and under the kernel alike. A process that lowered it
+only weighs less itself. One at ``-1000`` below what the sandbox inherited,
+which takes privileges on the host to set, is never killed.
 
 The branch dies whole: its processes are stopped (but not its root, whose
 parent sees it killed, never stopped), then everything is SIGKILLed, then any
 process forked meanwhile, found among the orphans of the sandbox's own
-processes, goes too.
+processes in the branch's sessions, goes too. One that its root moves into a
+new session in the instant before the kill survives, and stays watched.
 
 Files on the sandbox's tmpfs mounts hold memory that no kill frees and that no
 process's PSS includes unless mapped; kill reports say how much.
@@ -104,13 +109,6 @@ class _Process:
     @property
     def identity(self) -> Identity:
         return (self.pid, self.start_time)
-
-
-SHELLS = frozenset({"sh", "ash", "bash", "dash", "ksh", "mksh", "zsh"})
-# The command lines of the children multiprocessing spawns, and of its fork server,
-# whose children are copies of it.
-SPAWNED_MARKERS = ("multiprocessing.spawn", "--multiprocessing-fork")
-FORK_SERVER_MARKER = "multiprocessing.forkserver"
 
 
 def sample(
@@ -227,29 +225,6 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
                 pending.extend(children[process.pid])
         return [process for process in found if freed[process.pid]]
 
-    def kind(process: _Process) -> str | None:
-        """How ``process`` may be a worker of a pool its parent runs: a child that
-        multiprocessing spawned, or a copy of its parent (a fork that ran no other
-        program, as a fork server's children are). A subshell is none."""
-        parent = by_pid.get(process.parent) if process.parent is not None else None
-        if parent is None or not process.command:
-            return None
-        if any(mark in process.command for mark in SPAWNED_MARKERS):
-            return "spawned"
-        if process.command == parent.command and not _shell(process.command):
-            return "forked"
-        return None
-
-    def worker(process: _Process) -> bool:
-        """Whether ``process`` is one of the workers of a pool, or the fork server they
-        came from: one of several children of one kind. A lone child is no pool's: its
-        parent waits for it and learns that it was killed, as a grader, a subprocess
-        call or a test runner learns that a command it ran was."""
-        own = kind(process)
-        if own is None and FORK_SERVER_MARKER in process.command:
-            return len(children[process.pid]) > 1  # the server, which its children copy
-        return own is not None and sum(kind(kid) == own for kid in children[process.parent]) > 1
-
     top = candidates(None)
     if not top:
         return []  # nothing that may be killed holds memory
@@ -275,18 +250,10 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
             node = heaviest  # it holds the breach on its own
         else:
             break
-    # Never one worker of a pool, which can leave the pool waiting for it forever:
-    # the pool's owner goes, with every worker.
-    while worker(node) and killable(owner := by_pid[node.parent]):
-        node = owner
     found = [node]
     for process in found:  # grows while it is walked
         found.extend(children[process.pid])
     return [process for process in found if killable(process)]
-
-
-def _shell(command: str) -> bool:
-    return os.path.basename(command.split(" ", 1)[0]) in SHELLS
 
 
 def choose_victim(processes: list[_Process], limit_bytes: int) -> MemoryKill | None:
