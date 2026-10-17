@@ -128,7 +128,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         extra_start_args: Sequence[str] = (),
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT,
         memory_poll_s: float = 1.0,
-        rootfs_templates: bool = True,
+        rootfs_templates: bool | None = None,
         rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
     ) -> None:
         super().__init__(
@@ -156,7 +156,6 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             prepare=self._make_scratch_directories,
         )
         self.stop_grace_s = stop_grace_s
-        self.rootfs_templates = rootfs_templates
         self.allow_network_none = allow_network_none
         self.gpu = gpu
         self.cgroup_limits = cgroup_limits
@@ -176,7 +175,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
                 "GPUs, cgroup limits and --fakeroot need rootfs_layout='copy'"
                 if gpu or cgroup_limits or fakeroot
                 else "it needs rootfs_templates"
-                if not rootfs_templates
+                if rootfs_templates is False
                 else None
             )
             if conflict and rootfs_layout is not None:
@@ -184,6 +183,12 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             if conflict:  # a site-wide default this provider cannot take
                 layout = "copy"
         self.rootfs_layout = layout
+        # A copy of a template creates as many inodes as an extraction: on XFS, 64-128 copies at once took longer
+        # than 64-128 extractions (reflinks update refcounts too), so the copy layout extracts per sandbox unless
+        # asked; the fuse-overlay layout needs the template as its lower layer.
+        self.rootfs_templates = (
+            layout == "fuse-overlay" if rootfs_templates is None else rootfs_templates
+        )
 
     def _scratch_directories(self) -> list[Path]:
         assert self.runtime.tmp_dir is not None and self.runtime.cache_dir is not None

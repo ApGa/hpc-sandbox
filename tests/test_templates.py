@@ -13,7 +13,7 @@ from hpc_sandbox.singularity import TEMPLATE_DIR, TEMPLATE_MARKER
 
 
 async def test_sandboxes_of_one_image_share_one_extraction(tmp_path, sif, fake_runtime):
-    provider = make_provider(tmp_path)
+    provider = make_provider(tmp_path, rootfs_templates=True)
     first = await provider.start(SandboxSpec(image=str(sif)))
     others = await asyncio.gather(*(provider.start(SandboxSpec(image=str(sif))) for _ in range(3)))
     try:
@@ -36,8 +36,9 @@ async def test_sandboxes_of_one_image_share_one_extraction(tmp_path, sif, fake_r
         await asyncio.gather(*(sandbox.stop() for sandbox in [first, *others]))
 
 
-async def test_without_templates_every_sandbox_extracts(tmp_path, sif, fake_runtime):
-    provider = make_provider(tmp_path, rootfs_templates=False)
+async def test_the_copy_layout_extracts_every_sandbox_unless_asked(tmp_path, sif, fake_runtime):
+    provider = make_provider(tmp_path)
+    assert provider.rootfs_layout == "copy" and provider.rootfs_templates is False
     sandboxes = [await provider.start(SandboxSpec(image=str(sif))) for _ in range(2)]
     try:
         assert len(fake_runtime.calls("build")) == 2
@@ -47,7 +48,7 @@ async def test_without_templates_every_sandbox_extracts(tmp_path, sif, fake_runt
 
 
 async def test_a_failed_extraction_publishes_no_template(tmp_path, sif, fake_runtime, monkeypatch):
-    provider = make_provider(tmp_path)
+    provider = make_provider(tmp_path, rootfs_templates=True)
     original = provider._extract_into
     calls = 0
 
