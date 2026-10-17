@@ -752,7 +752,8 @@ class SessionSandbox:
         return snapshot
 
     async def stop(self) -> None:
-        """Stop the container and delete its session; idempotent and cancellation-safe.
+        """Stop the container and take its session out of the session root, to be
+        deleted in the background; idempotent and cancellation-safe.
 
         Teardown always runs to completion; a cancelled caller sees
         ``CancelledError`` only afterwards. If teardown fails (a process whose

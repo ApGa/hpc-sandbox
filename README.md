@@ -81,12 +81,13 @@ the runtime underneath.
 | `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the scratch and cache filesystems, free space, staging and reflink support, and what matters for the runtime: for Singularity/Apptainer the site settings (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices); for enroot whether namespaces can be created, whether imports can convert layer whiteouts, whether this process runs inside a container, and the site's `enroot.conf` and hooks. With `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
 | `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
 | `python -m hpc_sandbox pull [--refresh] IMAGE...` | Pulls images into the image cache unless cached, and checks local image files, printing on stdout only one JSON line per image, with the stable keys `reference`, `path`, `sha256` (of the image file) and `manifest_digest` (from a digest-pinned remote reference, else null); logs go to stderr. `--refresh` pulls tags again; sandboxes started afterwards get the new image, and starts never wait for a refresh. |
-| `python -m hpc_sandbox fetch-tools [--arch ARCH]` | Downloads the pinned static slirp4netns that pods use for egress when the host has none (`$HPC_SANDBOX_TOOLS`, else `~/.cache/hpc-sandbox/tools`), checks its SHA-256 and prints its path as a JSON line. Run it once where there is internet access; compute nodes need none. |
+| `python -m hpc_sandbox fetch-tools [--arch ARCH]` | Downloads the pinned static slirp4netns that pods use for egress when the host has none (`$HPC_SANDBOX_TOOLS`, else `hpc-sandbox/tools` in `$XDG_CACHE_HOME` or `~/.cache`), checks its SHA-256 and prints its path as a JSON line. Run it once where there is internet access; compute nodes need none. |
 | `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes and pods abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless `--runtime` names one, it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
 
-All commands take `--runtime auto|singularity|enroot` (default
-`$HPC_SANDBOX_RUNTIME`, else the first of `singularity`, `apptainer` and
-`enroot` found on `PATH`), `--binary`, `--scratch-root` and `--image-cache`.
+All commands but `fetch-tools` take `--runtime auto|singularity|enroot`
+(default `$HPC_SANDBOX_RUNTIME`, else the first of `singularity`, `apptainer`
+and `enroot` found on `PATH`), `--binary`, `--scratch-root` and
+`--image-cache`.
 
 ## How a sandbox is built
 
@@ -115,8 +116,10 @@ What both providers share:
    with `flock` and holding an owner record: the provider, owner PID and
    start time, the container's process identities, who commands run as
    (`remap_root`, `container_uid`), hostname and labels. The writable root
-   filesystem is extracted into it as a directory
-   owned by the calling uid: no loop devices, overlays or size-capped tmpfs.
+   filesystem is a directory in it owned by the calling uid, extracted from
+   the image or copied from a template (or, with Singularity's fuse-overlay
+   layout, a FUSE overlay over a template): no loop devices or size-capped
+   tmpfs.
 3. **Commands.** The host environment never reaches the sandbox. The
    container's own environment (the image's `ENV`), `HOME=/root`,
    `SandboxSpec.env` and per-call `env` are sent, POSIX-quoted, as one line
@@ -203,22 +206,26 @@ What both providers share:
    over that template, with the fuse-overlay layout.
 7. **Teardown and janitors.** `stop()` kills running commands, stops the
    container, re-proving process identities before signalling anything, and
-   moves the session into the session root's `.trash` under the janitor lock.
-   A detached `rm` deletes it once the stop returned: one deletion at a time
-   per session root, at the lowest CPU priority, holding an flock on its trash
-   entry (while 16 of a process's deletions are pending, its stops delete
-   their sessions themselves). `await provider.wait_for_deletions()` waits for
-   the deletions the process started; call it before a process or a Slurm
-   step ends, which kills them (`hpc-sandbox run` and `doctor` do). Teardown
-   is shielded from cancellation. A janitor considers only `hpcsb-<uuid>`
-   sessions under its root whose lease is free and whose owner process is
-   dead, optionally filtered by labels, and leaves sessions that belong to
-   another provider; it fails closed (reports and leaves the session)
-   whenever identities disagree, and never deletes through a mount point. It
-   takes over the trash entries no deletion holds once the process that moved
-   them died (a minute later if it lives). Each provider sweeps abandoned
-   sessions before its first start that finds the janitor lock free (a start
-   never waits for it; janitors and `reap()` do).
+   moves the session into the session root's `.trash` under the janitor lock. A
+   detached `rm` deletes it once the stop returned: one deletion at a time per
+   session root, at the lowest CPU priority, holding an flock on its trash
+   entry (while 16 of a process's deletions are pending, its stops delete their
+   sessions themselves). `await provider.wait_for_deletions()` waits for the
+   deletions the process started; call it before a process or a Slurm step
+   ends, which kills them (`hpc-sandbox run` and `doctor` do), and before
+   removing a scratch root yourself, whose files they still delete. On a
+   scratch too full even to move a session, the stop deletes it in place.
+   Teardown is shielded from cancellation, and a stop that failed is retried by
+   the next. A janitor considers only `hpcsb-<uuid>` sessions under its root
+   whose lease is free and whose owner process is dead, optionally filtered by
+   labels, and leaves sessions that belong to another provider; it fails closed
+   (reports and leaves the session) whenever identities disagree, and never
+   deletes through a mount point. It takes over the trash entries no deletion
+   holds once the process that moved them died (a minute later if it lives).
+   Each provider sweeps abandoned sessions at its first start that finds the
+   janitor lock free: a start never waits to sweep (janitors and `reap()` do),
+   though creating and removing sessions take that lock for an instant, so they
+   wait while a sweep stops abandoned sandboxes.
 
 ### Singularity CE / Apptainer
 
@@ -541,10 +548,13 @@ Singularity CE / Apptainer:
   provider sets it to `all` (inside a Slurm allocation, the allocated GPUs)
   unless it is already set.
 - **fuse-overlay** needs `fuse-overlayfs` and `fusermount3` (or `fusermount`)
-  on `PATH`, and `/dev/fuse`. Each overlay counts towards fusermount's
-  `mount_max` (`/etc/fuse.conf`, 1000 by default), which caps the FUSE mounts
-  of every user on the node; a killed job's overlays stay mounted, dead, until
-  a janitor or a provider's first start on the node unmounts them.
+  on `PATH`, `/dev/fuse`, and unprivileged user namespaces, which its instances
+  run in (`--userns`); janitors need only `fusermount3`. Each overlay counts
+  towards fusermount's `mount_max` (`/etc/fuse.conf`, 1000 by default), which
+  caps the FUSE mounts of every user on the node. An overlay whose
+  fuse-overlayfs gets SIGKILL (as Slurm sends what outlives a step or a job)
+  stays mounted, dead, until a janitor or a provider's first start on the node
+  unmounts it.
 - **Templates are never evicted.** Every image version used on a node keeps
   an extracted rootfs in `templates/` on scratch, next to its staged SIF. A
   per-job scratch root goes with the job; on one that outlives jobs, keep
