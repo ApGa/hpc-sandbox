@@ -607,7 +607,10 @@ class SessionPod:
         self._slirp = None
         self._slirp_start_time = None
         if self._session is not None:
-            self._record()
+            try:  # a full scratch must not stop the pod's teardown: janitors prove identities
+                self._record()
+            except OSError as error:
+                log.warning("pod %s: could not update its owner record: %s", self.id, error)
 
     def _slirp_log(self) -> str:
         assert self._session is not None
@@ -854,7 +857,8 @@ class PodService(SessionSandbox):
 
     @property
     def _files(self) -> Path:
-        assert self._session is not None
+        if self._session is None:
+            raise SandboxError(f"service {self.name!r} of pod {self.pod.id} is stopped")
         return self._session.path
 
     @property
@@ -877,14 +881,14 @@ class PodService(SessionSandbox):
             with os.fdopen(os.open(self.hosts_path, flags), "r+") as stream:
                 if line not in stream.read():
                     stream.write(line)
-        except (OSError, AssertionError) as error:
+        except (OSError, SandboxError) as error:
             log.warning("pod %s: could not add %s to %s: %s", self.pod.id, name, self.name, error)
 
     def rewrite_hosts(self, content: str) -> None:
         """Replace what the service's /etc/hosts says, in place: it is bound into the service."""
         try:
             fd = os.open(self.hosts_path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        except (OSError, AssertionError) as error:
+        except (OSError, SandboxError) as error:
             log.warning(
                 "pod %s: could not rewrite the hosts of %s: %s", self.pod.id, self.name, error
             )
@@ -923,7 +927,7 @@ class PodService(SessionSandbox):
                 size = stream.seek(0, os.SEEK_END)
                 stream.seek(max(start, size - limit))
                 return stream.read().decode(errors="replace")
-        except (OSError, AssertionError):
+        except (OSError, SandboxError):
             return ""
 
     # Starting.
@@ -1150,6 +1154,7 @@ class PodService(SessionSandbox):
 
     def terminate(self) -> None:
         """Ask the command to stop: SIGTERM to the init, which passes it on."""
+        self._stopping = True  # what it ends meanwhile was stopped, not lost
         init = self._service_init
         if init is not None and procfs.owned_live_start_time(init) == self._service_init_start:
             with contextlib.suppress(ProcessLookupError):
@@ -1179,7 +1184,8 @@ class PodService(SessionSandbox):
             and procfs.owned_live_start_time(container) == self._container_start
         ):
             raise SandboxError(f"the container of service {self.name!r} survived teardown")
-        self._exit_status = anchor.returncode
+        code = anchor.returncode  # negative when the launcher itself was killed
+        self._exit_status = 128 - code if code < 0 else code
         self._service_anchor = None
 
 

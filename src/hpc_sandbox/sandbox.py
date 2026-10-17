@@ -601,6 +601,7 @@ class SessionSandbox:
         # sandbox wrote, rather than from an image.
         self._restored = False
         self._stop_task: asyncio.Future[None] | None = None
+        self._stopping = False  # set when its stop has begun elsewhere (a pod's graceful stop)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.id!r}, image={self.spec.image!r})"
@@ -941,7 +942,7 @@ class SessionSandbox:
             for pid in roots:
                 self._execs.pop(pid, None)
                 self._exec_starts.pop(pid, None)
-        if self._stop_task is not None:
+        if self._stop_task is not None or self._stopping:
             raise SandboxError(f"sandbox {self.id} was stopped while the command ran")
         started_command, raw_stderr = split_start_marker(result.stderr)
         stdout = result.stdout.decode(errors="replace")

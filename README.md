@@ -434,10 +434,11 @@ async with pod:                                           # stopped when the blo
   else the pinned static release that `python -m hpc_sandbox fetch-tools`
   downloads once and checks against its SHA-256.
 - **Lifetime.** `pod.stop()` is idempotent and shielded from cancellation like
-  `Sandbox.stop()`: it cancels service starts in progress, gives services
-  `service_stop_grace_s` (default 0) after SIGTERM, then kills them,
-  slirp4netns and the holder, and deletes the pod's session directory, which
-  holds the services' sessions. Failed and cancelled starts leave nothing.
+  `Sandbox.stop()`: it cancels service starts in progress (those services are
+  killed at once), gives the others `service_stop_grace_s` (default 0) after
+  SIGTERM, then kills them, slirp4netns and the holder, and deletes the pod's
+  session directory, which holds the services' sessions. Failed and cancelled
+  starts leave nothing.
   Once the holder is gone, calls raise `SandboxLostError`. When the owning
   process dies, everything of its pods dies with it; `reap(labels)` stops
   matching live pods, and the janitor removes the files.

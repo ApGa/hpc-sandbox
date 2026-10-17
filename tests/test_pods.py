@@ -793,6 +793,42 @@ async def test_a_graceful_stop_reaches_the_command_and_statuses_are_shell_like(
     started = time.monotonic()
     await pod.stop()
     assert service.exit_status == 3 and time.monotonic() - started < 4
+    assert victim.exit_status == 137  # still, once stopped
+
+
+async def test_an_exec_running_while_its_pod_stops_gracefully_was_stopped_not_lost(runtime):
+    provider, image = runtime
+    provider.service_stop_grace_s = 5.0
+    pod = await provider.start_pod(PodSpec())
+    polite = ServiceSpec(
+        "polite",
+        SandboxSpec(image=image),
+        command=["sh", "-c", "trap 'exit 3' TERM; while :; do sleep 0.1; done"],
+    )
+    service = await pod.start_service(polite)
+    running = asyncio.ensure_future(service.exec("sleep 30"))
+    await asyncio.sleep(0.5)
+    await pod.stop()
+    with pytest.raises(SandboxError, match="stopped while the command ran") as caught:
+        await running
+    assert not isinstance(caught.value, SandboxLostError)
+
+
+async def test_a_pod_whose_owner_record_cannot_be_written_still_stops_and_leaves_nothing(
+    runtime, monkeypatch
+):
+    provider, image = runtime
+    pod = await provider.start_pod(PodSpec())
+    await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))
+    holder, path = pod._holder, pod.path
+
+    def full(self: Any, **fields: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sessions.Session, "write_owner_record", full)
+    await pod.stop()
+    assert await provider.wait_for_deletions(30)
+    assert holder.poll() is not None and not path.exists()
 
 
 async def test_a_cancelled_network_switch_leaves_a_state_that_tells_the_truth(runtime, fake_slirp):
