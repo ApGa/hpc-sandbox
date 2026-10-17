@@ -86,3 +86,23 @@ def test_bounded_output_keeps_the_head_and_the_tail():
     small = BoundedOutput(10)
     small.append(b"short")
     assert small.getvalue() == b"short"
+
+
+async def test_cancelling_at_any_moment_never_hangs(tmp_path):
+    # asyncio on Python 3.11 hangs when process creation is cancelled midway and
+    # what it started keeps the output pipes open (as commands behind nsenter do).
+    command = ["/bin/sh", "-c", f"sleep 60 & echo $$ $! >> {tmp_path}/pids; wait"]
+
+    async def cancelled_after(steps: int) -> None:
+        task = asyncio.ensure_future(run_process(command, timeout_s=30, stdin=b"x"))
+        for _ in range(steps):  # into the moment the pipes are being connected
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async with asyncio.timeout(60):
+        for steps in range(8):
+            await asyncio.gather(*(cancelled_after(steps) for _ in range(20)))
+    pids = (tmp_path / "pids").read_text().split() if (tmp_path / "pids").exists() else []
+    assert [pid for pid in map(int, pids) if not await gone(pid)] == []

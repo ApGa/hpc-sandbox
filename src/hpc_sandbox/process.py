@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import procfs
 
@@ -115,8 +116,8 @@ async def run_process(
     ``CancelledError`` propagates. The call returns once the command exits,
     even if a background process it started still holds an output pipe open.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
+    proc = await _create(
+        argv,
         stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -134,7 +135,10 @@ async def run_process(
     try:
         if on_start is not None:
             on_start(proc.pid)
-        await asyncio.wait_for(_exited(proc), timeout_s)
+        # Not wait_for: on Python 3.11 it swallows a cancellation that arrives
+        # just as the command exits, and the caller would never learn of it.
+        async with asyncio.timeout(timeout_s):
+            await _exited(proc)
     except TimeoutError:
         kill_tree(proc.pid)
         if await _settle(proc, readers, feeder):
@@ -149,6 +153,30 @@ async def run_process(
     await _drain(readers, feeder)
     assert proc.returncode is not None
     return ProcessResult(exit_status(proc.returncode), stdout.getvalue(), stderr.getvalue())
+
+
+async def _create(argv: Sequence[str], **options: Any) -> asyncio.subprocess.Process:
+    """``asyncio.create_subprocess_exec``, safe to cancel.
+
+    On Python 3.11, cancelling it while it connects the pipes leaves it
+    waiting forever for the process to finish. So creation always completes;
+    when the caller was cancelled meanwhile, the new process is killed.
+    """
+    creation = asyncio.ensure_future(asyncio.create_subprocess_exec(*argv, **options))
+    try:
+        return await asyncio.shield(creation)
+    except asyncio.CancelledError:
+        while not creation.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait({creation})
+        if not creation.cancelled() and creation.exception() is None:
+            proc = creation.result()
+            kill_tree(proc.pid)
+            exited = asyncio.ensure_future(_exited(proc))
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait({exited}, timeout=_REAP_TIMEOUT_S)
+            exited.cancel()
+        raise
 
 
 async def _read(stream: asyncio.StreamReader, sink: BoundedOutput) -> None:

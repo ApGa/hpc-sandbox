@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Cancelling a command while it starts no longer hangs.** On Python 3.11,
+  asyncio waits forever when the creation of a subprocess is cancelled while
+  what it started keeps its output open (as commands behind `nsenter` do);
+  cancelled `exec` calls and teardowns could hang that way.
+
 ## 0.2.0
 
 Changes since 0.1.0.
