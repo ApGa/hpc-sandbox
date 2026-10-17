@@ -173,6 +173,7 @@ class SessionProvider(Generic[S]):
         self._sandboxes: set[S] = set()
         self._pods: set[Any] = set()
         self._initial_sweep: asyncio.Future[None] | None = None
+        self._swept = False
         self._nsenter: str | None = None
 
     @property
@@ -282,6 +283,7 @@ class SessionProvider(Generic[S]):
             swept = await sweep(
                 root, stop, labels=labels, provider=self.name, claim_unknown=claim_unknown
             )
+            assert swept is not None  # it waits for the janitor lock
             report.stopped += swept.stopped
             report.removed += swept.removed
             report.live += swept.live
@@ -300,6 +302,7 @@ class SessionProvider(Generic[S]):
         services = path / SERVICES_DIRECTORY
         if services.is_dir() and not services.is_symlink():
             swept = await sweep(services, self._stop_abandoned_service, provider=self.name)
+            assert swept is not None  # it waits for the janitor lock
             if swept.errors or swept.live:
                 raise SandboxError("; ".join(swept.errors) or f"live services: {swept.live}")
             stopped = bool(swept.stopped)
@@ -450,16 +453,31 @@ class SessionProvider(Generic[S]):
 
     async def _prepare(self) -> None:
         self._make_scratch_directories()
-        if self._initial_sweep is None:
-            self._initial_sweep = asyncio.ensure_future(self._sweep_abandoned())
-        await asyncio.shield(self._initial_sweep)
+        if not self._swept:
+            if self._initial_sweep is None or self._initial_sweep.done():
+                self._initial_sweep = asyncio.ensure_future(self._sweep_abandoned())
+            await asyncio.shield(self._initial_sweep)
 
     async def _sweep_abandoned(self) -> None:
-        """Recover sessions left by crashed processes, once per provider."""
+        """Recover sessions left by crashed processes, once per provider.
+
+        It sweeps at the provider's first start that finds no other process
+        holding the janitor lock of its session roots: a start never waits for
+        that lock. With a provider per rollout and hundreds of rollouts starting
+        on one node, each start's sweep queued behind the other sweeps and
+        behind every session opened and stopped meanwhile.
+        """
+        swept = True
         for root, claim_unknown, stop in self._swept_roots():
-            report = await sweep(root, stop, provider=self.name, claim_unknown=claim_unknown)
+            report = await sweep(
+                root, stop, provider=self.name, claim_unknown=claim_unknown, wait=False
+            )
+            if report is None:  # another process holds the janitor lock: sweep at a later start
+                swept = False
+                continue
             for error in report.errors:
                 log.warning("hpc-sandbox janitor: %s", error)
+        self._swept = swept
 
     async def _copy_snapshot(self, source: Path, session: Session) -> None:
         for name, target in (

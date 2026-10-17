@@ -197,7 +197,8 @@ What both providers share:
    and whose owner process is dead, optionally filtered by labels, and leaves
    sessions that belong to another provider; it fails closed (reports and
    leaves the session) whenever identities disagree. Each provider sweeps
-   abandoned sessions before its first start.
+   abandoned sessions before its first start that finds the janitor lock free
+   (a start never waits for it; janitors and `reap()` do).
 
 ### Singularity CE / Apptainer
 
