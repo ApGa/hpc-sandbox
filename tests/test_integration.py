@@ -182,6 +182,23 @@ async def test_memory_watchdog_kills_the_hog_and_keeps_the_sandbox(provider):
     assert (await sandbox.exec("echo alive")).stdout == "alive\n"
 
 
+async def test_memory_watchdog_kills_the_runaway_command_and_spares_its_harness(provider):
+    """A harness holding more than any one of the workers its command starts, whose memory together breaks the
+    limit: the command (or its workers, as they grow) goes, the harness stays."""
+    sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=256))
+    pool = "for i in 1 2 3 4; do cat /dev/zero | tail -c 60000000 & done; wait"
+    harness = (
+        "big=$(head -c 100000000 /dev/zero | tr '\\0' a); "
+        f"sh -c '{pool}'; "
+        'echo "command exit $?"; echo "harness alive ${#big}"'
+    )
+    result = await sandbox.exec(harness, timeout_s=120)
+    assert result.exit_code == 0, (result.stdout, result.stderr)
+    assert "harness alive 100000000" in result.stdout
+    assert "memory limit exceeded" in result.stderr
+    assert sandbox.memory_kills
+
+
 CRASH = """\
 import asyncio, os, signal, sys
 from hpc_sandbox import EnrootProvider, SandboxSpec, SingularityProvider

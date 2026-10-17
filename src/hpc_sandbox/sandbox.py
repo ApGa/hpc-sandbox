@@ -19,6 +19,7 @@ import os
 import posixpath
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import threading
@@ -741,7 +742,12 @@ class SessionSandbox:
             note = f"hpc-sandbox: command timed out after {timeout_s:g} s"
             return ExecResult(TIMEOUT_EXIT_CODE, stdout, _append(stderr, note), timed_out=True)
         if kills:
-            return ExecResult(137, stdout, _append(stderr, kills[-1].message()))
+            # The watchdog killed something in this command's tree. When that ended the command itself, it exits
+            # 137; when it ended only processes the command started (a harness's runaway tool), the command's
+            # own exit stands. Either way the kill is noted.
+            killed_itself = result.returncode in (137, -signal.SIGKILL)
+            code = 137 if killed_itself else result.returncode
+            return ExecResult(code, stdout, _append(stderr, kills[-1].message()))
         if result.returncode != 0 and not self._container_alive():
             self._mark_lost(stderr)
         return ExecResult(result.returncode, stdout, stderr)
