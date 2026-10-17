@@ -44,6 +44,7 @@ services always get a copy.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import re
@@ -72,7 +73,7 @@ from .sandbox import (
     make_owner_writable,
     poll,
 )
-from .sessions import Session, remove_tree
+from .sessions import Session, leased, remove_tree
 from .types import SandboxError, SandboxSnapshot, SandboxStartError
 
 KEEPALIVE_STARTSCRIPT = """\
@@ -98,6 +99,11 @@ OVERLAY_RECORD = (
 )
 #: A snapshot of a fuse-overlay sandbox: its upper layer (``upper/``), and the template it lies over (``lower``).
 OVERLAY_SNAPSHOT_FORMAT = "hpc-sandbox/fuse-overlay-v1"
+# The type a fuse-overlayfs mount has in the mount table, the name of its daemon, and where a session's (or its
+# trash entry's) rootfs lies.
+OVERLAY_FSTYPE = "fuse.fuse-overlayfs"
+OVERLAY_DAEMON = "fuse-overlayfs"
+_SESSION_ROOTFS = re.compile(r".*/hpcsb-[0-9a-f]{32}(\.[0-9]+-[0-9]+\.[0-9a-f]{8})?/rootfs")
 _PID_WAIT_S = 5.0
 _UNMOUNT_TIMEOUT_S = 30.0
 
@@ -316,6 +322,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
                 await asyncio.shield(asyncio.to_thread(remove_tree, work))
                 raise
         return final / "rootfs"
+
+    async def _sweep_node(self) -> list[str]:
+        return await unmount_dead_overlays()
 
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
         if record is not None and record.get("instance_pid_file") != str(path / PID_FILE):
@@ -605,6 +614,82 @@ async def unmount_overlay(session_path: Path) -> bool:
         if not _mounted(mountpoint):
             return True
     raise SandboxError(f"could not unmount the overlay at {mountpoint}: {result.detail()}")
+
+
+async def unmount_dead_overlays() -> list[str]:
+    """Unmount this user's session overlays whose fuse-overlayfs died, wherever they lie; returns errors.
+
+    A killed job takes its fuse-overlayfs processes with it but leaves their
+    mounts in the node's mount table, where they count towards fusermount's
+    ``mount_max`` (FUSE mounts of every user on the node), and its scratch
+    root is often per job, so no janitor sweeps its sessions again. An overlay
+    is dead when nobody holds its session's lease, no fuse-overlayfs of this
+    user serves it and it answers ``ENOTCONN``.
+    """
+    dead = await asyncio.to_thread(lambda: _dead_overlays(Path("/proc/self/mountinfo").read_text()))
+    if not dead:
+        return []
+    unmount = shutil.which("fusermount3") or shutil.which("fusermount")
+    if unmount is None:
+        return [f"cannot unmount {len(dead)} dead overlays: fusermount3 is not on PATH"]
+    errors = []
+    for mountpoint in dead:
+        result = await run_process([unmount, "-u", "-z", mountpoint], timeout_s=_UNMOUNT_TIMEOUT_S)
+        if result.returncode != 0 or result.timed_out:
+            errors.append(f"could not unmount the dead overlay at {mountpoint}: {result.detail()}")
+    return errors
+
+
+def _dead_overlays(mountinfo: str) -> list[str]:
+    owner = f"user_id={os.getuid()}"
+    candidates = []
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if "-" not in fields:
+            continue
+        kind = fields[fields.index("-") + 1 :]
+        mountpoint = _unescape(fields[4])
+        if (
+            len(kind) == 3
+            and kind[0] == OVERLAY_FSTYPE
+            and owner in kind[2].split(",")
+            and _SESSION_ROOTFS.fullmatch(mountpoint)
+            and not leased(Path(mountpoint).parent)
+        ):
+            candidates.append(mountpoint)
+    if not candidates:
+        return []
+    served = _served_overlays()
+    dead = []
+    for mountpoint in candidates:
+        if mountpoint in served:
+            continue
+        try:
+            os.stat(mountpoint)  # a live daemon answers; a dead one's mount cannot
+        except OSError as error:
+            if error.errno == errno.ENOTCONN:
+                dead.append(mountpoint)
+    return dead
+
+
+def _served_overlays() -> set[str]:
+    """The real paths of the mount points this user's fuse-overlayfs processes serve."""
+    served = set()
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+        except OSError:
+            continue
+        argv = procfs.argv(int(entry.name))
+        if argv and len(argv) > 1 and os.path.basename(argv[0]) == OVERLAY_DAEMON:
+            target = argv[-1]
+            served.add(
+                os.path.join(os.path.realpath(os.path.dirname(target)), os.path.basename(target))
+            )
+    return served
 
 
 class SingularityService(PodService, SingularitySandbox):

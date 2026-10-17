@@ -3,9 +3,15 @@ an unprivileged instance, unmounted before its session is deleted (by its owner 
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 import os
+import shutil
+import signal
+import subprocess
 import sys
+from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,11 +19,23 @@ import pytest
 from conftest import FakeRuntime, in_mount_namespace, make_provider, namespaces_unavailable
 from test_janitor import crashed_sandboxes
 
-from hpc_sandbox import PodSpec, SandboxSnapshot, SandboxSpec, SandboxStartError, ServiceSpec
+from hpc_sandbox import (
+    PodSpec,
+    SandboxSnapshot,
+    SandboxSpec,
+    SandboxStartError,
+    ServiceSpec,
+    procfs,
+)
 from hpc_sandbox import singularity as singularity_module
 from hpc_sandbox.singularity import OVERLAY_RECORD, OVERLAY_SNAPSHOT_FORMAT, TEMPLATE_DIR
 
 FAKE_FUSE = Path(__file__).with_name("fake_fuse.py")
+SFTP_SERVERS = (
+    "/usr/lib/openssh/sftp-server",
+    "/usr/libexec/openssh/sftp-server",
+    "/usr/lib/sftp-server",
+)
 
 
 @pytest.fixture
@@ -34,6 +52,43 @@ def fake_fuse(tmp_path: Path, fake_runtime: FakeRuntime, monkeypatch: pytest.Mon
 
     monkeypatch.setattr(singularity_module, "_mounted", mounted)
     return fake_runtime.state
+
+
+@pytest.fixture
+def sshfs(tmp_path: Path) -> Iterator[Callable[[Path], int]]:
+    """Mount real FUSE file systems, which sshfs over a local sftp-server makes as fuse-overlayfs does."""
+    binary = shutil.which("sshfs")
+    server = next((path for path in SFTP_SERVERS if os.access(path, os.X_OK)), None)
+    if binary is None or server is None or shutil.which("fusermount3") is None:
+        pytest.skip("needs sshfs, an sftp-server and fusermount3")
+    if not os.access("/dev/fuse", os.R_OK | os.W_OK):
+        pytest.skip("needs /dev/fuse")
+    wrapper = tmp_path / "sftp.sh"
+    wrapper.write_text(f"#!/bin/sh\nexec {server}\n")
+    wrapper.chmod(0o755)
+    served = tmp_path / "served"
+    served.mkdir()
+    mounted: list[Path] = []
+
+    def mount(mountpoint: Path) -> int:
+        """Mount at ``mountpoint``; the PID of its daemon."""
+        mountpoint.mkdir(parents=True)
+        source = f"localhost:{served}"
+        command = [binary, "-o", f"ssh_command={wrapper}", source, str(mountpoint)]
+        subprocess.run(command, check=True, timeout=30)
+        mounted.append(mountpoint)
+        (daemon,) = [
+            int(pid)
+            for pid in os.listdir("/proc")
+            if pid.isdigit() and procfs.argv(int(pid)) == command
+        ]
+        return daemon
+
+    yield mount
+    for mountpoint in mounted:
+        subprocess.run(
+            ["fusermount3", "-u", "-z", str(mountpoint)], capture_output=True, check=False
+        )
 
 
 def fuse_calls(state: Path) -> list[list[str]]:
@@ -116,6 +171,54 @@ print([_mounted(path) for path in paths])
 """
     output = in_mount_namespace(script, str(real), str(tmp_path / "link"), os.path.relpath(real))
     assert output.splitlines() == ["[False, False, False]", "[True, True, True]"]
+
+
+async def test_janitors_unmount_dead_overlays_wherever_they_lie(tmp_path, sshfs, monkeypatch):
+    monkeypatch.setattr(singularity_module, "OVERLAY_FSTYPE", "fuse.sshfs")
+    monkeypatch.setattr(singularity_module, "OVERLAY_DAEMON", "sshfs")
+    sessions = tmp_path / "a-killed-job" / "sessions"
+    dead = sessions / f"hpcsb-{'a' * 32}" / "rootfs"
+    trashed = sessions / ".trash" / f"hpcsb-{'b' * 32}.12-345.0123abcd" / "rootfs"
+    live = sessions / f"hpcsb-{'c' * 32}" / "rootfs"
+    leased = sessions / f"hpcsb-{'d' * 32}" / "rootfs"  # its owner unmounts it
+    other = tmp_path / "not-a-session" / "rootfs"
+    daemons = {path: sshfs(path) for path in (dead, trashed, live, leased, other)}
+    lease = os.open(leased.parent / ".lease", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lease, fcntl.LOCK_EX)
+    try:
+        for path in (dead, trashed, leased, other):
+            os.kill(daemons[path], signal.SIGKILL)
+        for path in (dead, trashed, leased, other):
+            while procfs.start_time(daemons[path]) is not None:
+                await asyncio.sleep(0.05)
+        assert await singularity_module.unmount_dead_overlays() == []
+        mounted = {path.parent.name[:7]: singularity_module._mounted(path) for path in daemons}
+        assert mounted == {
+            "hpcsb-a": False,
+            "hpcsb-b": False,
+            "hpcsb-c": True,
+            "hpcsb-d": True,
+            "not-a-s": True,
+        }
+    finally:
+        os.close(lease)
+
+
+async def test_janitors_and_first_starts_look_for_dead_overlays(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    calls = []
+
+    async def looking() -> list[str]:
+        calls.append(len(calls))
+        return ["an error"]
+
+    monkeypatch.setattr(singularity_module, "unmount_dead_overlays", looking)
+    provider = make_provider(tmp_path)
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    await sandbox.stop()
+    report = await provider.reap()
+    assert calls == [0, 1] and report.errors == ["an error"]
 
 
 async def test_a_fuse_overlay_snapshot_is_its_upper_layer_and_restores_over_the_template(

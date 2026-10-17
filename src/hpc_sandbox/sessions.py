@@ -145,6 +145,21 @@ def _lease(root: Path, name: str) -> Session:
     return Session(name, path, lease)
 
 
+def leased(path: Path) -> bool:
+    """Whether a live process holds the lease of the session directory ``path``."""
+    try:
+        descriptor = os.open(path / LEASE_FILE, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(descriptor)
+    return False
+
+
 def remove_session(session: Session) -> None:
     """Delete a stopped session's directory and drop its lease.
 

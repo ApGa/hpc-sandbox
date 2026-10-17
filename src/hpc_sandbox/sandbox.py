@@ -290,6 +290,7 @@ class SessionProvider(Generic[S]):
             report.removed += swept.removed
             report.live += swept.live
             report.errors += swept.errors
+        report.errors += await self._sweep_node()
         return report
 
     def _swept_roots(self) -> list[tuple[Path, bool, Stopper]]:
@@ -328,6 +329,10 @@ class SessionProvider(Generic[S]):
     def _session_roots(self) -> list[tuple[Path, bool]]:
         """Directories janitors sweep, and whether they claim sessions of no known provider."""
         return [(self.session_root, True)]
+
+    async def _sweep_node(self) -> list[str]:
+        """Recover what abandoned sessions left outside any session root; returns errors."""
+        return []
 
     async def wait_for_deletions(self, timeout_s: float = 300.0) -> bool:
         """Wait until the session files of the sandboxes this process stopped are deleted; False on timeout."""
@@ -479,6 +484,8 @@ class SessionProvider(Generic[S]):
                 continue
             for error in report.errors:
                 log.warning("hpc-sandbox janitor: %s", error)
+        for error in await self._sweep_node():
+            log.warning("hpc-sandbox janitor: %s", error)
         self._swept = swept
 
     async def _copy_snapshot(self, source: Path, session: Session) -> None:
