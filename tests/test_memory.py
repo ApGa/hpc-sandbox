@@ -1,5 +1,5 @@
-"""The memory watchdog's choice: the smallest subtree whose memory alone ends a breach, so a harness survives the
-command that ran away however that command spread its memory."""
+"""The memory watchdog's choice: the subtree the memory leads down to, so a harness survives the command that ran
+away however that command spread its memory, and a small process beside the memory survives a small excess."""
 
 from __future__ import annotations
 
@@ -53,9 +53,45 @@ def test_memory_spread_over_independent_trees_kills_the_largest_and_samples_agai
     processes = tree((1, None, 1), (2, 1, 1000), (3, 1, 1200), (4, 1, 1100), protected=(1,))
     kill = choose_victim(processes, 2000 * MB)
     assert kill is not None and kill.pids == (3,)
-    # With a smaller excess, the smallest subtree that holds it.
+    # With a smaller excess, which each of them holds, still the largest.
     kill = choose_victim(processes, 3000 * MB)
-    assert kill is not None and kill.pids == (2,)
+    assert kill is not None and kill.pids == (3,)
+
+
+def test_a_small_excess_kills_the_process_that_holds_the_memory():
+    """At the first sample over the limit the excess is often small, and fits in any small process: the keep-alive
+    loop's sleep, a sleep in the command's pipeline. The memory is in the hog. (A real Singularity instance and exec:
+    sinit and the keep-alive loop are protected; PSS in KiB.)"""
+    rows = [
+        (1, None, 19348, None, True),  # sinit
+        (2, 1, 289, None, True),  # /bin/sh /.singularity.d/startscript
+        (3, 2, 259, None, False),  # sleep 86400
+        (10, None, 9416, 10, False),  # Singularity runtime parent (the exec)
+        (11, 10, 19870, 10, False),  # the command, a shell holding 20 MB
+        (12, 11, 252, 10, False),  # sleep 25, in its pipeline
+        (13, 11, 97951, 10, False),  # tail -c 100000000, the hog
+    ]
+    processes = [
+        _Process(pid, str(pid), kib * 1024, exec_root, protected, parent)
+        for pid, parent, kib, exec_root, protected in rows
+    ]
+    total = sum(process.pss_bytes for process in processes)
+    for excess_kib in (4, 64, 256, 1024, 65536):
+        kill = choose_victim(processes, total - excess_kib * 1024)
+        assert kill is not None and (kill.pids, kill.exec_root) == ((13,), 10), excess_kib
+
+
+def test_a_bystander_smaller_than_the_hog_survives_a_small_excess():
+    # A hog growing under a shell, next to an independent 300 MB process, first sampled 50 MB over the limit.
+    processes = tree((1, None, 1), (2, 1, 2), (3, 2, 2800), (4, 1, 300), protected=(1,))
+    kill = choose_victim(processes, 3053 * MB)
+    assert kill is not None and kill.pids == (3,)
+
+
+def test_of_two_hogs_under_a_harness_one_goes_and_the_harness_stays():
+    processes = tree((1, None, 1), (2, 1, 200), (3, 2, 2000), (4, 2, 1900), protected=(1,))
+    kill = choose_victim(processes, 4000 * MB)
+    assert kill is not None and kill.pids == (3,)
 
 
 def test_protected_processes_are_never_chosen_and_nothing_under_the_limit_is():

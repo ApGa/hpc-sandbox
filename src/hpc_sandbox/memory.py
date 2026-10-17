@@ -5,18 +5,24 @@ sampling the proportional set size (PSS) of its processes: the instance's
 process tree plus the tree of every active ``exec`` (exec'd commands join the
 instance's namespaces but stay host-side children of their ``exec`` call).
 
-On a breach the watchdog kills the smallest process subtree whose memory alone
-brings the sandbox back under its limit: a process and all of its descendants.
-That is the command that ran away, however its memory is spread: one process
-that grew, or a pool of workers that are each smaller than their grandparent
-(``make -j``, ``pytest -n``, joblib's ``n_jobs=-1``, sized by the node's CPU
-count). A process that runs commands (an agent's harness in the sandbox)
-survives the command that ran away, unless it holds the excess itself. When no
-single subtree holds the excess (the memory is spread over several independent
-commands), the largest subtree is killed, and the next sample decides again.
-The instance's process and its direct children (the container's init and the
-keep-alive loop) are never killed. This is a best-effort guard, not a hard
-limit; usage can overshoot between samples.
+On a breach the watchdog follows the memory down and kills a process subtree
+(a process and all of its descendants): it starts from the largest subtree that
+no other killable process contains (an exec's whole tree, or one that the
+container's init or keep-alive loop runs) and moves into the child subtree that
+holds the most, as long as that child alone holds the excess. That is the
+command that ran away, however its memory is spread: one process that grew, or
+a pool of workers that are each smaller than their grandparent (``make -j``,
+``pytest -n``, joblib's ``n_jobs=-1``, sized by the node's CPU count), where it
+stops at the pool's parent once no single worker holds the excess. A process
+that runs commands (an agent's harness in the sandbox) survives the command
+that ran away, unless it holds the excess itself, and a small process beside
+the memory (the keep-alive loop's ``sleep``, a helper in a pipeline) is never
+taken for it because a small excess, as at the first sample over the limit,
+would fit in it. When no subtree holds the excess (it is spread over several
+independent commands), the largest subtree is killed, and the next sample
+decides again. The instance's process and its direct children (the container's
+init and the keep-alive loop) are never killed. This is a best-effort guard,
+not a hard limit; usage can overshoot between samples.
 """
 
 from __future__ import annotations
@@ -103,19 +109,24 @@ def choose_victim(processes: list[_Process], limit_bytes: int) -> MemoryKill | N
         if process.parent is not None:
             children.setdefault(process.parent, []).append(process)
     held: dict[int, int] = {}
-    depth: dict[int, int] = {}
-    for process in processes:  # parents come first
-        depth[process.pid] = depth.get(process.parent, -1) + 1 if process.parent is not None else 0
     for process in reversed(processes):  # children are summed before their parents
         held[process.pid] = process.pss_bytes + sum(
             held[child.pid] for child in children.get(process.pid, ())
         )
     excess = total - limit_bytes
-    covering = [process for process in candidates if held[process.pid] >= excess]
-    if covering:  # the deepest culprit: the smallest subtree whose end alone ends the breach
-        victim = min(covering, key=lambda process: (held[process.pid], -depth[process.pid]))
-    else:  # spread over independent subtrees: the largest, then the next sample decides again
-        victim = max(candidates, key=lambda process: held[process.pid])
+    # From the largest subtree that no other candidate contains (an exec's tree, or one that the
+    # container's init or keep-alive loop runs) down into the child that holds the most, while that
+    # child alone holds the excess. A small excess fits in any small process; it is the memory that
+    # leads to the victim. Spread over subtrees that each hold less: the largest, and sample again.
+    killable = {process.pid for process in processes if not process.protected}
+    roots = [process for process in candidates if process.parent not in killable]
+    victim = max(roots, key=lambda process: held[process.pid])
+    while True:
+        below = [child for child in children.get(victim.pid, ()) if not child.protected]
+        heaviest = max(below, key=lambda process: held[process.pid], default=None)
+        if heaviest is None or held[heaviest.pid] < excess:
+            break
+        victim = heaviest
     pids: list[int] = []
     pending = [victim]
     while pending:
