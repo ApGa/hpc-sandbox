@@ -115,6 +115,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     pull.set_defaults(handler=_pull)
 
+    fetch = commands.add_parser(
+        "fetch-tools",
+        help="download the pinned slirp4netns pods use for egress when the host has none",
+    )
+    fetch.add_argument("--arch", help="machine architecture (default: this one's)")
+    fetch.set_defaults(handler=_fetch_tools)
+
     janitor = commands.add_parser(
         "janitor", parents=[common], help="stop and remove abandoned sessions on this node"
     )
@@ -204,6 +211,14 @@ async def _pull(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _fetch_tools(args: argparse.Namespace) -> int:
+    from .tools import SLIRP4NETNS_VERSION, fetch_slirp4netns
+
+    path = await asyncio.to_thread(fetch_slirp4netns, args.arch)
+    print(json.dumps({"tool": "slirp4netns", "version": SLIRP4NETNS_VERSION, "path": str(path)}))
+    return 0
+
+
 async def _janitor(args: argparse.Namespace) -> int:
     labels = _pairs(args.label, "--label") or None
     report = JanitorReport()
@@ -277,6 +292,10 @@ async def _doctor(args: argparse.Namespace) -> int:
         if _reflink_works(provider.scratch_root)
         else "no (snapshots copy data)",
     )
+    try:
+        report.line("ok", "pods: egress", f"slirp4netns {provider.slirp4netns()}")
+    except SandboxError as error:
+        report.line("warn", "pods: egress", str(error))
     if args.image:
         await _smoke(report, provider, args.image)
     return 1 if report.failures else 0

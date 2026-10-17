@@ -77,6 +77,17 @@ def instance_start_time(pid: int, name: str) -> str | None:
     return owned_live_start_time(pid)
 
 
+def argv(pid: int) -> list[str] | None:
+    """The arguments of ``pid``, None if unreadable (or a zombie's)."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return [os.fsdecode(part) for part in raw.rstrip(b"\0").split(b"\0")]
+
+
 def cmdline(pid: int) -> str | None:
     """The command line of ``pid`` with arguments joined by spaces."""
     try:

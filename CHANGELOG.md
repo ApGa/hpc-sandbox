@@ -23,6 +23,16 @@
 
 ### Added
 
+- **Pods**: services sharing one network, like a docker-compose project.
+  `provider.start_pod(PodSpec(...))` returns a pod; `pod.start_service(
+  ServiceSpec(...), wait="started" | "healthy")` starts each service, with
+  compose healthchecks (`HealthCheck`), `health()`, `logs()`, upstream relays
+  to host Unix sockets (`pod.routes`), `set_network("none" | "egress")` and
+  `stop()`. Both providers have the `pods` capability. See the README's Pods
+  section.
+- **`python -m hpc_sandbox fetch-tools`** downloads the pinned slirp4netns
+  pods use for egress, for hosts that have none; providers take a
+  `slirp4netns` path and a `service_stop_grace_s`.
 - **`MemoryKill.processes` and `MemoryKill.tmpfs_bytes`**: how many processes
   the killed branch held, and how much the sandbox's own tmpfs mounts held
   (memory no kill frees). `MemoryKill.pid` and `pss_bytes` now describe the
@@ -36,6 +46,12 @@
   asyncio waits forever when the creation of a subprocess is cancelled while
   what it started keeps its output open (as commands behind `nsenter` do);
   cancelled `exec` calls and teardowns could hang that way.
+- **A janitor sweep no longer stalls a process starting or stopping many
+  sandboxes.** Session directories were created and removed in worker threads
+  that waited for the janitor's lock, while the sweep holding it needed a
+  worker thread too.
+- **A start cancelled while its session directory is created leaves nothing**:
+  the directory and its lease were kept until the process exited.
 
 ## 0.2.0
 

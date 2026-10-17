@@ -81,7 +81,8 @@ the runtime underneath.
 | `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the scratch and cache filesystems, free space, staging and reflink support, and what matters for the runtime: for Singularity/Apptainer the site settings (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices); for enroot whether namespaces can be created, whether imports can convert layer whiteouts, whether this process runs inside a container, and the site's `enroot.conf` and hooks. With `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
 | `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
 | `python -m hpc_sandbox pull [--refresh] IMAGE...` | Pulls images into the image cache unless cached, and checks local image files, printing on stdout only one JSON line per image, with the stable keys `reference`, `path`, `sha256` (of the image file) and `manifest_digest` (from a digest-pinned remote reference, else null); logs go to stderr. `--refresh` pulls tags again; sandboxes started afterwards get the new image, and starts never wait for a refresh. |
-| `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless `--runtime` names one, it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
+| `python -m hpc_sandbox fetch-tools [--arch ARCH]` | Downloads the pinned static slirp4netns that pods use for egress when the host has none (`$HPC_SANDBOX_TOOLS`, else `~/.cache/hpc-sandbox/tools`), checks its SHA-256 and prints its path as a JSON line. Run it once where there is internet access; compute nodes need none. |
+| `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes and pods abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless `--runtime` names one, it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
 
 All commands take `--runtime auto|singularity|enroot` (default
 `$HPC_SANDBOX_RUNTIME`, else the first of `singularity`, `apptainer` and
@@ -310,6 +311,101 @@ long-lived `enroot start` whose command is a keep-alive loop.
   abandoned session already gone, kills any survivor whose start time and
   command line still match, and removes the files.
 
+## Pods
+
+A pod runs several services that share one network, like a docker-compose
+project: an agent's container plus the databases, MCP servers or judges it
+reaches by name on fixed ports. Both providers run pods (capability `pods`).
+
+```python
+from hpc_sandbox import EnrootProvider, HealthCheck, PodSpec, SandboxSpec, ServiceSpec
+
+provider = EnrootProvider()
+pod = await provider.start_pod(PodSpec(
+    network="none",                                       # or "egress"
+    upstreams={"gateway": "unix:///path/to/gateway.sock"},  # in the pod: pod.routes["gateway"]
+    labels={"rollout_id": "r42"},
+))
+async with pod:                                           # stopped when the block exits
+    await pod.start_service(ServiceSpec(
+        "judge",
+        SandboxSpec(image="docker://ghcr.io/org/judge:1", env={"MODE": "strict"}),
+        command=["python", "-m", "judge", "--port", "8082"],
+        healthcheck=HealthCheck(["CMD-SHELL", "curl -fs localhost:8082/health"], start_period_s=60),
+    ), wait="healthy")
+    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image="docker://python:3.12-slim")))
+    result = await main.exec(["curl", "-s", "http://judge:8082/"])
+    print(await pod.health("judge"), await pod.logs("judge"))
+    await pod.set_network("egress")                       # for example for a verifier phase
+```
+
+- **Holder.** A small process owns the pod's user namespace (your uid and
+  gid mapped to root, `setgroups` denied) and its network namespace, which
+  has only an up loopback interface. It lets the pod's root bind ports below
+  1024 and send ICMP echo requests, as Docker does, and relays each upstream:
+  `127.0.0.1:<port>` in the pod (18080, 18081... in order, unless
+  `upstream_ports` says otherwise; `pod.routes` has the URLs) to the host's
+  Unix socket. The ports are bound on both loopback addresses before any
+  service starts, without `SO_REUSEPORT`, so no service can take one over;
+  half-closed connections and long streams pass through, and nothing outside
+  the pod can reach the ports.
+- **Services.** Each service is a sandbox: its `SandboxSpec` gives the image,
+  workdir, environment, mounts and `memory_mb` (its `network` is the pod's).
+  Its container joins the pod's namespaces with mount, PID, IPC and UTS
+  namespaces of its own. PID 1 is a small init that sets the hostname (the
+  service's name), `ulimits` (within the hard limits of the host process;
+  `nproc` and `locks` are accepted but not applied: `nproc` would count every
+  process of the pod, and under Docker it does not bind root either) and a
+  `/dev/shm` of `shm_mb` (64 MiB unless given, as with Docker), runs the
+  runtime as its child, passes SIGTERM, SIGINT and SIGHUP on, and exits with
+  the command's status. The runtime puts root in a nested user namespace,
+  which holds no capability over the pod's network: services can neither
+  reconfigure it nor open raw sockets to watch each other's traffic. The
+  command (`command`, or an idle loop for a service such as `main` that only
+  runs `exec`) gets the image's environment, `HOME=/root`, then the spec's
+  `env`, none of it on a command line; its working directory is created when
+  missing, its stdin is `/dev/null`, and its output goes through a pipe into a
+  log file, whose tail `logs()` returns.
+- **Names.** Each service's own `/etc/hosts` maps `localhost`, its name and
+  the names of the other services to 127.0.0.1, and gains the names of
+  services that start later; `/etc/resolv.conf` names slirp4netns's resolver,
+  `10.0.2.3`. On Debian-based images apt runs as root
+  (`APT::Sandbox::User "root"`): with one mapped id it cannot switch to
+  `_apt`.
+- **Commands** (`exec`, transfers, healthchecks) enter a service in two steps,
+  the pod's user and network namespaces and then the container's own, so they
+  too run as root of the nested user namespace, in a few milliseconds, with
+  the service's `ulimits`.
+- **Health.** `HealthCheck` reads like docker-compose's: `test` is
+  `["CMD", ...]`, `["CMD-SHELL", "..."]`, a shell string or `["NONE"]`, and
+  `interval_s`, `timeout_s`, `retries`, `start_period_s` and
+  `start_interval_s` work as there. `health(name)` is `starting`, `healthy`,
+  `unhealthy`, or `exited` once the service's command exited, whatever else
+  answers the check (`service.exit_status` holds its status); a service
+  without a healthcheck is healthy while it runs. `wait="healthy"` waits up to
+  `start_timeout_s` and stops the service and raises `SandboxStartError` if it
+  turns unhealthy or exits first.
+- **Egress.** `network="egress"` (or `set_network("egress")`) adds
+  slirp4netns with `--disable-host-loopback --enable-sandbox
+  --enable-seccomp`: services reach other hosts through the gateway
+  `10.0.2.2`, resolve names through `10.0.2.3`, and never reach the host's
+  loopback. Only the holder keeps slirp4netns's exit pipe open, so it ends with
+  the pod; `set_network("none")` removes it. slirp4netns is the one given as
+  the `slirp4netns` option, else the one on `PATH` if it has these options,
+  else the pinned static release that `python -m hpc_sandbox fetch-tools`
+  downloads once and checks against its SHA-256.
+- **Lifetime.** `pod.stop()` is idempotent and shielded from cancellation like
+  `Sandbox.stop()`: it cancels service starts in progress, gives services
+  `service_stop_grace_s` (default 0) after SIGTERM, then kills them,
+  slirp4netns and the holder, and deletes the pod's session directory, which
+  holds the services' sessions. Failed and cancelled starts leave nothing.
+  Once the holder is gone, calls raise `SandboxLostError`. When the owning
+  process dies, everything of its pods dies with it; `reap(labels)` stops
+  matching live pods, and the janitor removes the files.
+
+On enroot a pod starts in about 0.1 s and a service in about 0.3 s; 64 pods
+of two services each, started together on 8 cores, took about 6 s apiece.
+
 ## Configuration
 
 Options both providers take:
@@ -327,6 +423,8 @@ Options both providers take:
 | `extra_start_args` | () | Extra `instance start` / `enroot start` flags. |
 | `output_limit_bytes` | 16 MiB | Captured bytes per stream and command. |
 | `memory_poll_s` | 1.0 | Watchdog sampling interval. |
+| `slirp4netns` | see Pods | The slirp4netns executable for pods with egress. |
+| `service_stop_grace_s` | 0 | How long pod services get between SIGTERM and SIGKILL when their pod stops. |
 
 `SingularityProvider` only:
 
@@ -362,8 +460,8 @@ builds never fill a small `/tmp` or a quota-limited home. Singularity bind
 variables (`SINGULARITY_BIND`, ...), `SINGULARITYENV_*`/`APPTAINERENV_*` and
 `*_CONFIGDIR` are removed from the runtime's environment.
 
-Capabilities: `{"snapshot", "isolation"}`, plus `network_none` and `gpu` as
-described above. Isolation means private PID/IPC namespaces, root filesystem,
+Capabilities: `{"snapshot", "isolation", "pods"}`, plus `network_none` and
+`gpu` as described above. Isolation means private PID/IPC namespaces, root filesystem,
 `/tmp` and environment; it is not a security boundary against code running
 as your uid with host networking.
 
@@ -429,6 +527,21 @@ enroot:
   `doctor` lists the site's hooks and which standard ones sandboxes get; a
   standard hook the installation lacks or has disabled is skipped.
 
+Pods:
+
+- **Requirements.** Unprivileged user namespaces that nest (the pod's, then
+  each service's), util-linux `nsenter`, and `prlimit` for services with
+  `ulimits`. Egress needs `/dev/net/tun` usable by users (it usually is) and
+  slirp4netns, the site's or the pinned one (`fetch-tools`); the site's gets
+  its distribution's security fixes, the pinned one only when this package
+  moves its pin.
+- **Singularity CE / Apptainer** services run `singularity exec --cleanenv
+  --no-eval --writable --containall --no-home --no-mount home,cwd,bind-paths`
+  on a rootfs directory, in a user namespace the launcher creates, so the
+  runtime runs unprivileged (its non-setuid starter) even where it is
+  installed setuid; `/etc/hosts`, `/etc/resolv.conf` and `/dev/shm` are bound
+  into the container. Pods never use `--network none`.
+
 Both:
 
 - **Paths.** Keep the image cache on shared storage that supports `flock` and
@@ -443,7 +556,8 @@ Both:
 
 ```bash
 python -m pytest                       # unit tests, no container runtime needed
-HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_integration.py -v   # compute node
+HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_integration.py -v        # compute node
+HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_pods_integration.py -v   # compute node
 ```
 
 Unit tests put a fake `singularity` (`tests/fake_singularity.py`) and a fake
@@ -456,12 +570,18 @@ checks, the janitor, the watchdog, timeouts and cancellation are exercised
 with real processes. The integration tests need a compute node (never run
 containers on a login node); `HPC_SANDBOX_TEST_RUNTIME` selects the runtime
 (`singularity`, `enroot`, or `auto` as on the command line) and
-`HPC_SANDBOX_TEST_IMAGE` the image (default `docker://alpine:3.20`).
+`HPC_SANDBOX_TEST_IMAGE` the image (default `docker://alpine:3.20`). The pod
+tests run `HPC_SANDBOX_TEST_POD_IMAGE` (default `docker://alpine:3.20`) and
+`HPC_SANDBOX_TEST_APT_IMAGE` (default `docker://python:3.12-slim`), start
+`HPC_SANDBOX_TEST_PODS` pods at once (default 16) and check egress where
+slirp4netns is found.
 
 ## Not yet
 
 - an ext3 overlay mode as an alternative to rootfs directories;
-- memory snapshots, and per-node PID namespaces inside one shared sandbox.
+- memory snapshots, and per-node PID namespaces inside one shared sandbox;
+- for pods: snapshots, GPUs, services that switch to other users (that needs
+  subordinate id ranges), host networking and egress allowlists.
 
 ## License
 

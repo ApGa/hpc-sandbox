@@ -7,6 +7,7 @@ adapters to other sandbox interfaces only need these field and method names.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -141,6 +142,104 @@ class SandboxProvider(Protocol):
     async def start(self, spec: SandboxSpec) -> Sandbox: ...
 
     async def restore(self, snapshot: SandboxSnapshot, spec: SandboxSpec) -> Sandbox: ...
+
+
+PodNetwork = Literal["none", "egress"]
+ServiceHealth = Literal["starting", "healthy", "unhealthy", "exited"]
+
+
+@dataclass
+class HealthCheck:
+    """A docker-compose healthcheck, run in the service like ``exec``.
+
+    ``test`` is ``["CMD", program, arg...]``, ``["CMD-SHELL", command]`` or a
+    shell command. A check that exits 0 within ``timeout_s`` passes. The
+    service is healthy after a pass, and unhealthy after ``retries`` failures in
+    a row, not counting failures within ``start_period_s`` of the start, during
+    which checks run every ``start_interval_s`` instead of ``interval_s``.
+    """
+
+    test: list[str] | str
+    interval_s: float = 30.0
+    timeout_s: float = 30.0
+    retries: int = 3
+    start_period_s: float = 0.0
+    start_interval_s: float = 5.0
+
+
+@dataclass
+class ServiceSpec:
+    """One service of a pod.
+
+    ``sandbox`` gives its image, workdir, environment, mounts and limits (its
+    ``network`` is ignored: services share the pod's). ``command`` is the full
+    argv to run; without one the service keeps running idle, like a sandbox,
+    for ``exec`` (the agent's ``main`` service). ``name`` resolves to 127.0.0.1
+    in every service and is the service's hostname. ``ulimits`` maps resource
+    names (``nofile``, ``stack``...) to ``(soft, hard)``, ``-1`` for unlimited,
+    within the hard limits of the host process; ``nproc`` and ``locks`` are
+    accepted but not applied (``nproc`` would count every process of the pod,
+    and under Docker it does not bind root either).
+    """
+
+    name: str
+    sandbox: SandboxSpec
+    command: list[str] | None = None
+    healthcheck: HealthCheck | None = None
+    shm_mb: int | None = None
+    ulimits: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+
+@dataclass
+class PodSpec:
+    """A group of services sharing one network, like a docker-compose project.
+
+    ``network`` is ``"none"`` (loopback only) or ``"egress"`` (outbound access
+    through slirp4netns, never to the host's loopback). Each upstream
+    (``{"gateway": "unix:///path/gw.sock"}``) is reachable in every service at
+    ``127.0.0.1:<port>``, by default 18080, 18081... in order
+    (``upstream_ports`` overrides), relayed to the host's Unix socket.
+    ``labels`` select pods for :meth:`reap` and janitors.
+    """
+
+    network: PodNetwork = "none"
+    upstreams: dict[str, str] = field(default_factory=dict)
+    upstream_ports: dict[str, int] = field(default_factory=dict)
+    labels: dict[str, str] = field(default_factory=dict)
+
+
+@runtime_checkable
+class Pod(Protocol):
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def routes(self) -> Mapping[str, str]: ...  # {"gateway": "http://127.0.0.1:18080"}
+
+    @property
+    def services(self) -> Mapping[str, Sandbox]: ...
+
+    async def start_service(
+        self, spec: ServiceSpec, wait: Literal["started", "healthy"] = "started"
+    ) -> Sandbox: ...
+
+    async def health(self, name: str) -> ServiceHealth: ...
+
+    async def logs(self, name: str) -> str: ...
+
+    async def set_network(self, mode: PodNetwork) -> None: ...
+
+    async def stop(self) -> None: ...
+
+
+@runtime_checkable
+class PodProvider(Protocol):
+    """A provider with the ``pods`` capability."""
+
+    name: str
+    capabilities: frozenset[str]
+
+    async def start_pod(self, spec: PodSpec) -> Pod: ...
 
 
 class SandboxError(RuntimeError):

@@ -2,12 +2,17 @@
 
 It records every invocation and simulates the subset of the CLI hpc-sandbox
 uses: ``pull``, ``sif list``, ``build --sandbox``, ``instance start|list|stop``,
-``exec instance://``, ``--version`` and ``buildcfg``. Instances are real host
-processes titled "Singularity instance: <user> [<name>]", like the real
-ones, so PID identity checks run for real. ``exec`` runs commands on the host:
-``--cwd`` and absolute-path arguments (except the script after ``-c``) are
-mapped onto the instance's binds and rootfs; system directories such as /bin
-and /usr stay host paths.
+``exec instance://``, ``exec DIRECTORY``, ``--version`` and ``buildcfg``.
+Instances are real host processes titled "Singularity instance: <user>
+[<name>]", like the real ones, so PID identity checks run for real. ``exec
+instance://`` runs commands on the host: ``--cwd`` and absolute-path arguments
+(except the script after ``-c``) are mapped onto the instance's binds and
+rootfs; system directories such as /bin and /usr stay host paths. ``exec
+DIRECTORY`` (as pod services run) needs to run as root of a user namespace,
+as it does under hpc-sandbox's launcher: like ``--containall``, it gives the
+command new mount and PID namespaces, the host's system directories, a fresh
+/proc and the binds, then chroots into the directory; a shim init runs the
+command as its child, as SingularityCE's does.
 
 State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_PULL_FAILURES   fail this many pulls first (default 0)
@@ -18,8 +23,10 @@ State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,6 +59,12 @@ VALUED = {
     "-W",
 }
 RECORDED_ENV = ("NVIDIA_VISIBLE_DEVICES",)
+HOST_DIRS = ("bin", "sbin", "usr", "lib", "lib32", "lib64", "libx32")
+HOST_FILES = ("etc/ld.so.cache", "etc/passwd", "etc/group", "etc/nsswitch.conf")
+CLONE_NEWNS, CLONE_NEWPID = 0x00020000, 0x20000000
+MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC = 0x1, 0x2, 0x4, 0x8
+MS_REMOUNT, MS_BIND, MS_REC, MS_PRIVATE = 0x20, 0x1000, 0x4000, 0x40000
+libc = ctypes.CDLL(None, use_errno=True)
 INSTANCE_LOOP = """\
 import signal, sys, time
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -119,8 +132,17 @@ def build(args: list[str]) -> int:
     if root.exists():
         return fail(f"{target} already exists")
     meta = json.loads(Path(source).read_bytes()[len(MAGIC) :] or b"{}")
-    for directory in (".singularity.d/env", "etc", "tmp", "var/tmp"):
+    for directory in (".singularity.d/env", "etc", "tmp", "var/tmp", "proc", "dev", "sys"):
         (root / directory).mkdir(parents=True)
+    for name in HOST_DIRS:  # mount points for the host's, as exec DIRECTORY binds them
+        host = Path("/", name)
+        if host.is_symlink():
+            (root / name).symlink_to(os.readlink(host))
+        elif host.is_dir():
+            (root / name).mkdir()
+    for name in HOST_FILES:
+        if Path("/", name).is_file():
+            shutil.copyfile(Path("/", name), root / name)
     (root / ".singularity.d" / "startscript").write_text("#!/bin/sh\n")
     for name, content in meta.get("files", {}).items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
@@ -219,11 +241,98 @@ class Mapper:
         return self.rootfs + path
 
 
+def check(result: int, what: str) -> None:
+    if result != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"{what}: {os.strerror(errno)}")
+
+
+def mount(source: str, target: Path, fstype: str | None, flags: int, data: str = "") -> None:
+    check(
+        libc.mount(
+            source.encode(),
+            str(target).encode(),
+            fstype.encode() if fstype else None,
+            flags,
+            data.encode() or None,
+        ),
+        f"mount {source} on {target}",
+    )
+
+
+def exec_directory(options: dict[str, list[str]], root: Path, command: list[str]) -> int:
+    if "--writable" not in options or "--containall" not in options:
+        return fail("expected --writable --containall with a sandbox directory")
+    binds = []
+    for spec in options.get("--bind", []):
+        source, target, mode = spec.split(":")
+        if not Path(source).exists():
+            return fail(f"bind source {source} does not exist")
+        if not (root / target.lstrip("/")).exists():
+            return fail(f"destination {target} doesn't exist in container")
+        binds.append((source, root / target.lstrip("/"), mode))
+    check(libc.unshare(CLONE_NEWNS | CLONE_NEWPID), "unshare (exec needs a user namespace)")
+    mount("none", Path("/"), None, MS_REC | MS_PRIVATE)
+    # Like SingularityCE: this process forwards signals to the container's
+    # shim init (PID 1 of its PID namespace), which runs the command as its
+    # child, forwards signals to it, reaps orphans and exits with its status.
+    shim = os.fork()
+    if shim:
+        return _supervise(shim)
+    try:
+        for name in HOST_DIRS:
+            target = root / name
+            if target.is_dir() and not target.is_symlink():
+                mount(f"/{name}", target, None, MS_BIND | MS_REC)
+        mount("proc", root / "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC)
+        mount("/dev", root / "dev", None, MS_BIND | MS_REC)
+        for source, target, mode in binds:
+            mount(source, target, None, MS_BIND)
+            if mode == "ro":
+                flags = MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV
+                mount("none", target, None, flags)
+        os.chroot(root)
+        os.chdir("/")
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C", "SINGULARITY_CONTAINER": "x"}
+        payload = os.fork()
+        if payload == 0:
+            os.execvpe(command[0], command, env)
+        os._exit(_supervise(payload, reap_all=True))
+    except OSError as error:
+        print(f"FATAL:   {error}", file=sys.stderr)
+    os._exit(255)
+
+
+def _supervise(child: int, *, reap_all: bool = False) -> int:
+    """Forward SIGTERM, SIGINT and SIGHUP to ``child``; return its status as a shell would."""
+    for forwarded in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(forwarded, lambda signum, _frame: _forward(child, signum))
+    while True:
+        try:
+            pid, status = os.waitpid(-1 if reap_all else child, 0)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            return 255
+        if pid == child:
+            code = os.waitstatus_to_exitcode(status)
+            return 128 - code if code < 0 else code
+
+
+def _forward(child: int, signum: int) -> None:
+    try:
+        os.kill(child, signum)
+    except ProcessLookupError:
+        pass
+
+
 def exec_(args: list[str]) -> int:
     options, rest = parse(args)
     target, command = rest[0], rest[1:]
+    if Path(target).is_dir():
+        return exec_directory(options, Path(target), command)
     if not target.startswith("instance://"):
-        return fail("only instance:// execs are simulated", 99)
+        return fail("only instance:// and directory execs are simulated", 99)
     path = INSTANCES / f"{target.removeprefix('instance://')}.json"
     record = json.loads(path.read_text()) if path.exists() else None
     if record is None or not alive(record["pid"]):

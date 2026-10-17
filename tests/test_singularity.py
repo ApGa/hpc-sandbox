@@ -33,7 +33,7 @@ def option_values(argv: list[str], flag: str) -> list[str]:
 async def test_provider_and_sandbox_satisfy_the_protocols(provider, sif):
     assert isinstance(provider, SandboxProvider)
     assert provider.name == "singularity"
-    assert provider.capabilities == {"snapshot", "isolation"}
+    assert provider.capabilities == {"snapshot", "isolation", "pods"}
     sandbox = await provider.start(SandboxSpec(image=str(sif)))
     assert isinstance(sandbox, Sandbox)
 
@@ -211,7 +211,7 @@ async def test_mounts_are_bound_with_targets_created(provider, sif, tmp_path, fa
 
 async def test_optional_runtime_flags(tmp_path, sif, fake_runtime):
     provider = make_provider(tmp_path, allow_network_none=True, gpu="nv", cgroup_limits=True)
-    assert provider.capabilities == {"snapshot", "isolation", "network_none", "gpu"}
+    assert provider.capabilities == {"snapshot", "isolation", "network_none", "gpu", "pods"}
     sandbox = await provider.start(
         SandboxSpec(image=str(sif), network="none", cpus=2, memory_mb=512)
     )

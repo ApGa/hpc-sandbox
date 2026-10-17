@@ -60,7 +60,7 @@ async def gone(pid: int, start_time: str | None = None) -> bool:
 async def test_provider_and_sandbox_satisfy_the_protocols(enroot_provider, sqsh):
     assert isinstance(enroot_provider, SandboxProvider)
     assert enroot_provider.name == "enroot"
-    assert enroot_provider.capabilities == {"snapshot", "isolation", "network_none"}
+    assert enroot_provider.capabilities == {"snapshot", "isolation", "network_none", "pods"}
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
     assert isinstance(sandbox, Sandbox)
 
@@ -506,7 +506,7 @@ printf converted > {marker}
 
 def test_provider_capabilities_follow_the_options(tmp_path, fake_enroot):
     provider = EnrootProvider(scratch_root=tmp_path / "scratch", gpus="all")
-    assert provider.capabilities == {"snapshot", "isolation", "network_none", "gpu"}
+    assert provider.capabilities == {"snapshot", "isolation", "network_none", "gpu", "pods"}
     session = Session("hpcsb-" + "3" * 32, tmp_path / "session", None)
     provider.runtime.sysconf_dir = tmp_path / "sysconf"  # as if prepared
     environment = provider.runtime.container_environment(session, remap_root=True, gpus="all")

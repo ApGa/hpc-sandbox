@@ -74,10 +74,11 @@ from .images import (
     local_path,
 )
 from .paths import default_image_cache, should_stage
+from .pods import PodService
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import RUNTIME_CANDIDATES
 from .sandbox import SessionProvider, SessionSandbox, make_owner_writable, poll
-from .sessions import Session, remove_tree
+from .sessions import Session, kill_exact, remove_tree, signal_kill
 from .types import SandboxError, SandboxSpec, SandboxStartError
 
 log = logging.getLogger(__name__)
@@ -624,6 +625,11 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     network namespace; ``stop_grace_s`` is ignored because sandboxes are
     stopped with SIGKILL. ``gpu="rocm"`` and ``cgroup_limits=True`` cannot be
     honored and raise ValueError, as does a setting given under both names.
+
+    Pods (:meth:`start_pod`) find slirp4netns for egress at ``slirp4netns``,
+    else on PATH, else as fetched by ``hpc-sandbox fetch-tools``; their
+    services get ``service_stop_grace_s`` between SIGTERM and SIGKILL when
+    their pod stops.
     """
 
     network_none_hint = "network 'none' was turned off with allow_network_none=False"
@@ -651,6 +657,8 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         allow_network_none: bool | None = None,
         stop_grace_s: float | None = None,
         cgroup_limits: bool = False,
+        slirp4netns: str | None = None,
+        service_stop_grace_s: float = 0.0,
     ) -> None:
         if gpu is not None:
             if gpus is not None:
@@ -672,6 +680,9 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
             memory_poll_s=memory_poll_s,
         )
         self.sandbox_type = EnrootSandbox
+        self.service_type = EnrootService
+        self.slirp4netns_path = slirp4netns
+        self.service_stop_grace_s = service_stop_grace_s
         self.runtime = EnrootRuntime(
             binary,
             cache_dir=self.scratch_root / "runtime-cache",
@@ -696,21 +707,11 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         self.bind_resolv_conf = bind_resolv_conf
         self.extra_start_args = tuple(extra_start_args)
         self.capabilities = frozenset(
-            {"snapshot", "isolation"}
+            {"snapshot", "isolation", "pods"}
             | ({"network_none"} if allow_network_none is not False else set())
             | ({"gpu"} if gpus else set())
         )
-        self._nsenter: str | None = None
         self._sysconf: asyncio.Future[None] | None = None
-
-    @property
-    def nsenter(self) -> str:
-        if self._nsenter is None:
-            resolved = shutil.which("nsenter")
-            if resolved is None:
-                raise SandboxError("nsenter (util-linux) is not on PATH")
-            self._nsenter = resolved
-        return self._nsenter
 
     def _session_roots(self) -> list[tuple[Path, bool]]:
         # Earlier versions kept enroot sessions in the Singularity provider's
@@ -719,8 +720,8 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         singularity = any(shutil.which(binary) for binary in RUNTIME_CANDIDATES)
         return [*super()._session_roots(), (self.scratch_root / "sessions", not singularity)]
 
-    def _check(self, spec: SandboxSpec) -> None:
-        super()._check(spec)
+    def _check(self, spec: SandboxSpec, *, service: bool = False) -> None:
+        super()._check(spec, service=service)
         for mount in spec.mounts:
             if any(c.isspace() for text in (mount.source, mount.target) for c in text):
                 raise ValueError(f"mount paths cannot contain whitespace: {mount}")
@@ -892,11 +893,7 @@ class EnrootSandbox(SessionSandbox):
                 f"{resolv_conf.resolve()}:/etc/resolv.conf:none:"
                 "x-create=file,bind,ro,nosuid,nodev,noexec"
             )
-        for mount in self.spec.mounts:
-            source = Path(mount.source).resolve()
-            kind = "dir" if source.is_dir() else "file"
-            mode = "ro" if mount.read_only else "rw"
-            mounts.append(f"{source}:{mount.target}:none:x-create={kind},bind,{mode},nosuid")
+        mounts += self._spec_mounts()
         for mount in mounts:
             args += ["--mount", mount]
         return [
@@ -908,6 +905,15 @@ class EnrootSandbox(SessionSandbox):
             KEEPALIVE,
             self.id,
         ]
+
+    def _spec_mounts(self) -> list[str]:
+        mounts = []
+        for mount in self.spec.mounts:
+            source = Path(mount.source).resolve()
+            kind = "dir" if source.is_dir() else "file"
+            mode = "ro" if mount.read_only else "rw"
+            mounts.append(f"{source}:{mount.target}:none:x-create={kind},bind,{mode},nosuid")
+        return mounts
 
     async def _start_container(self) -> None:
         assert self._session is not None
@@ -1051,7 +1057,7 @@ class EnrootSandbox(SessionSandbox):
                 init = next(iter(procfs.children(anchor.pid)), None)
             started = procfs.owned_live_start_time(init) if init is not None else None
             if init is not None and started is not None and init in procfs.children(anchor.pid):
-                _kill(init)  # its parent, the launcher, reaps it and exits
+                signal_kill(init)  # its parent, the launcher, reaps it and exits
             if await poll(anchor.poll, _KILL_WAIT_S) is None:
                 anchor.kill()
             if await poll(anchor.poll, self._provider.stop_timeout_s) is None:
@@ -1059,6 +1065,44 @@ class EnrootSandbox(SessionSandbox):
         if self._init_pid is not None and self._container_alive():
             raise SandboxError(f"the container init of sandbox {self.id} survived teardown")
         self._anchor = None
+
+
+class EnrootService(PodService, EnrootSandbox):
+    """A pod service as an enroot container; start it with ``pod.start_service``.
+
+    Enroot's own user namespace, nested in the pod's, is where root lives, so
+    commands in the service hold no capability over the pod's network.
+    """
+
+    def _runtime_command(self, argv: list[str]) -> list[str]:
+        assert self._session is not None
+        session, provider = self._session, self._provider
+        args = ["start", "--rw", *(["--root"] if provider.remap_root else [])]
+        args += ["--rc", str(session.path / RC_FILE)]
+        mounts = [
+            f"{session.tmp}:/tmp:none:x-create=dir,bind,rw,nosuid",
+            f"{session.var_tmp}:/var/tmp:none:x-create=dir,bind,rw,nosuid",
+            f"{self.shm_path}:/dev/shm:none:x-create=dir,bind,rw,nosuid,nodev",
+            f"{self.hosts_path}:/etc/hosts:none:x-create=file,bind,ro,nosuid,nodev,noexec",
+            f"{self.resolv_path}:/etc/resolv.conf:none:x-create=file,bind,ro,nosuid,nodev,noexec",
+            *self._spec_mounts(),
+        ]
+        for mount in mounts:
+            args += ["--mount", mount]
+        return [
+            provider.runtime.path,
+            *args,
+            *provider.extra_start_args,
+            session.rootfs.name,
+            *argv,
+        ]
+
+    def _runtime_environment(self) -> dict[str, str]:
+        assert self._session is not None
+        provider = self._provider
+        return provider.runtime.container_environment(
+            self._session, remap_root=provider.remap_root, gpus=None
+        )
 
 
 def make_placeholders_readable(rootfs: Path) -> None:
@@ -1117,36 +1161,6 @@ def _open_placeholder(name: str, dir_fd: int) -> bool:
         return directory
     finally:
         os.close(item)
-
-
-def kill_exact(processes: list[tuple[int, str]], name: str) -> bool:
-    """SIGKILL the processes ``(pid, start time)`` that still run sandbox ``name``.
-
-    A process is signalled only if its start time matches and its command
-    line names the sandbox; return whether any was running.
-    """
-    killed = []
-    for pid, started in processes:
-        if procfs.owned_live_start_time(pid) != started:
-            continue
-        if name not in (procfs.cmdline(pid) or ""):
-            raise SandboxError(f"refusing to stop {name!r}: PID {pid} identity changed")
-        _kill(pid)
-        killed.append((pid, started))
-    deadline = time.monotonic() + _KILL_WAIT_S
-    for pid, started in killed:
-        while procfs.owned_live_start_time(pid) == started:
-            if time.monotonic() > deadline:
-                raise SandboxError(f"process {pid} of {name!r} survived SIGKILL")
-            time.sleep(0.02)
-    return bool(killed)
-
-
-def _kill(pid: int) -> None:
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
 
 
 def install_time_zone(rootfs: Path, source: Path = Path("/etc/localtime")) -> None:

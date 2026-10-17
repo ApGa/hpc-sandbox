@@ -16,15 +16,19 @@ process identities and fails closed on any ambiguity, and only then deletes it.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +43,7 @@ _NAME = re.compile(r"hpcsb-[0-9a-f]{32}")
 LEASE_FILE = ".lease"
 OWNER_FILE = "owner.json"
 JANITOR_LOCK = ".janitor.lock"
+_KILL_WAIT_S = 5.0
 
 # Stops what still runs for an abandoned session; see :func:`sweep`.
 Stopper = Callable[[Path, "dict[str, Any] | None"], Awaitable[bool]]
@@ -99,15 +104,19 @@ def open_session(root: Path, name: str) -> Session:
     """
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     with locked_sync(root / JANITOR_LOCK):
-        path = root / name
-        path.mkdir(mode=0o700)
-        path.chmod(0o700)
-        try:
-            lease = open_lock_file(path / LEASE_FILE)
-            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BaseException:
-            shutil.rmtree(path, ignore_errors=True)
-            raise
+        return _lease(root, name)
+
+
+def _lease(root: Path, name: str) -> Session:
+    path = root / name
+    path.mkdir(mode=0o700)
+    path.chmod(0o700)
+    try:
+        lease = open_lock_file(path / LEASE_FILE)
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
     return Session(name, path, lease)
 
 
@@ -118,6 +127,40 @@ def remove_session(session: Session) -> None:
         # janitor lock stops a janitor from leasing a fresh inode meanwhile.
         with locked_sync(session.path.parent / JANITOR_LOCK):
             remove_tree(session.path)
+    finally:
+        session.release()
+
+
+async def create_session(root: Path, name: str) -> Session:
+    """:func:`open_session` for the event loop.
+
+    The janitor lock is awaited, never waited for in a worker thread: a sweep
+    holding it needs worker threads to finish. A session created after the
+    caller was cancelled is removed again.
+    """
+    await asyncio.to_thread(root.mkdir, mode=0o700, parents=True, exist_ok=True)
+    async with locked(root / JANITOR_LOCK):
+        task = asyncio.ensure_future(asyncio.to_thread(_lease, root, name))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait({task})
+            if not task.cancelled() and task.exception() is None:
+                session = task.result()
+                try:
+                    await asyncio.to_thread(remove_tree, session.path)
+                finally:
+                    session.release()
+            raise
+
+
+async def discard_session(session: Session) -> None:
+    """:func:`remove_session` for the event loop (see :func:`create_session`)."""
+    try:
+        async with locked(session.path.parent / JANITOR_LOCK):
+            await asyncio.to_thread(remove_tree, session.path)
     finally:
         session.release()
 
@@ -272,3 +315,47 @@ async def _sweep_session(
         report.errors.append(f"could not clean {path.name}: {error}")
     finally:
         os.close(lease)
+
+
+def read_bound_record(path: Path) -> dict[str, Any] | None:
+    """The owner record of the session at ``path`` if it is bound to it on this host."""
+    record = _read_owner_record(path)
+    bound = bool(
+        record
+        and record.get("schema") == SCHEMA
+        and record.get("instance_name") == path.name
+        and record.get("session_directory") == str(path)
+        and record.get("hostname") == socket.gethostname()
+    )
+    return record if bound else None
+
+
+def kill_exact(processes: list[tuple[int, str]], name: str) -> bool:
+    """SIGKILL the processes ``(pid, start time)`` that still run sandbox ``name``.
+
+    A process is signalled only if its start time matches and its command
+    line names the sandbox; return whether any was running.
+    """
+    killed = []
+    for pid, started in processes:
+        if procfs.owned_live_start_time(pid) != started:
+            continue
+        command = procfs.cmdline(pid)
+        if command and name not in command:  # empty while it exits
+            raise SandboxError(f"refusing to stop {name!r}: PID {pid} identity changed")
+        signal_kill(pid)
+        killed.append((pid, started))
+    deadline = time.monotonic() + _KILL_WAIT_S
+    for pid, started in killed:
+        while procfs.owned_live_start_time(pid) == started:
+            if time.monotonic() > deadline:
+                raise SandboxError(f"process {pid} of {name!r} survived SIGKILL")
+            time.sleep(0.02)
+    return bool(killed)
+
+
+def signal_kill(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass

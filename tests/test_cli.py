@@ -70,11 +70,15 @@ def test_run_uses_enroot_when_asked(tmp_path, sqsh, fake_enroot, capsys):
     assert fake_enroot.calls("start")
 
 
-def test_doctor_checks_enroot_and_smoke_tests_an_image(tmp_path, sqsh, fake_enroot, capsys):
+def test_doctor_checks_enroot_and_smoke_tests_an_image(
+    tmp_path, sqsh, fake_enroot, capsys, monkeypatch
+):
+    monkeypatch.setenv("HPC_SANDBOX_TOOLS", str(tmp_path / "no-tools"))
     arguments = ["doctor", "--runtime", "enroot", *common(tmp_path), "--image", str(sqsh)]
-    assert main(arguments) == 0
+    assert main(arguments) == 0  # pods without egress are no failure
     output = capsys.readouterr().out
     assert "3.5.0-fake" in output and "[  ok] namespaces" in output
+    assert "[warn] pods: egress: pods with egress need slirp4netns" in output
     for check in ("sandbox start", "exec", "upload/download", "sandbox stop"):
         assert f"[  ok] {check}" in output
 

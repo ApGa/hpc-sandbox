@@ -39,8 +39,9 @@ from . import procfs
 from .images import ImageStore, ResolvedImage, SifImages
 from .locks import locked
 from .paths import default_image_cache, should_stage
+from .pods import PodService
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult
-from .runtime import ContainerRuntime, instance_pid
+from .runtime import PASSED_DESPITE_CLEANENV, ContainerRuntime, instance_pid
 from .sandbox import (
     RESERVED_TARGETS,
     SessionProvider,
@@ -75,6 +76,11 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     namespaces, ``gpu`` to ``"nv"`` or ``"rocm"`` to pass GPUs through, and
     ``cgroup_limits`` where rootless cgroups work (Apptainer with systemd), to
     turn ``cpus``/``memory_mb`` into hard limits.
+
+    Pods (:meth:`start_pod`) find slirp4netns for egress at ``slirp4netns``,
+    else on PATH, else as fetched by ``hpc-sandbox fetch-tools``; their
+    services get ``service_stop_grace_s`` between SIGTERM and SIGKILL when
+    their pod stops.
     """
 
     name = "singularity"
@@ -101,6 +107,8 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         extra_start_args: Sequence[str] = (),
         output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT,
         memory_poll_s: float = 1.0,
+        slirp4netns: str | None = None,
+        service_stop_grace_s: float = 0.0,
     ) -> None:
         super().__init__(
             scratch_root=scratch_root,
@@ -111,6 +119,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             memory_poll_s=memory_poll_s,
         )
         self.sandbox_type = SingularitySandbox
+        self.service_type = SingularityService
+        self.slirp4netns_path = slirp4netns
+        self.service_stop_grace_s = service_stop_grace_s
         self.runtime = ContainerRuntime(
             binary,
             tmp_dir=self.scratch_root / "runtime-tmp",
@@ -133,7 +144,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         self.bind_resolv_conf = bind_resolv_conf
         self.extra_start_args = tuple(extra_start_args)
         self.capabilities = frozenset(
-            {"snapshot", "isolation"}
+            {"snapshot", "isolation", "pods"}
             | ({"network_none"} if allow_network_none else set())
             | ({"gpu"} if gpu else set())
         )
@@ -362,6 +373,65 @@ class SingularitySandbox(SessionSandbox):
                 timeout_s=self._provider.stop_timeout_s,
             )
         self._instance_may_exist = False
+
+
+class SingularityService(PodService, SingularitySandbox):
+    """A pod service as a long-lived ``singularity exec``; start it with ``pod.start_service``.
+
+    The launcher's init puts the runtime in a nested user namespace of its
+    own, so Singularity runs unprivileged (its non-setuid starter) as root of
+    that namespace, which holds no capability over the pod's network, and its
+    starter is never the service's PID 1. ``--containall`` gives the container
+    its own PID and IPC namespaces too; commands enter all of them.
+    """
+
+    anchor_options = ("--userns",)
+
+    def _user(self) -> dict[str, Any]:
+        return {"remap_root": True, "container_uid": 0}
+
+    def _prepare_service_rootfs(self) -> None:
+        assert self._session is not None
+        rootfs = self._session.rootfs
+        make_mount_point(rootfs, "/etc", directory=True)  # never through a link
+        for target in ("/etc/hosts", "/etc/resolv.conf"):
+            path = rootfs / target.lstrip("/")
+            if path.is_symlink():  # an image's link, followed by nothing yet
+                path.unlink()
+            make_mount_point(rootfs, target, directory=False)
+        make_mount_point(rootfs, "/dev/shm", directory=True)
+
+    def _runtime_command(self, argv: list[str]) -> list[str]:
+        assert self._session is not None
+        session = self._session
+        args = [
+            "exec",
+            "--cleanenv",
+            "--no-eval",
+            "--writable",
+            "--containall",
+            "--no-home",
+            "--no-mount",
+            "home,cwd,bind-paths",
+            "--bind",
+            f"{session.tmp}:/tmp:rw",
+            "--bind",
+            f"{session.var_tmp}:/var/tmp:rw",
+            "--bind",
+            f"{self.shm_path}:/dev/shm:rw",
+            "--bind",
+            f"{self.hosts_path}:/etc/hosts:ro",
+            "--bind",
+            f"{self.resolv_path}:/etc/resolv.conf:ro",
+        ]
+        for mount in self.spec.mounts:
+            mode = "ro" if mount.read_only else "rw"
+            args += ["--bind", f"{Path(mount.source).resolve()}:{mount.target}:{mode}"]
+        return [self._runtime.path, *args, str(session.rootfs), *argv]
+
+    def _runtime_environment(self) -> dict[str, str]:
+        environment = self._runtime.environment()
+        return {k: v for k, v in environment.items() if k not in PASSED_DESPITE_CLEANENV}
 
 
 def make_mount_point(rootfs: Path, target: str, *, directory: bool) -> None:

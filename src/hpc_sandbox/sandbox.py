@@ -19,6 +19,7 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import stat
 import threading
 import time
@@ -28,7 +29,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, Generic, NoReturn, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, NoReturn, Self, TypeVar
 
 from . import memory, procfs, safefs
 from .images import ImageStore, ResolvedImage
@@ -37,10 +38,12 @@ from .process import TIMEOUT_EXIT_CODE, ProcessResult, kill_tree, run_process
 from .sessions import (
     JanitorReport,
     Session,
+    Stopper,
+    create_session,
+    discard_session,
+    kill_exact,
     labels_match,
     new_instance_name,
-    open_session,
-    remove_session,
     remove_tree,
     sweep,
 )
@@ -52,12 +55,16 @@ from .types import (
     DownloadReport,
     DroppedLink,
     ExecResult,
+    PodSpec,
     SandboxError,
     SandboxLostError,
     SandboxSnapshot,
     SandboxSpec,
     SandboxStartError,
 )
+
+if TYPE_CHECKING:
+    from .pods import SessionPod
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +124,8 @@ class SessionProvider(Generic[S]):
     """Start, restore and reap sandboxes whose state lives in session directories.
 
     Subclasses set ``name``, ``capabilities``, ``images`` and ``sandbox_type``
-    and implement :meth:`_extract` and :meth:`_stop_abandoned`.
+    and implement :meth:`_extract` and :meth:`_stop_abandoned`; providers with
+    pods set ``service_type`` and list ``"pods"`` among their capabilities.
     """
 
     name: str
@@ -127,6 +135,10 @@ class SessionProvider(Generic[S]):
     network_none_hint = "network 'none' is not supported by this provider"
     # Each provider keeps its sessions apart: janitors only know their own runtime.
     sessions_directory = "sessions"
+    service_type: Any = None
+    # How long pod services get between SIGTERM and SIGKILL when their pod stops.
+    service_stop_grace_s = 0.0
+    slirp4netns_path: str | None = None
 
     def __init__(
         self,
@@ -147,7 +159,9 @@ class SessionProvider(Generic[S]):
         self.output_limit_bytes = output_limit_bytes
         self.memory_poll_s = memory_poll_s
         self._sandboxes: set[S] = set()
+        self._pods: set[Any] = set()
         self._initial_sweep: asyncio.Future[None] | None = None
+        self._nsenter: str | None = None
 
     @property
     def session_root(self) -> Path:
@@ -156,6 +170,24 @@ class SessionProvider(Generic[S]):
     @property
     def snapshot_root(self) -> Path:
         return self.scratch_root / "snapshots"
+
+    @property
+    def pod_root(self) -> Path:
+        return self.scratch_root / f"pods-{self.name}"
+
+    @property
+    def nsenter(self) -> str:
+        if self._nsenter is None:
+            resolved = shutil.which("nsenter")
+            if resolved is None:
+                raise SandboxError("nsenter (util-linux) is not on PATH")
+            self._nsenter = resolved
+        return self._nsenter
+
+    @property
+    def pods(self) -> frozenset[Any]:
+        """The pods this provider started that have not been stopped."""
+        return frozenset(self._pods)
 
     @property
     def sandboxes(self) -> frozenset[S]:
@@ -180,6 +212,30 @@ class SessionProvider(Generic[S]):
     async def delete_snapshot(self, snapshot: SandboxSnapshot) -> None:
         await asyncio.to_thread(remove_tree, self._snapshot_dir(snapshot))
 
+    async def start_pod(self, spec: PodSpec) -> SessionPod:
+        """Start an empty pod: its holder, its network and its upstream relays.
+
+        Add services with :meth:`SessionPod.start_service`.
+        """
+        from .pods import SessionPod, check_pod
+
+        if "pods" not in self.capabilities or self.service_type is None:
+            raise ValueError(f"the {self.name} provider does not run pods")
+        check_pod(spec)
+        if spec.network == "egress":
+            self.slirp4netns()  # fail before anything starts
+        self.nsenter  # noqa: B018 - fail before anything starts
+        await self._prepare()
+        pod = SessionPod(self, spec)
+        await pod._boot()
+        return pod
+
+    def slirp4netns(self) -> str:
+        """The slirp4netns pods use for egress; see :func:`hpc_sandbox.tools.find_slirp4netns`."""
+        from .tools import find_slirp4netns
+
+        return find_slirp4netns(self.slirp4netns_path)
+
     async def reap(self, labels: Mapping[str, str] | None = None) -> JanitorReport:
         """Stop sandboxes and remove sessions that match ``labels``.
 
@@ -190,6 +246,14 @@ class SessionProvider(Generic[S]):
         """
         report = JanitorReport()
         if labels is not None:
+            pods = [pod for pod in self._pods if labels_match(pod.spec.labels, labels)]
+            results = await asyncio.gather(*(pod.stop() for pod in pods), return_exceptions=True)
+            for pod, result in zip(pods, results, strict=True):
+                if isinstance(result, BaseException):
+                    report.errors.append(f"could not stop pod {pod.id}: {result}")
+                else:
+                    report.stopped.append(pod.id)
+                    report.removed.append(pod.id)
             mine = [
                 sandbox for sandbox in self._sandboxes if labels_match(sandbox.spec.labels, labels)
             ]
@@ -202,19 +266,47 @@ class SessionProvider(Generic[S]):
                 else:
                     report.stopped.append(sandbox.id)
                     report.removed.append(sandbox.id)
-        for root, claim_unknown in self._session_roots():
+        for root, claim_unknown, stop in self._swept_roots():
             swept = await sweep(
-                root,
-                self._stop_abandoned,
-                labels=labels,
-                provider=self.name,
-                claim_unknown=claim_unknown,
+                root, stop, labels=labels, provider=self.name, claim_unknown=claim_unknown
             )
             report.stopped += swept.stopped
             report.removed += swept.removed
             report.live += swept.live
             report.errors += swept.errors
         return report
+
+    def _swept_roots(self) -> list[tuple[Path, bool, Stopper]]:
+        roots = [(root, claim, self._stop_abandoned) for root, claim in self._session_roots()]
+        return [*roots, (self.pod_root, True, self._stop_abandoned_pod)]
+
+    async def _stop_abandoned_pod(self, path: Path, record: dict[str, Any] | None) -> bool:
+        """Stop the services, the holder and slirp4netns of an abandoned pod."""
+        from .pods import SERVICES_DIRECTORY
+
+        stopped = False
+        services = path / SERVICES_DIRECTORY
+        if services.is_dir() and not services.is_symlink():
+            swept = await sweep(services, self._stop_abandoned_service, provider=self.name)
+            if swept.errors or swept.live:
+                raise SandboxError("; ".join(swept.errors) or f"live services: {swept.live}")
+            stopped = bool(swept.stopped)
+        if record is not None:
+            for role, name in (("holder", path.name), ("slirp", "slirp4netns")):
+                pid, started = record.get(f"{role}_pid"), record.get(f"{role}_start_time")
+                if isinstance(pid, int) and isinstance(started, str):
+                    stopped |= await asyncio.to_thread(kill_exact, [(pid, started)], name)
+        return stopped
+
+    async def _stop_abandoned_service(self, path: Path, record: dict[str, Any] | None) -> bool:
+        if record is None:
+            return False
+        processes = []
+        for role in ("init", "anchor"):  # the init first, so its parent can reap it
+            pid, started = record.get(f"{role}_pid"), record.get(f"{role}_start_time")
+            if isinstance(pid, int) and isinstance(started, str):
+                processes.append((pid, started))
+        return await asyncio.to_thread(kill_exact, processes, path.name)
 
     def _session_roots(self) -> list[tuple[Path, bool]]:
         """Directories janitors sweep, and whether they claim sessions of no known provider."""
@@ -258,11 +350,12 @@ class SessionProvider(Generic[S]):
         await sandbox._boot(populate)
         return sandbox
 
-    def _check(self, spec: SandboxSpec) -> None:
+    def _check(self, spec: SandboxSpec, *, service: bool = False) -> None:
+        """Validate ``spec``; a pod service's ``network`` is the pod's, not its own."""
         self.images.format.check(spec.image)
-        if spec.network not in ("host", "none"):
+        if not service and spec.network not in ("host", "none"):
             raise ValueError(f"unknown network mode {spec.network!r}")
-        if spec.network == "none" and "network_none" not in self.capabilities:
+        if not service and spec.network == "none" and "network_none" not in self.capabilities:
             raise ValueError(self.network_none_hint)
         if not PurePosixPath(spec.workdir).is_absolute():
             raise ValueError(f"workdir must be absolute: {spec.workdir!r}")
@@ -300,10 +393,8 @@ class SessionProvider(Generic[S]):
 
     async def _sweep_abandoned(self) -> None:
         """Recover sessions left by crashed processes, once per provider."""
-        for root, claim_unknown in self._session_roots():
-            report = await sweep(
-                root, self._stop_abandoned, provider=self.name, claim_unknown=claim_unknown
-            )
+        for root, claim_unknown, stop in self._swept_roots():
+            report = await sweep(root, stop, provider=self.name, claim_unknown=claim_unknown)
             for error in report.errors:
                 log.warning("hpc-sandbox janitor: %s", error)
 
@@ -336,6 +427,7 @@ class SessionSandbox:
     """
 
     probe_hint = ""
+    _tracked = True  # listed in the provider's sandboxes
 
     def __init__(self, provider: SessionProvider[Any], spec: SandboxSpec) -> None:
         self.id = new_instance_name()
@@ -585,6 +677,10 @@ class SessionSandbox:
         """The host processes of the running commands, with their start times."""
         return [(pid, started) for pid, started in list(self._exec_starts.items())]
 
+    def _session_root(self) -> Path:
+        """Where the sandbox's session directory goes."""
+        return self._provider.session_root
+
     def _own_processes(self) -> list[int]:
         """The processes that make up the sandbox once it started, which are never killed.
 
@@ -599,7 +695,7 @@ class SessionSandbox:
     async def _boot(self, populate: Callable[[Session], Awaitable[None]]) -> None:
         provider = self._provider
         try:
-            self._session = await asyncio.to_thread(open_session, provider.session_root, self.id)
+            self._session = await create_session(self._session_root(), self.id)
             self._record()
             await populate(self._session)
             await asyncio.to_thread(self._prepare_rootfs)
@@ -621,7 +717,8 @@ class SessionSandbox:
                 raise
             raise SandboxStartError(f"sandbox {self.id} failed to start: {error}") from error
         self._running = True
-        provider._sandboxes.add(self)
+        if self._tracked:
+            provider._sandboxes.add(self)
         if self.spec.memory_mb:
             self._watchdog = asyncio.create_task(
                 memory.watch(
@@ -793,7 +890,7 @@ class SessionSandbox:
         if session is None:
             return
         await self._stop_container(session)
-        await asyncio.to_thread(remove_session, session)
+        await discard_session(session)
         self._session = None
 
 
