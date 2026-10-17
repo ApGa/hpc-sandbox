@@ -76,6 +76,7 @@ async def provider(scratch: Path) -> AsyncIterator[SessionProvider[Any]]:
         await sandbox.stop()
     report = await provider.reap()
     assert not report.errors, report.errors
+    assert await provider.wait_for_deletions(120)  # before the scratch root goes
 
 
 async def test_lifecycle_keeps_the_uid_and_isolates_tmp(provider):

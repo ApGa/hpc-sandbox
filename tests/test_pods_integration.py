@@ -83,6 +83,7 @@ async def provider(scratch: Path) -> AsyncIterator[Any]:
         await pod.stop()
     report = await provider.reap()
     assert not report.errors, report.errors
+    assert await provider.wait_for_deletions(120)  # before the scratch root goes
 
 
 @pytest.fixture
