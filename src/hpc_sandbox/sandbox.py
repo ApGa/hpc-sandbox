@@ -84,10 +84,12 @@ _TRANSFER_CLEANUP_S = 60.0
 # sh -c _DETACH DELETE_SCRIPT TREE LOG LOCK: start the deletion in the background and return at once; the deletion is
 # reparented to init, and its errors go to LOG, which it removes when it succeeds. Deletions of one session root run
 # one at a time (LOCK) and at the lowest CPU priority: in parallel they slowed starts, whose extractions or copies
-# create the same kind of metadata the deletions remove.
+# create the same kind of metadata the deletions remove. Each path stays one argument, whatever characters it holds.
 _DETACH = (
-    'if command -v flock >/dev/null 2>&1; then serial="flock $3"; else serial=; fi; '
-    'nice -n 19 $serial /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2" </dev/null >/dev/null 2>"$2" &'
+    "log=$2; "
+    'if command -v flock >/dev/null 2>&1; then set -- flock "$3" /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; '
+    'else set -- /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; fi; '
+    'nice -n 19 "$@" </dev/null >/dev/null 2>"$log" &'
 )
 # Trash entries this process started deleting (wait_for_deletions).
 _DELETIONS: set[Path] = set()

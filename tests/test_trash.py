@@ -49,6 +49,16 @@ async def test_a_stop_moves_the_session_out_and_deletes_it_in_the_background(
     assert list((provider.session_root / TRASH_DIR).iterdir()) == []
 
 
+async def test_a_session_root_with_spaces_and_glob_characters_is_deleted_too(
+    tmp_path, sif, fake_runtime
+):
+    provider = make_provider(tmp_path, scratch_root=tmp_path / "node scratch [*]")
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    await sandbox.stop()
+    assert await provider.wait_for_deletions(timeout_s=30)
+    assert list((provider.session_root / TRASH_DIR).iterdir()) == []
+
+
 async def test_janitors_finish_the_deletions_of_dead_processes_only(
     tmp_path, sif, fake_runtime, monkeypatch
 ):
