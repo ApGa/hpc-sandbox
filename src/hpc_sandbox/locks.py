@@ -47,6 +47,24 @@ async def locked(path: Path, *, private: bool = True, poll_s: float = 0.05) -> A
         os.close(descriptor)
 
 
+@asynccontextmanager
+async def try_locked(path: Path, *, private: bool = True) -> AsyncIterator[bool]:
+    """Hold an exclusive lock on ``path`` if it is free right now; yields whether it is held.
+
+    Never waits: for work that another process may do instead, or later.
+    """
+    descriptor = open_lock_file(path, private=private)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def locked_sync(path: Path, *, private: bool = True) -> Iterator[None]:
     """Blocking variant of :func:`locked` for code running in worker threads."""

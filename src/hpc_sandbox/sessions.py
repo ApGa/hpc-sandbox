@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from . import procfs
-from .locks import locked, locked_sync, open_lock_file
+from .locks import locked, locked_sync, open_lock_file, try_locked
 from .types import SandboxError
 
 SCHEMA = "hpc-sandbox/session-v1"
@@ -297,7 +297,8 @@ async def sweep(
     labels: Mapping[str, str] | None = None,
     provider: str | None = None,
     claim_unknown: bool = True,
-) -> JanitorReport:
+    wait: bool = True,
+) -> JanitorReport | None:
     """Stop and remove abandoned sessions below ``root``.
 
     A session is abandoned when nobody holds its lease and its recorded owner
@@ -309,13 +310,17 @@ async def sweep(
     whatever still runs; ``record`` is the owner record if it is bound to
     this session on this host, else None. Live sessions and unrecognized
     directories are never touched; foreign directories and failed stops are
-    reported and kept.
+    reported and kept. With ``wait=False`` it sweeps only if no other process
+    holds the root's janitor lock right now, and returns None when one does.
     """
     report = JanitorReport()
     if not root.is_dir():
         return report
     doomed: list[Path] = []
-    async with locked(root / JANITOR_LOCK):
+    janitor = locked(root / JANITOR_LOCK) if wait else try_locked(root / JANITOR_LOCK)
+    async with janitor as held:
+        if held is False:
+            return None
         for path in sorted(root.iterdir()):
             if not _NAME.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
                 continue
