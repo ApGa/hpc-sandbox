@@ -769,9 +769,13 @@ async def test_the_watchdog_spares_the_runtime_between_the_init_and_the_service(
     await pod.stop()
 
 
-async def test_a_graceful_stop_reaches_the_command_and_statuses_are_shell_like(runtime):
+async def test_a_graceful_stop_reaches_the_command_and_statuses_are_shell_like(
+    runtime, monkeypatch
+):
     provider, image = runtime
     provider.service_stop_grace_s = 5.0
+    # A status takes a while up through Singularity's processes: the stop must wait for it.
+    monkeypatch.setenv("FAKE_SINGULARITY_EXIT_DELAY", "1")
     pod = await provider.start_pod(PodSpec())
     polite = ServiceSpec(
         "polite",

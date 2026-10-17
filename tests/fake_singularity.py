@@ -20,6 +20,7 @@ State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_PULL_REVISION   pulls write a different image, as after a tag moved
   FAKE_SINGULARITY_INSTANCE_EXITS  "1": instances exit right after starting
   FAKE_SINGULARITY_START_DELAY     seconds each instance start takes (default 0)
+  FAKE_SINGULARITY_EXIT_DELAY      seconds a shim waits to pass its command's status on (default 0)
 """
 
 from __future__ import annotations
@@ -318,6 +319,7 @@ def _supervise(child: int, *, reap_all: bool = False) -> int:
             return 255
         if pid == child:
             code = os.waitstatus_to_exitcode(status)
+            time.sleep(float(os.environ.get("FAKE_SINGULARITY_EXIT_DELAY", "0")))
             return 128 - code if code < 0 else code
 
 

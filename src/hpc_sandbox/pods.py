@@ -775,7 +775,9 @@ class SessionPod:
             for service in commands:
                 service.terminate()
             deadline = time.monotonic() + grace
-            while time.monotonic() < deadline and any(s._command_running() for s in commands):
+            # Until the launchers report the statuses: the command exits before its status gets
+            # up through the runtime's processes and the init, which a stop would kill.
+            while time.monotonic() < deadline and any(s.exit_status is None for s in commands):
                 await asyncio.sleep(0.05)
         results = await asyncio.gather(
             *(service.stop() for service in self._services.values()), return_exceptions=True
