@@ -8,7 +8,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hpc_sandbox import procfs
+import pytest
+from conftest import make_provider
+
+from hpc_sandbox import SandboxSpec, procfs
 from hpc_sandbox.memory import _Process, choose_branch, choose_victim, sample
 
 MB = 1024 * 1024
@@ -142,12 +145,10 @@ def test_pools_of_two_or_uneven_pools_die_whole():
     assert killed(processes) == [20, 100, 101]
 
 
-def test_pools_of_one_and_spawned_or_forkserver_pools_die_with_their_owner():
+def test_spawned_and_forkserver_pools_die_with_their_owner():
     owner = proc(20, 10, 30, command=POOL)
-    forked = sandbox(proc(10, 2, 257), owner, proc(100, 20, 1500, command=POOL))
-    assert killed(forked) == [20, 100]
-    spawned = sandbox(proc(10, 2, 257), owner, proc(100, 20, 1500, command=SPAWNED))
-    assert killed(spawned) == [20, 100]
+    spawned = sandbox(proc(10, 2, 257), owner, *pool(20, 100, 2, 750, command=SPAWNED))
+    assert killed(spawned) == [20, 100, 101]
     # The fork server forks the workers; its owner waits on them.
     server = [proc(30, 20, 10, command=FORKSERVER), *pool(30, 100, 3, 500, command=FORKSERVER)]
     tracker = proc(
@@ -155,6 +156,18 @@ def test_pools_of_one_and_spawned_or_forkserver_pools_die_with_their_owner():
     )
     processes = sandbox(proc(10, 2, 257), owner, *server, tracker)
     assert killed(processes) == [20, 30, 40, 100, 101, 102]
+
+
+def test_a_lone_child_dies_alone_and_its_parent_learns_of_it():
+    # A harness runs code in one child (multiprocessing.Process, os.fork) and joins it.
+    harness = proc(10, 2, 257, command="python3 harness.py")
+    forked = proc(100, 10, 2000, command="python3 harness.py")
+    assert killed(sandbox(harness, forked), 900 * MB) == [100]
+    spawned = proc(100, 10, 2000, command=SPAWNED)
+    assert killed(sandbox(harness, spawned), 900 * MB) == [100]
+    server = proc(30, 10, 10, command=FORKSERVER)  # Python 3.14's default
+    child = proc(100, 30, 2000, command=FORKSERVER)
+    assert killed(sandbox(harness, server, child), 900 * MB) == [100]
 
 
 def test_a_subshell_is_no_pool_worker():
@@ -167,12 +180,24 @@ def test_a_subshell_is_no_pool_worker():
     assert killed(processes, 100 * MB) == [53, *range(100, 104)]
 
 
-def test_children_running_the_very_same_command_are_a_pool():
-    # sh -c 'for i in 1 2 3 4; do tail ... & done; wait', or xargs -P.
+def test_children_running_the_very_same_command_die_one_at_a_time():
+    # Unlike a multiprocessing pool's owner, their parent learns that one was killed.
+    # A shell's jobs, or xargs -P:
     shell = proc(20, 10, 1, command="sh -c for i in 1 2 3 4; do tail -c 60000000 & done; wait")
-    workers = pool(20, 100, 4, 50, command="tail -c 60000000")
+    workers = [proc(100, 20, 60, command="tail -c 60000000")]
+    workers += pool(20, 101, 3, 50, command="tail -c 60000000")
     processes = sandbox(proc(10, 2, 100, command="harness"), shell, *workers)
-    assert killed(processes, 280 * MB) == [20, *range(100, 104)]
+    assert killed(processes, 280 * MB) == [100]
+    # A grader running one solution on several inputs:
+    grader = proc(10, 2, 100, command="python3 grade.py")
+    cases = [
+        proc(20 + i, 10, mb, command="python3 /tmp/sol.py") for i, mb in enumerate((50, 900, 50))
+    ]
+    assert killed(sandbox(grader, *cases)) == [21]
+    # An agent's shell running echo 1 | python3 sol.py & echo 2 | python3 sol.py &:
+    agent = proc(10, 2, 5, command="bash")
+    jobs = [proc(20, 10, 700, command="python3 sol.py"), proc(21, 10, 50, command="python3 sol.py")]
+    assert killed(sandbox(agent, *jobs), 600 * MB) == [20]
 
 
 def test_tool_commands_that_differ_only_in_numbers_are_no_pool():
@@ -198,6 +223,10 @@ def test_a_runaway_tool_in_a_test_worker_dies_alone():
     tool = proc(40, 30, 900, command="./cli --big")
     processes = sandbox(proc(10, 2, 100, command="pytest -n 4"), proc(20, 10, 50), *workers, tool)
     assert killed(processes) == [40]
+    # A test that leaks in the worker itself: pytest reports the worker it lost.
+    xdist = "python3 -c import sys;exec(eval(sys.stdin.readline()))"
+    leaking = [proc(30, 10, 900, command=xdist), *pool(10, 31, 3, 50, command=xdist)]
+    assert killed(sandbox(proc(10, 2, 100, command="pytest -n 4"), *leaking)) == [30]
 
 
 def test_a_pool_dies_whole_even_when_one_worker_would_do():
@@ -220,6 +249,115 @@ def test_a_marked_pool_counts_its_mark_once():
     tools = [proc(20, 10, 10, adj=1000), *pool(20, 100, 15, 100, adj=1000)]
     tools.append(proc(30, 10, 2000, adj=1000))
     assert killed(sandbox(proc(10, 2, 257), *tools)) == [30]
+
+
+# Scenarios of the watchdog of the fuse-overlay pull request (its tests 0010 and 0014).
+HARNESS = "python3 /opt/agent/harness.py --task 17"
+TRAIN = "python3 train.py"
+LOKY = (
+    "/usr/local/bin/python3 -m joblib.externals.loky.backend.popen_loky_posix "
+    "--process-name LokyProcess-1 --pipe 19 --semaphore 7"
+)
+
+
+def tree(*rows, protected=(), commands=None):
+    """Processes from (pid, parent, MB) rows, parents first."""
+    commands = commands or {}
+    return [
+        proc(pid, parent, mb, protected=pid in protected, command=commands.get(pid, ""))
+        for pid, parent, mb in rows
+    ]
+
+
+def test_192_workers_of_a_training_script_die_with_it_and_the_harness_survives():
+    workers = [(100 + i, 3, 240) for i in range(192)]
+    for kind in ("", LOKY, TRAIN):
+        names = {2: HARNESS, 3: TRAIN, **{100 + i: kind for i in range(192)}} if kind else {}
+        processes = tree(
+            (1, None, 1), (2, 1, 257), (3, 2, 60), *workers, protected=(1,), commands=names
+        )
+        kill = choose_victim(processes, 3072 * MB)
+        assert kill is not None and kill.pids == (3, *range(100, 292))
+        assert kill.pss_bytes == (60 + 192 * 240) * MB
+        assert "killed pid 3 and 192 descendant(s)" in kill.message()
+
+
+def test_a_small_excess_kills_the_process_that_holds_the_memory_on_an_instance():
+    rows = [  # pid, parent, KiB, exec root, protected, command
+        (1, None, 19348, None, True, "sinit"),
+        (2, 1, 289, None, True, "/bin/sh /.singularity.d/startscript"),
+        (3, 2, 259, None, False, "sleep 86400"),
+        (10, None, 9416, 10, False, "Singularity runtime parent"),
+        (11, 10, 19870, 10, False, "/bin/sh -c x=...; sleep 25 | tail -c 100000000 /dev/zero"),
+        (12, 11, 252, 10, False, "sleep 25"),
+        (13, 11, 97951, 10, False, "tail -c 100000000 /dev/zero"),
+    ]
+    processes = [
+        _Process(pid, parent, "0", kib * 1024, root, protected, 0, command)
+        for pid, parent, kib, root, protected, command in rows
+    ]
+    total = sum(process.pss_bytes for process in processes)
+    for excess_kib in (4, 64, 256, 1024, 65536):
+        kill = choose_victim(processes, total - excess_kib * 1024)
+        assert kill is not None and (kill.pids, kill.exec_root) == ((13,), 10), excess_kib
+
+
+def test_a_bystander_smaller_than_the_hog_survives_a_small_excess():
+    processes = tree((1, None, 1), (2, 1, 2), (3, 2, 2800), (4, 1, 300), protected=(1,))
+    assert killed(processes, 3053 * MB) == [3]
+
+
+def test_of_two_hogs_under_a_harness_one_goes_unless_they_are_a_pool():
+    for tools in (("", ""), ("python3 sol.py 1", "python3 sol.py 2"), ("python3 sol.py",) * 2):
+        names = {2: HARNESS, 3: tools[0], 4: tools[1]}
+        rows = ((1, None, 1), (2, 1, 200), (3, 2, 2000), (4, 2, 1900))
+        assert killed(tree(*rows, protected=(1,), commands=names), 4000 * MB) == [3], tools
+    # Two copies of the harness are a pool, as two of multiprocessing.Pool's fork workers
+    # are: one killed alone would leave the pool waiting for it forever.
+    names = {2: HARNESS, 3: HARNESS, 4: HARNESS}
+    rows = ((1, None, 1), (2, 1, 200), (3, 2, 2000), (4, 2, 1900))
+    assert killed(tree(*rows, protected=(1,), commands=names), 4000 * MB) == [2, 3, 4]
+
+
+PYTHON = "/usr/bin/python3"
+# A harness that runs code in a child it joins, as HumanEval's does.
+HARNESS_JOINS_A_CHILD = """
+import multiprocessing, os, sys, time
+def touched(mb):
+    data = bytearray(mb * 1024 * 1024)
+    data[::4096] = b"\\1" * (len(data) // 4096)
+    return data
+def leak():
+    held = touched(400)
+    time.sleep(30)
+harness = touched(120)
+if sys.argv[1] == "os.fork":
+    pid = os.fork()
+    if pid == 0:
+        leak()
+        os._exit(0)
+    print("harness alive, child exit", os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+else:
+    child = multiprocessing.get_context("fork").Process(target=leak)
+    child.start()
+    child.join(30)
+    print("harness alive, child exit", child.exitcode)
+"""
+
+
+@pytest.mark.skipif(not Path(PYTHON).exists(), reason=f"needs {PYTHON}")
+async def test_a_harness_learns_that_the_child_it_joins_was_killed(tmp_path, fake_runtime, sif):
+    provider = make_provider(tmp_path)
+    sandbox = await provider.start(SandboxSpec(image=str(sif), memory_mb=300))
+    try:
+        for how in ("multiprocessing", "os.fork"):
+            command = [PYTHON, "-c", HARNESS_JOINS_A_CHILD, how]
+            result = await sandbox.exec(command, timeout_s=60)
+            assert result.exit_code == 0, (how, result.stdout, result.stderr)
+            assert "harness alive, child exit -9" in result.stdout, how
+            assert sandbox.memory_kills[-1].processes == 1
+    finally:
+        await sandbox.stop()
 
 
 def test_sample_protects_the_instance_and_the_recorded_processes():

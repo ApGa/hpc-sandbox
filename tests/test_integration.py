@@ -403,15 +403,15 @@ async def test_commands_get_the_images_path_and_none_of_the_hosts_variables(prov
             assert key in shell_state or env.get(key) == value, (key, value, env.get(key))
 
 
-POOL_UNDER_A_HARNESS = """# The "harness": the largest single process. The "tool": a pool of smaller workers.
-cat /dev/zero | tail -c 100000000 > /dev/null &
+POOL_UNDER_A_HARNESS = """# The "harness" idles; the "tool" runs jobs that all grow, for a while.
+cat /dev/zero | tail -c 50000000 > /dev/null &
 harness=$!
 sleep 2
-sh -c 'for i in 1 2 3 4; do cat /dev/zero | tail -c 60000000 > /dev/null & done; wait'
+sh -c 'for i in 1 2 3 4; do (head -c 60000000 /dev/zero; sleep 4) | tail -c 60000000 > /dev/null & done
+wait'
 echo "pool exit $?"
-sleep 1
 for p in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < "$p" 2>/dev/null; echo; done |
-    grep -c "tail -c 100000000 $" | sed 's/^/harness tails: /'
+    grep -c "tail -c 50000000 $" | sed 's/^/harness tails: /'
 kill "$harness"
 """
 
@@ -473,7 +473,8 @@ async def test_memory_watchdog_kills_a_runaway_pool_and_spares_the_harness(provi
     sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=200))
     result = await sandbox.exec(["/bin/sh", "-c", POOL_UNDER_A_HARNESS], timeout_s=120)
     assert result.exit_code == 0, (result.stdout, result.stderr)  # the command itself survived
-    assert "pool exit 137" in result.stdout and "harness tails: 1" in result.stdout, result.stdout
-    assert "memory limit exceeded" in result.stderr and "descendant" in result.stderr
-    (kill,) = sandbox.memory_kills
-    assert kill.processes >= 5 and kill.pss_bytes > kill.total_bytes // 2
+    assert "pool exit" in result.stdout and "harness tails: 1" in result.stdout, result.stdout
+    assert "memory limit exceeded" in result.stderr
+    # Jobs go one at a time while one holds the excess, else the loop with all of them.
+    assert sandbox.memory_kills
+    assert all(kill.pss_bytes >= 50_000_000 for kill in sandbox.memory_kills)

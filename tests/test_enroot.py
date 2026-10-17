@@ -1331,9 +1331,10 @@ async def test_memory_watchdog_kills_a_runaway_pool_and_spares_the_harness(
     assert (await sandbox.exec("head -c 30000000 /dev/zero > /dev/shm/blob")).exit_code == 0
     result = await sandbox.exec(["/bin/sh", "-c", POOL_UNDER_A_HARNESS], timeout_s=60)
     assert result.exit_code == 0, (result.stdout, result.stderr)
-    assert "pool exit 137" in result.stdout and "harness tails: 1" in result.stdout, result.stdout
-    (kill,) = sandbox.memory_kills
-    assert kill.processes >= 5 and kill.exec_root is not None
+    assert "pool exit" in result.stdout and "harness tails: 1" in result.stdout, result.stdout
+    # Jobs go one at a time while one holds the excess, else the loop with all of them.
+    kill = sandbox.memory_kills[-1]
+    assert kill.exec_root is not None
     assert kill.tmpfs_bytes is not None and kill.tmpfs_bytes >= 30_000_000  # /dev/shm/blob
     assert f"tmpfs files hold {kill.tmpfs_bytes} bytes" in result.stderr
     await sandbox.stop()

@@ -76,6 +76,7 @@ class MemoryKill:
     exec_root: int | None  # the exec whose process tree held the branch, if any
     processes: int = 1  # how many processes the branch held
     tmpfs_bytes: int | None = None  # held by files on the sandbox's tmpfs mounts, if known
+    pids: tuple[int, ...] = ()  # the branch's processes as sampled, root first
 
     def message(self) -> str:
         killed = f"pid {self.pid}"
@@ -105,15 +106,11 @@ class _Process:
         return (self.pid, self.start_time)
 
 
-# Command lines of worker pools' processes (multiprocessing's spawn and forkserver
-# workers and its fork server, joblib's loky workers): parts of their parent's pool.
 SHELLS = frozenset({"sh", "ash", "bash", "dash", "ksh", "mksh", "zsh"})
-POOL_MARKERS = (
-    "multiprocessing.spawn",
-    "multiprocessing.forkserver",
-    "--multiprocessing-fork",
-    "loky.backend",
-)
+# The command lines of the children multiprocessing spawns, and of its fork server,
+# whose children are copies of it.
+SPAWNED_MARKERS = ("multiprocessing.spawn", "--multiprocessing-fork")
+FORK_SERVER_MARKER = "multiprocessing.forkserver"
 
 
 def sample(
@@ -217,18 +214,30 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
                 pending.extend(children[process.pid])
         return [process for process in found if freed[process.pid]]
 
+    def kind(process: _Process) -> str | None:
+        """How ``process`` may be a worker of a pool its parent runs: a child that
+        multiprocessing spawned, or a copy of its parent (a fork that ran no other
+        program, as a fork server's children are). A subshell is none."""
+        parent = by_pid.get(process.parent) if process.parent is not None else None
+        if parent is None or not process.command:
+            return None
+        if any(mark in process.command for mark in SPAWNED_MARKERS):
+            return "spawned"
+        if process.command == parent.command and not _shell(process.command):
+            return "forked"
+        return None
+
     def worker(process: _Process) -> bool:
-        """Whether ``process`` is a worker of a pool its parent runs: a known kind, a
-        copy of its parent (a fork that did not run another program), or one of
-        several children running the very same command line; subshells are none."""
-        if process.parent not in by_pid or not process.command:
-            return False
-        if any(mark in process.command for mark in POOL_MARKERS):
-            return True
-        if _shell(process.command):
-            return False
-        same = [kid for kid in children[process.parent] if kid.command == process.command]
-        return len(same) > 1 or process.command == by_pid[process.parent].command
+        """Whether ``process`` is one of the workers of a pool, or the fork server they
+        came from: one of several children of one kind. A lone child is no pool's: its
+        parent waits for it and learns that it was killed, as a grader, a subprocess
+        call or a test runner learns that a command it ran was."""
+        own = kind(process)
+        if (
+            own is None and FORK_SERVER_MARKER in process.command
+        ):  # the server; its children copy it
+            return len(children[process.pid]) > 1
+        return own is not None and sum(kind(kid) == own for kid in children[process.parent]) > 1
 
     top = candidates(None)
     if not top:
@@ -282,6 +291,7 @@ def _report(
         root.exec_root,
         len(branch),
         tmpfs_bytes,
+        tuple(process.pid for process in branch),
     )
 
 

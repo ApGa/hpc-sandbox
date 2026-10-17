@@ -171,20 +171,26 @@ What both providers share:
    the most while that child alone holds the excess over the limit. So the
    command that ran away dies and a harness survives a tool command it started,
    whatever their sizes; when the memory is spread over several children, their
-   parent's branch dies whole. The victim is never one worker of a pool
-   (children running the very same command line, or multiprocessing's and
-   joblib's workers), which could leave the pool waiting forever: the pool's
-   owner goes, with every worker. Like the kernel's OOM killer, it may kill a
-   larger idle process before a smaller one that is growing; a tool command
-   started with a higher `oom_score_adj` (`choom -n 1000 -- cmd`) goes first,
-   and a value every process inherited changes nothing. The branch dies whole,
-   with whatever it forks meanwhile; its root is killed, never stopped, so its
-   parent sees a kill. A command the watchdog killed returns 137; one whose
-   descendants it killed keeps its own exit status (or times out). Either way
-   the explanation is appended to stderr and recorded in `Sandbox.memory_kills`,
-   with how many processes the branch held and how much the sandbox's own tmpfs
-   mounts (`/dev/shm`, `/run`...) hold, which no kill frees. This is a sampled
-   guard, not a cgroup: usage can overshoot between samples.
+   parent's branch dies whole. The victim is never one of several workers of
+   a pool (fork copies of their parent, or children multiprocessing spawned or
+   its fork server forked), which could leave a `multiprocessing.Pool` waiting
+   forever: the pool's owner goes, with every worker. A lone child dies alone,
+   so a harness that runs code in a child and joins it learns that the child
+   was killed, as a grader or a test runner learns that a command it ran was.
+   A `ProcessPoolExecutor`'s owner goes with its pool too (it would have got
+   `BrokenProcessPool`): the process tree cannot tell the two apart. Like the
+   kernel's OOM killer, it may kill a larger idle process before a smaller one
+   that is growing; a process with a higher `oom_score_adj` than its parent
+   (`choom -n 1000 -- cmd`, or a browser's renderers, which mark themselves)
+   goes first, and a value every process inherited changes nothing. The
+   branch dies whole, with whatever it forks meanwhile; its root is killed,
+   never stopped, so its parent sees a kill. A command the watchdog killed
+   returns 137; one whose descendants it killed keeps its own exit status (or
+   times out). Either way the explanation is appended to stderr and recorded
+   in `Sandbox.memory_kills`, with the processes the branch held (`pids`) and
+   how much the sandbox's own tmpfs mounts (`/dev/shm`, `/run`...) hold, which
+   no kill frees. This is a sampled guard, not a cgroup: usage can overshoot
+   between samples.
 6. **Snapshots** copy the rootfs and the private tmp directories with
    `cp -a --reflink=auto` (near free on reflink filesystems), after a `sync`.
    Processes and memory are not captured; take snapshots while the sandbox is
