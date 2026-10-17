@@ -622,8 +622,11 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     ``gpus="all"``; ``allow_network_none=False`` refuses ``network="none"``,
     which is otherwise always available because every sandbox gets its own
     network namespace; ``stop_grace_s`` is ignored because sandboxes are
-    stopped with SIGKILL. ``gpu="rocm"`` and ``cgroup_limits=True`` cannot be
-    honored and raise ValueError, as does a setting given under both names.
+    stopped with SIGKILL, and ``rootfs_templates`` because ``enroot create``
+    extracts each sandbox's root filesystem from its image, which is the copy
+    layout (``rootfs_layout="copy"``). ``gpu="rocm"``, ``cgroup_limits=True``
+    and ``rootfs_layout="fuse-overlay"`` cannot be honored and raise
+    ValueError, as does a setting given under both names.
     """
 
     network_none_hint = "network 'none' was turned off with allow_network_none=False"
@@ -651,6 +654,8 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         allow_network_none: bool | None = None,
         stop_grace_s: float | None = None,
         cgroup_limits: bool = False,
+        rootfs_templates: bool | None = None,
+        rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
     ) -> None:
         if gpu is not None:
             if gpus is not None:
@@ -662,7 +667,13 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
             raise ValueError(
                 "the enroot provider cannot apply cgroup limits; memory_mb arms the memory watchdog"
             )
+        if rootfs_layout not in (None, "copy"):
+            raise ValueError(
+                "the enroot provider extracts each sandbox's root filesystem with enroot create "
+                f"(rootfs_layout='copy'), not rootfs_layout={rootfs_layout!r}"
+            )
         del stop_grace_s  # SIGKILL needs no grace period
+        del rootfs_templates  # enroot create extracts every sandbox's root filesystem
         super().__init__(
             scratch_root=scratch_root,
             default_timeout_s=default_timeout_s,

@@ -340,9 +340,11 @@ Options both providers take:
 options works for both runtimes: `gpu="nv"` means `gpus="all"`;
 `allow_network_none=False` refuses `network="none"`, which is otherwise
 always available because every enroot sandbox has its own network namespace;
-`stop_grace_s` is ignored because enroot sandboxes are stopped with SIGKILL.
-`gpu="rocm"`, `cgroup_limits=True` and a setting given under both names raise
-`ValueError`.
+`stop_grace_s` is ignored because enroot sandboxes are stopped with SIGKILL,
+and `rootfs_templates` because `enroot create` extracts each sandbox's root
+filesystem from its image, which is the copy layout (`rootfs_layout="copy"`).
+`gpu="rocm"`, `cgroup_limits=True`, `rootfs_layout="fuse-overlay"` and a
+setting given under both names raise `ValueError`.
 
 Default scratch root: `$HPC_SANDBOX_SCRATCH`, else `$PBS_LOCALDIR/hpc-sandbox`,
 else `/local/$PBS_JOBID/hpc-sandbox` when it exists, else
