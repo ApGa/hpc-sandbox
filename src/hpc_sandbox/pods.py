@@ -791,7 +791,7 @@ class SessionPod:
             doomed = await trash_session_awaiting(session)
             self._session = None
             if doomed is not None:
-                self._provider._delete_in_background(doomed)
+                await self._provider._delete_in_background(doomed)
 
     async def _stop_holder(self) -> None:
         holder, control = self._holder, self._control

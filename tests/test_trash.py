@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
+import subprocess
+import time
 from pathlib import Path
 
 from conftest import in_mount_namespace, make_provider
 
 from hpc_sandbox import SandboxSpec, sessions
-from hpc_sandbox.sessions import JANITOR_LOCK, TRASH_DIR
+from hpc_sandbox.sandbox import _DELETIONS
+from hpc_sandbox.sessions import JANITOR_LOCK, TRASH_DIR, remove_tree
 
 
 def janitor_lock_held(root: Path) -> bool:
@@ -105,3 +109,50 @@ except SandboxError as error:
 def test_a_relative_scratch_root_is_made_absolute(tmp_path, fake_runtime, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert make_provider(tmp_path, scratch_root="scratch").scratch_root == tmp_path / "scratch"
+
+
+async def test_no_worker_thread_is_awaited_under_the_janitor_lock(tmp_path, monkeypatch):
+    # The executor may be busy with starts: the node-wide lock would be held all that time.
+    root = tmp_path / "sessions"
+    root.mkdir()
+    held = []
+    original = asyncio.to_thread
+
+    async def recording(function, /, *args, **kwargs):
+        held.append(janitor_lock_held(root))
+        return await original(function, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording)
+    session = await sessions.create_session(root, sessions.new_instance_name())
+    assert await sessions.trash_session_awaiting(session) is not None
+    assert held and not any(held)
+
+
+def removed_during_an_rm(tree: Path) -> bool:
+    for top in range(40):
+        for sub in range(50):
+            (tree / "rootfs" / f"d{top}" / f"s{sub}").mkdir(parents=True)
+    rm = subprocess.Popen(["rm", "-rf", "--", str(tree / "rootfs")])
+    time.sleep(0.01)
+    try:
+        remove_tree(tree)
+    finally:
+        rm.wait()
+    return not tree.exists()
+
+
+def test_a_removal_finishes_what_another_deletion_left(tmp_path):
+    # A janitor can claim a pod whose services' entries a detached rm still deletes.
+    assert all(removed_during_an_rm(tmp_path / f"tree{trial}") for trial in range(5))
+
+
+async def test_finished_deletions_are_forgotten(tmp_path, sif, fake_runtime):
+    provider = make_provider(tmp_path)
+    first = await provider.start(SandboxSpec(image=str(sif)))
+    second = await provider.start(SandboxSpec(image=str(sif)))
+    await first.stop()
+    (deleted,) = _DELETIONS
+    while os.path.lexists(deleted):
+        await asyncio.sleep(0.05)
+    await second.stop()
+    assert deleted not in _DELETIONS

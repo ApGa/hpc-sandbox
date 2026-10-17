@@ -138,7 +138,6 @@ def _background_deletions_finish() -> Iterator[None]:
         time.sleep(0.05)
 
 
-@functools.cache
 def in_mount_namespace(script: str, *args: str) -> str:
     """Run the Python ``script`` as root of new user and mount namespaces; its output."""
     if shutil.which("unshare") is None:
@@ -158,6 +157,7 @@ def in_mount_namespace(script: str, *args: str) -> str:
     return result.stdout
 
 
+@functools.cache
 def namespaces_unavailable() -> str | None:
     """Why sandbox namespaces cannot be created on this host, or None if they can."""
     if shutil.which("nsenter") is None:

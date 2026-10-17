@@ -21,8 +21,9 @@ from typing import Any
 
 import pytest
 from conftest import make_enroot_provider, make_provider, namespaces_unavailable
+from test_trash import janitor_lock_held
 
-from hpc_sandbox import SandboxSpec
+from hpc_sandbox import SandboxSpec, sessions
 from hpc_sandbox.pods import check_pod, health_argv, hosts_file
 from hpc_sandbox.procfs import owned_live_start_time
 from hpc_sandbox.types import (
@@ -427,6 +428,38 @@ async def test_the_janitor_removes_the_pods_of_a_dead_owner(runtime, tmp_path):
     report = await provider.reap()
     assert pod_id in report.removed and not report.errors
     assert not (provider.pod_root / pod_id).exists()
+
+
+async def test_the_pods_janitor_deletes_nothing_under_the_pod_roots_lock(
+    runtime, tmp_path, monkeypatch
+):
+    provider, image = runtime
+    kind = "enroot" if type(provider).__name__.startswith("Enroot") else "singularity"
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    command = [sys.executable, "-c", CRASH.format(src=src), kind, str(provider.scratch_root)]
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [*command, str(tmp_path / "cache"), image],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == -signal.SIGKILL, result.stderr
+    pod_id = result.stdout.split()[0]
+    await asyncio.sleep(0.5)  # the parent-death signals
+    deleted = []
+    original = sessions.remove_tree
+
+    def recording(path: Path) -> None:
+        deleted.append((path.name.split(".")[0], janitor_lock_held(provider.pod_root)))
+        original(path)
+
+    monkeypatch.setattr(sessions, "remove_tree", recording)
+    report = await provider.reap()
+    assert pod_id in report.removed and not report.errors
+    # The pod goes whole, services and all, once its root's janitor lock is released.
+    assert deleted == [(pod_id, False)]
 
 
 def test_pod_spec_validation():

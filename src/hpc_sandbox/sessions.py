@@ -246,34 +246,23 @@ async def create_session(root: Path, name: str) -> Session:
     """:func:`open_session` for the event loop.
 
     The janitor lock is awaited, never waited for in a worker thread: a sweep
-    holding it needs worker threads to finish. A session created after the
-    caller was cancelled is removed again.
+    holding it needs worker threads to finish. The lease is taken inline, a
+    few metadata operations on local scratch, so that the node-wide lock is
+    never held while a busy executor gets to a worker thread.
     """
     await asyncio.to_thread(root.mkdir, mode=0o700, parents=True, exist_ok=True)
     async with locked(root / JANITOR_LOCK):
-        task = asyncio.ensure_future(asyncio.to_thread(_lease, root, name))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            while not task.done():
-                with suppress(asyncio.CancelledError):
-                    await asyncio.wait({task})
-            if not task.cancelled() and task.exception() is None:
-                session = task.result()
-                try:
-                    await asyncio.to_thread(remove_tree, session.path)
-                finally:
-                    session.release()
-            raise
+        return _lease(root, name)
 
 
 async def trash_session_awaiting(session: Session) -> Path | None:
     """:func:`trash_session` for the event loop: the janitor lock is awaited,
-    never waited for in a worker thread (see :func:`create_session`)."""
+    never waited for in a worker thread, and the session is moved inline (see
+    :func:`create_session`)."""
     doomed = None
     try:
         async with locked(session.path.parent / JANITOR_LOCK):
-            doomed = await asyncio.to_thread(move_to_trash, session.path)
+            doomed = move_to_trash(session.path)
     finally:
         session.release()
     return doomed
@@ -293,26 +282,33 @@ def remove_tree(path: Path) -> None:
         return
 
     def make_traversable(directory: Path) -> None:
-        info = directory.lstat()
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:  # another deletion of the tree got there first
+            return
         if stat.S_ISLNK(info.st_mode):
             return
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise SandboxError(f"refusing to remove a directory this uid does not own: {directory}")
         if info.st_dev != device:
             raise SandboxError(f"refusing to remove a tree through the mount point {directory}")
-        directory.chmod(stat.S_IMODE(info.st_mode) | 0o700)
+        with suppress(FileNotFoundError):
+            directory.chmod(stat.S_IMODE(info.st_mode) | 0o700)
 
     if path.is_symlink():
         raise SandboxError(f"refusing to remove a symlinked tree: {path}")
     make_traversable(path)
 
     def fail(error: OSError) -> None:
-        raise error
+        if not isinstance(error, FileNotFoundError):
+            raise error
 
     for directory, directories, _files in os.walk(path, onerror=fail):
         for name in directories:
             make_traversable(Path(directory) / name)
-    shutil.rmtree(path)
+    while os.path.lexists(path):
+        with suppress(FileNotFoundError):  # another deletion removed an entry first: go on
+            shutil.rmtree(path)
 
 
 @dataclass
@@ -359,6 +355,7 @@ async def sweep(
     provider: str | None = None,
     claim_unknown: bool = True,
     wait: bool = True,
+    delete: bool = True,
 ) -> JanitorReport | None:
     """Stop and remove abandoned sessions below ``root``.
 
@@ -373,6 +370,7 @@ async def sweep(
     directories are never touched; foreign directories and failed stops are
     reported and kept. With ``wait=False`` it sweeps only if no other process
     holds the root's janitor lock right now, and returns None when one does.
+    With ``delete=False`` it only stops: the caller deletes ``root`` whole.
     """
     report = JanitorReport()
     if not root.is_dir():
@@ -393,9 +391,9 @@ async def sweep(
                 owner = record_provider(_read_owner_record(path))
                 if owner != provider and (owner is not None or not claim_unknown):
                     continue
-            await _sweep_session(path, stop, labels, report, doomed)
+            await _sweep_session(path, stop, labels, report, doomed if delete else None)
         try:
-            doomed += _claim_dead_trash(root)
+            doomed += _claim_dead_trash(root) if delete else []
         except (OSError, SandboxError) as error:
             report.errors.append(f"could not claim the trash of {root}: {error}")
     for path in doomed:
@@ -411,7 +409,7 @@ async def _sweep_session(
     stop: Stopper,
     labels: Mapping[str, str] | None,
     report: JanitorReport,
-    doomed: list[Path],
+    doomed: list[Path] | None,
 ) -> None:
     try:
         lease = open_lock_file(path / LEASE_FILE)
@@ -443,6 +441,8 @@ async def _sweep_session(
         )
         if await stop(path, record if bound else None):
             report.stopped.append(path.name)
+        if doomed is None:  # stop only
+            return
         moved = move_to_trash(path)
         if moved is not None:
             doomed.append(moved)

@@ -21,7 +21,6 @@ import re
 import shlex
 import shutil
 import stat
-import subprocess
 import threading
 import time
 import uuid
@@ -99,6 +98,7 @@ _DETACH = (
 )
 # Trash entries this process started deleting (wait_for_deletions).
 _DELETIONS: set[Path] = set()
+_DETACH_TIMEOUT_S = 30.0
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROBE_SCRIPT = """\
 set -e
@@ -132,6 +132,33 @@ _PROBE_TIMEOUT_S = 120.0
 
 T = TypeVar("T")
 S = TypeVar("S", bound="SessionSandbox")
+
+
+async def _detach_deletion(path: Path) -> None:
+    stderr_path = path.parent / f".{path.name}.log"
+    lock_path = (
+        path.parent.parent / ".deletions.lock"
+    )  # next to the janitor lock, in the session root
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/bin/sh",
+            "-c",
+            _DETACH,
+            DELETE_SCRIPT,
+            str(path),
+            str(stderr_path),
+            str(lock_path),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        async with asyncio.timeout(_DETACH_TIMEOUT_S):
+            await process.wait()
+    except (OSError, TimeoutError) as error:
+        log.warning("hpc-sandbox: could not start deleting %s: %s", path, error)
+        return
+    _DELETIONS.add(path)
 
 
 class SessionProvider(Generic[S]):
@@ -304,7 +331,11 @@ class SessionProvider(Generic[S]):
         stopped = False
         services = path / SERVICES_DIRECTORY
         if services.is_dir() and not services.is_symlink():
-            swept = await sweep(services, self._stop_abandoned_service, provider=self.name)
+            # Stop only: the pod's own sweep moves it whole, services and all, into the trash,
+            # and deletes it once the pod root's janitor lock is released.
+            swept = await sweep(
+                services, self._stop_abandoned_service, provider=self.name, delete=False
+            )
             assert swept is not None  # it waits for the janitor lock
             if swept.errors or swept.live:
                 raise SandboxError("; ".join(swept.errors) or f"live services: {swept.live}")
@@ -348,35 +379,14 @@ class SessionProvider(Generic[S]):
             await asyncio.sleep(0.05)
         return True
 
-    def _delete_in_background(self, path: Path) -> None:
+    async def _delete_in_background(self, path: Path) -> None:
         """Delete a trash entry with ``rm`` in a detached process, so that a stop returns once its session left the
         session root, and the deletion holds no lock, worker thread or GIL here. The process outlives this one if
-        need be; if it is killed, a janitor finishes the deletion."""
-        stderr_path = path.parent / f".{path.name}.log"
-        # The lock sits next to the janitor lock, in the session root.
-        lock_path = path.parent.parent / ".deletions.lock"
-        try:
-            subprocess.run(
-                [
-                    "/bin/sh",
-                    "-c",
-                    _DETACH,
-                    DELETE_SCRIPT,
-                    str(path),
-                    str(stderr_path),
-                    str(lock_path),
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            log.warning("hpc-sandbox: could not start deleting %s: %s", path, error)
-            return
-        _DELETIONS.add(path)
+        need be; if it is killed, a janitor finishes the deletion. A cancelled caller still starts it."""
+        _DELETIONS.difference_update(
+            [done for done in list(_DELETIONS) if not os.path.lexists(done)]
+        )
+        await asyncio.shield(_detach_deletion(path))
 
     async def copy_tree(self, source: Path, target: Path) -> None:
         """``cp -a --reflink=auto``: near-free on reflink filesystems, a full copy otherwise."""
@@ -995,7 +1005,7 @@ class SessionSandbox:
         """Take a stopped session out of the session root at once; its files go in the background."""
         doomed = await trash_session_awaiting(session)
         if doomed is not None:
-            self._provider._delete_in_background(doomed)
+            await self._provider._delete_in_background(doomed)
 
 
 async def _in_thread(
