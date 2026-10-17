@@ -6,7 +6,7 @@ import fcntl
 import os
 from pathlib import Path
 
-from conftest import make_provider
+from conftest import in_mount_namespace, make_provider
 
 from hpc_sandbox import SandboxSpec, sessions
 from hpc_sandbox.sessions import JANITOR_LOCK, TRASH_DIR
@@ -81,3 +81,27 @@ async def test_janitors_finish_the_deletions_of_dead_processes_only(
     assert not report.errors
     assert not dead.exists() and not recent.exists()
     assert live.exists()
+
+
+def test_removals_never_go_through_a_mount_point(tmp_path):
+    tree = tmp_path / "tree"
+    (tree / "rootfs").mkdir(parents=True)
+    script = """
+import subprocess, sys
+from pathlib import Path
+from hpc_sandbox.sessions import remove_tree
+from hpc_sandbox.types import SandboxError
+tree = Path(sys.argv[1])
+subprocess.run(["mount", "-t", "tmpfs", "tmpfs", str(tree / "rootfs")], check=True)
+(tree / "rootfs" / "kept").write_text("kept")
+try:
+    remove_tree(tree)
+except SandboxError as error:
+    print("mount point" in str(error), (tree / "rootfs" / "kept").exists())
+"""
+    assert in_mount_namespace(script, str(tree)).split() == ["True", "True"]
+
+
+def test_a_relative_scratch_root_is_made_absolute(tmp_path, fake_runtime, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert make_provider(tmp_path, scratch_root="scratch").scratch_root == tmp_path / "scratch"

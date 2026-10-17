@@ -139,6 +139,25 @@ def _background_deletions_finish() -> Iterator[None]:
 
 
 @functools.cache
+def in_mount_namespace(script: str, *args: str) -> str:
+    """Run the Python ``script`` as root of new user and mount namespaces; its output."""
+    if shutil.which("unshare") is None:
+        pytest.skip("needs unshare")
+    if reason := namespaces_unavailable():
+        pytest.skip(reason)
+    source = str(Path(__file__).parents[1] / "src")
+    result = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--mount", sys.executable, "-c", script, *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "PYTHONPATH": source},
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
 def namespaces_unavailable() -> str | None:
     """Why sandbox namespaces cannot be created on this host, or None if they can."""
     if shutil.which("nsenter") is None:

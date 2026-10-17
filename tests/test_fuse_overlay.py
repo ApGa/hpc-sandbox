@@ -4,12 +4,13 @@ an unprivileged instance, unmounted before its session is deleted (by its owner 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
 
 import pytest
-from conftest import FakeRuntime, make_provider, namespaces_unavailable
+from conftest import FakeRuntime, in_mount_namespace, make_provider, namespaces_unavailable
 from test_janitor import crashed_sandboxes
 
 from hpc_sandbox import PodSpec, SandboxSnapshot, SandboxSpec, SandboxStartError, ServiceSpec
@@ -86,6 +87,35 @@ async def test_janitors_unmount_the_overlays_of_abandoned_sessions(
     assert (report.stopped, report.removed, report.errors) == ([name], [name], [])
     assert ["fusermount3", "-u", str(session / "rootfs")] in fuse_calls(fake_fuse)
     assert not session.exists()
+
+
+async def test_janitors_unmount_overlays_whose_record_is_unreadable(
+    tmp_path, sif, fake_runtime, fake_fuse, monkeypatch
+):
+    monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")
+    (name,) = await crashed_sandboxes(tmp_path, sif, "a")
+    session = make_provider(tmp_path).session_root / name
+    (session / OVERLAY_RECORD).write_text("")  # as a crash or a full disk might have left it
+    report = await make_provider(tmp_path).reap()
+    assert (report.stopped, report.removed, report.errors) == ([name], [name], [])
+    assert ["fusermount3", "-u", str(session / "rootfs")] in fuse_calls(fake_fuse)
+
+
+def test_mounts_are_found_through_links_relative_paths_and_escapes(tmp_path):
+    real = tmp_path / "a b\\c\td"
+    (real / "rootfs").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(real)
+    script = """
+import subprocess, sys
+from pathlib import Path
+from hpc_sandbox.singularity import _mounted
+paths = [Path(arg) / "rootfs" for arg in sys.argv[1:]]
+print([_mounted(path) for path in paths])
+subprocess.run(["mount", "-t", "tmpfs", "tmpfs", str(paths[0])], check=True)
+print([_mounted(path) for path in paths])
+"""
+    output = in_mount_namespace(script, str(real), str(tmp_path / "link"), os.path.relpath(real))
+    assert output.splitlines() == ["[False, False, False]", "[True, True, True]"]
 
 
 async def test_a_fuse_overlay_snapshot_is_its_upper_layer_and_restores_over_the_template(
@@ -176,6 +206,7 @@ async def test_pod_services_get_the_copy_layout(tmp_path, sif, fake_runtime, fak
         assert [call[-2] for call in fake_runtime.calls("build")] == [str(session / "rootfs")]
     finally:
         await pod.stop()
+
 
 def test_layouts_are_checked(tmp_path, fake_runtime, monkeypatch):
     with pytest.raises(ValueError, match="rootfs_layout must be one of"):

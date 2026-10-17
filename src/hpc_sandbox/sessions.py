@@ -55,11 +55,9 @@ _KILL_WAIT_S = 5.0
 TRASH_DIR = ".trash"
 # How long after a trash entry was moved a janitor may take over its deletion.
 TRASH_GRACE_S = 600.0
-# sh -c DELETE_SCRIPT hpc-sandbox-delete TREE: delete a trash entry the way remove_tree does (refusing directories
-# this uid does not own, restoring owner access first), without following links or crossing into other mounts.
 # sh -c DELETE_SCRIPT hpc-sandbox-delete TREE [LOG]: delete a trash entry as remove_tree does (refusing
-# directories this uid does not own, restoring owner access first), without following links or crossing into other
-# mounts; LOG, where the caller sends its errors, is removed when it succeeds.
+# directories this uid does not own, restoring owner access to directories first), without following links or
+# crossing into other mounts; LOG, where the caller sends its errors, is removed when it succeeds.
 DELETE_SCRIPT = r"""
 tree=$1; log=${2:-}
 foreign=$(find "$tree" -xdev -type d ! -uid "$(id -u)" -print 2>/dev/null | head -n 1)
@@ -67,7 +65,7 @@ if [ -n "$foreign" ]; then
     echo "hpc-sandbox: refusing to delete $tree: $foreign is not owned by this uid" >&2
     exit 3
 fi
-chmod -R u+rwX -- "$tree" 2>/dev/null
+find "$tree" -xdev -type d ! -perm -0700 -exec chmod u+rwx -- {} \; 2>/dev/null
 rm -rf --one-file-system -- "$tree" || exit
 if [ -n "$log" ]; then rm -f -- "$log"; fi
 """
@@ -271,8 +269,13 @@ def remove_tree(path: Path) -> None:
 
     Tasks and package managers create directories with mode 000 or 0555.
     Owner rwx is restored top-down, without following links, so rmtree can
-    traverse them. Directories owned by anyone else stop the removal.
+    traverse them. Directories owned by anyone else, and mount points (a
+    rootfs still mounted, alive or not), stop the removal.
     """
+    try:
+        device = path.lstat().st_dev
+    except FileNotFoundError:
+        return
 
     def make_traversable(directory: Path) -> None:
         info = directory.lstat()
@@ -280,14 +283,13 @@ def remove_tree(path: Path) -> None:
             return
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise SandboxError(f"refusing to remove a directory this uid does not own: {directory}")
+        if info.st_dev != device:
+            raise SandboxError(f"refusing to remove a tree through the mount point {directory}")
         directory.chmod(stat.S_IMODE(info.st_mode) | 0o700)
 
     if path.is_symlink():
         raise SandboxError(f"refusing to remove a symlinked tree: {path}")
-    try:
-        make_traversable(path)
-    except FileNotFoundError:
-        return
+    make_traversable(path)
 
     def fail(error: OSError) -> None:
         raise error

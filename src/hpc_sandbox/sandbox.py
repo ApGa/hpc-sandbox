@@ -166,7 +166,7 @@ class SessionProvider(Generic[S]):
     ) -> None:
         if output_limit_bytes < MIN_OUTPUT_LIMIT:
             raise ValueError(f"output_limit_bytes must be at least {MIN_OUTPUT_LIMIT}")
-        self.scratch_root = Path(scratch_root) if scratch_root else default_scratch_root()
+        self.scratch_root = Path(os.path.abspath(scratch_root or default_scratch_root()))
         self.default_timeout_s = default_timeout_s
         self.start_timeout_s = start_timeout_s
         self.stop_timeout_s = stop_timeout_s

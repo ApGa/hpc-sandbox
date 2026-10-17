@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -563,7 +564,9 @@ async def mount_overlay(
         if any(c in str(path) for c in ",:"):
             raise SandboxStartError(f"fuse-overlayfs cannot take a path with ',' or ':': {path}")
     record = {"mountpoint": str(session.rootfs), "lower": str(template), "upper": str(upper)}
-    (session.path / OVERLAY_RECORD).write_text(json.dumps(record, sort_keys=True) + "\n")
+    temporary = session.path / f".{OVERLAY_RECORD}.tmp"
+    temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
+    os.replace(temporary, session.path / OVERLAY_RECORD)
     result = await run_process(
         [mount, "-o", f"lowerdir={template},upperdir={upper},workdir={work}", str(session.rootfs)],
         timeout_s=timeout_s,
@@ -573,23 +576,28 @@ async def mount_overlay(
 
 
 def _mounted(path: Path) -> bool:
-    target = str(path).replace(" ", "\\040")
-    try:
-        with open("/proc/self/mountinfo") as stream:
-            return any(line.split(" ", 5)[4] == target for line in stream)
-    except OSError:
-        return False
+    """Whether something is mounted at ``path`` in this mount namespace.
+
+    The mount table holds real paths, octal-escaped; ``path`` itself is never
+    looked up, since a mount whose daemon died answers nothing.
+    """
+    target = os.path.join(os.path.realpath(path.parent), path.name)
+    with open("/proc/self/mountinfo") as stream:
+        return any(_unescape(line.split(" ", 5)[4]) == target for line in stream)
+
+
+def _unescape(field: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), field)
 
 
 async def unmount_overlay(session_path: Path) -> bool:
     """Unmount a session's fuse-overlay rootfs, if it has one that is mounted; whether one was.
 
     Raises :class:`SandboxError` if it stays mounted, so the session is kept rather than deleted through it."""
-    record_path = session_path / OVERLAY_RECORD
-    if not record_path.exists():
+    if not (session_path / OVERLAY_RECORD).exists():
         return False
-    mountpoint = Path(json.loads(record_path.read_text())["mountpoint"])
-    if mountpoint.parent != session_path or not _mounted(mountpoint):
+    mountpoint = session_path / "rootfs"  # where mount_overlay mounts, whatever the record says
+    if not _mounted(mountpoint):
         return False
     _, unmount = _fuse_tools()
     for args in (["-u"], ["-u", "-z"]):
