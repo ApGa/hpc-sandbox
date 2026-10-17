@@ -354,3 +354,79 @@ async def test_commands_get_the_images_path_and_none_of_the_hosts_variables(prov
         assert image_env.keys() - shell_state, init
         for key, value in image_env.items():
             assert key in shell_state or env.get(key) == value, (key, value, env.get(key))
+
+
+POOL_UNDER_A_HARNESS = """# The "harness": the largest single process. The "tool": a pool of smaller workers.
+cat /dev/zero | tail -c 100000000 > /dev/null &
+harness=$!
+sleep 2
+sh -c 'for i in 1 2 3 4; do cat /dev/zero | tail -c 60000000 > /dev/null & done; wait'
+echo "pool exit $?"
+sleep 1
+for p in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < "$p" 2>/dev/null; echo; done |
+    grep -c "tail -c 100000000 $" | sed 's/^/harness tails: /'
+kill "$harness"
+"""
+
+
+# A pool that is the command itself: it dies whole, with the command.
+POOL_AS_THE_COMMAND = (
+    "for i in 1 2 3 4; do cat /dev/zero | tail -c 40000000 > /dev/null & done; wait"
+)
+
+
+async def test_memory_watchdog_explains_a_command_killed_with_its_children(provider):
+    sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=100))
+    for _ in range(3):
+        result = await sandbox.exec(POOL_AS_THE_COMMAND, timeout_s=120)
+        assert result.exit_code == 137, (result.stdout, result.stderr)
+        assert "memory limit exceeded" in result.stderr and "descendant" in result.stderr
+    # The command outlives its children by an instant: its own status, and the note.
+    result = await sandbox.exec(f"({POOL_AS_THE_COMMAND}); echo sub=$?", timeout_s=120)
+    assert (result.exit_code, result.stdout) == (0, "sub=137\n"), result.stderr
+    assert "memory limit exceeded" in result.stderr
+
+
+# Forks a child holding 2 MB every 10 ms, without end.
+FORKER = """while :; do
+    (cat /dev/zero | tail -c 2000000 > /dev/null) &
+    sleep 0.01
+done"""
+
+
+async def test_memory_watchdog_leaves_nothing_a_forking_command_started(provider):
+    sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=100))
+    for _ in range(3):
+        result = await sandbox.exec(FORKER, timeout_s=60)
+        assert result.exit_code == 137 and "memory limit exceeded" in result.stderr, result
+    await asyncio.sleep(1)
+    left = await sandbox.exec(SURVIVORS)
+    assert left.stdout.strip() == "0", left
+
+
+# The forker's children still running, however coreutils names itself (not this grep).
+SURVIVORS = """for p in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < "$p" 2>/dev/null; echo; done |
+    grep -c "tail -c 2000000 $"
+"""
+
+
+async def test_memory_watchdog_spares_what_other_commands_leave_running(provider):
+    sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=100))
+    detach = "for i in $(seq 100); do (sleep 1000 &); sleep 0.02; done; echo made"
+    maker = asyncio.ensure_future(sandbox.exec(detach, timeout_s=120))
+    await asyncio.sleep(0.3)
+    for _ in range(2):  # killed while the other command detaches its processes
+        assert (await sandbox.exec(POOL_AS_THE_COMMAND, timeout_s=120)).exit_code == 137
+    assert (await maker).stdout == "made\n"
+    count = SURVIVORS.replace("tail -c 2000000 $", "sleep 1000 $")
+    assert (await sandbox.exec(count)).stdout.strip() == "100"
+
+
+async def test_memory_watchdog_kills_a_runaway_pool_and_spares_the_harness(provider):
+    sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=200))
+    result = await sandbox.exec(["/bin/sh", "-c", POOL_UNDER_A_HARNESS], timeout_s=120)
+    assert result.exit_code == 0, (result.stdout, result.stderr)  # the command itself survived
+    assert "pool exit 137" in result.stdout and "harness tails: 1" in result.stdout, result.stdout
+    assert "memory limit exceeded" in result.stderr and "descendant" in result.stderr
+    (kill,) = sandbox.memory_kills
+    assert kill.processes >= 5 and kill.pss_bytes > kill.total_bytes // 2

@@ -80,7 +80,7 @@ the runtime underneath.
 |---|---|
 | `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the scratch and cache filesystems, free space, staging and reflink support, and what matters for the runtime: for Singularity/Apptainer the site settings (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices); for enroot whether namespaces can be created, whether imports can convert layer whiteouts, whether this process runs inside a container, and the site's `enroot.conf` and hooks. With `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
 | `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
-| `python -m hpc_sandbox pull [--refresh] IMAGE...` | Pulls images into the image cache unless cached, printing one JSON line per image: `reference`, `path`, `sha256` (of the image file) and `manifest_digest` (from a digest-pinned remote reference, else null). `--refresh` pulls tags again; sandboxes started afterwards get the new image, and starts never wait for a refresh. |
+| `python -m hpc_sandbox pull [--refresh] IMAGE...` | Pulls images into the image cache unless cached, and checks local image files, printing on stdout only one JSON line per image, with the stable keys `reference`, `path`, `sha256` (of the image file) and `manifest_digest` (from a digest-pinned remote reference, else null); logs go to stderr. `--refresh` pulls tags again; sandboxes started afterwards get the new image, and starts never wait for a refresh. |
 | `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless `--runtime` names one, it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
 
 All commands take `--runtime auto|singularity|enroot` (default
@@ -163,11 +163,27 @@ What both providers share:
    there is followed, a directory receives a directory's contents, and only a
    file replaces an existing file.
 5. **Memory.** With `memory_mb`, a watchdog samples the proportional set size
-   of the container's processes and of every running command once a second.
-   On a breach it kills the largest process, like the kernel OOM killer, and
-   the command that owned it returns 137 with an explanation in stderr; a
-   harness running in the same sandbox survives a runaway tool call. This is
-   a sampled guard, not a cgroup: usage can overshoot between samples.
+   of the container's processes and of every running command once a second. On
+   a breach it kills one branch of processes, never the sandbox's own. It
+   starts from the heaviest of the running commands and the processes left
+   running in the background, and descends into the child branch that holds
+   the most while that child alone holds the excess over the limit. So the
+   command that ran away dies and a harness survives a tool command it started,
+   whatever their sizes; when the memory is spread over several children, their
+   parent's branch dies whole. The victim is never one worker of a pool
+   (children running the very same command line, or multiprocessing's and
+   joblib's workers), which could leave the pool waiting forever: the pool's
+   owner goes, with every worker. Like the kernel's OOM killer, it may kill a
+   larger idle process before a smaller one that is growing; a tool command
+   started with a higher `oom_score_adj` (`choom -n 1000 -- cmd`) goes first,
+   and a value every process inherited changes nothing. The branch dies whole,
+   with whatever it forks meanwhile; its root is killed, never stopped, so its
+   parent sees a kill. A command the watchdog killed returns 137; one whose
+   descendants it killed keeps its own exit status (or times out). Either way
+   the explanation is appended to stderr and recorded in `Sandbox.memory_kills`,
+   with how many processes the branch held and how much the sandbox's own tmpfs
+   mounts (`/dev/shm`, `/run`...) hold, which no kill frees. This is a sampled
+   guard, not a cgroup: usage can overshoot between samples.
 6. **Snapshots** copy the rootfs and the private tmp directories with
    `cp -a --reflink=auto` (near free on reflink filesystems), after a `sync`.
    Processes and memory are not captured; take snapshots while the sandbox is

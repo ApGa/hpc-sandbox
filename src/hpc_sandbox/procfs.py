@@ -33,6 +33,18 @@ def start_time(pid: int) -> str | None:
     return fields[19] if fields else None
 
 
+def parent(pid: int) -> int | None:
+    """The PID of ``pid``'s parent, or None if it is gone."""
+    fields = _stat_fields(pid)
+    return int(fields[1]) if fields else None
+
+
+def identity(pid: int) -> tuple[str, int] | None:
+    """The start time and session ID of ``pid``, or None if it is gone."""
+    fields = _stat_fields(pid)
+    return (fields[19], int(fields[3])) if fields else None
+
+
 def identity_matches(pid: int, expected_start_time: str) -> bool:
     """Whether ``pid`` still names the same process; a zombie still matches."""
     return pid > 0 and start_time(pid) == expected_start_time
@@ -133,10 +145,12 @@ def resident_bytes(pid: int) -> int:
     """
     proc = Path(f"/proc/{pid}")
     try:
-        for line in (proc / "smaps_rollup").read_text().splitlines():
-            if line.startswith("Pss:"):
-                return int(line.split()[1]) * 1024
-        return 0
+        pss = _pss(proc / "smaps_rollup")
+        if pss is None:  # its main thread exited: ask one of the others
+            for thread in (proc / "task").iterdir():
+                if thread.name != str(pid) and (pss := _pss(thread / "smaps_rollup")):
+                    break
+        return pss or 0
     except PermissionError:
         pass
     except OSError:
@@ -148,3 +162,83 @@ def resident_bytes(pid: int) -> int:
     except OSError:
         pass
     return 0
+
+
+def _pss(path: Path) -> int | None:
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1]) * 1024
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        raise
+    except OSError:
+        pass
+    return None
+
+
+def oom_score_adj(pid: int) -> int | None:
+    """``oom_score_adj`` of ``pid`` (-1000 to 1000), None if unreadable."""
+    try:
+        return int(Path(f"/proc/{pid}/oom_score_adj").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+# Where a sandbox's own tmpfs mounts sit; others it sees may be the host's.
+SANDBOX_TMPFS = (
+    "/dev",
+    "/dev/shm",
+    "/tmp",
+    "/var/tmp",
+    "/run",
+    "/run/lock",
+    "/var/run",
+    "/var/lock",
+)
+
+
+def tmpfs_bytes(pid: int) -> int | None:
+    """Bytes held by files on the tmpfs mounted at :data:`SANDBOX_TMPFS` in ``pid``'s view.
+
+    Tried through ``pid`` and then its descendants, until one's mount table is
+    readable (a setuid runtime's own processes are not); None if none is.
+    """
+    for candidate in (pid, *descendants([pid])):
+        try:
+            mountinfo = Path(f"/proc/{candidate}/mountinfo").read_text()
+        except OSError:
+            continue
+        used = 0
+        for mount_point in sandbox_tmpfs(mountinfo):
+            try:
+                info = os.statvfs(f"/proc/{candidate}/root{mount_point}")
+            except OSError:
+                continue
+            used += (info.f_blocks - info.f_bfree) * info.f_frsize
+        return used
+    return None
+
+
+def sandbox_tmpfs(mountinfo: str) -> list[str]:
+    """Mount points of the tmpfs file systems at :data:`SANDBOX_TMPFS`, one per file system.
+
+    Only whole file systems count: a directory of a host tmpfs bound there
+    (``/tmp`` from a scratch directory in RAM) would report every file of that
+    tmpfs.
+    """
+    found: list[str] = []
+    devices = set()
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if "-" not in fields:
+            continue
+        fstype = fields[fields.index("-") + 1]
+        device, root, mount_point = fields[2], fields[3], fields[4]
+        if fstype != "tmpfs" or root != "/" or mount_point not in SANDBOX_TMPFS:
+            continue
+        if device not in devices and mount_point not in found:  # statvfs sees the top mount
+            devices.add(device)
+            found.append(mount_point)
+    return found

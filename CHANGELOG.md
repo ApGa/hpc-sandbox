@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Changed behaviour
+
+- **The memory watchdog kills the branch of processes that holds the memory**,
+  not the largest single process. It starts from the heaviest of the running
+  commands and the processes left running in the background, and descends
+  into the child branch that holds the most while that child alone holds the
+  excess over the limit. So a harness survives a tool command that ran away,
+  even when the harness is the largest process, and a worker pool dies with its
+  parent, never one worker at a time. The branch dies whole, with whatever it
+  forks meanwhile. `oom_score_adj` counts as for the kernel's OOM killer,
+  relative to the parent's value: tool commands started with `choom -n 1000`
+  go first, and a value every process inherited changes nothing.
+- **A command whose descendants the watchdog killed keeps its own exit
+  status**, with the explanation appended to stderr (also when it then times
+  out); only a command the watchdog killed itself returns 137.
+- **Processes that commands leave running in a Singularity sandbox can be
+  killed by the watchdog.** Only the processes that make up the sandbox when
+  it starts are spared.
+
+### Added
+
+- **`MemoryKill.processes` and `MemoryKill.tmpfs_bytes`**: how many processes
+  the killed branch held, and how much the sandbox's own tmpfs mounts held
+  (memory no kill frees). `MemoryKill.pid` and `pss_bytes` now describe the
+  killed branch.
+- **`pull` reports local image files too**, and its stdout holds only the JSON
+  lines, whose keys are stable.
+
 ### Fixed
 
 - **Cancelling a command while it starts no longer hangs.** On Python 3.11,

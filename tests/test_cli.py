@@ -132,3 +132,18 @@ def test_pull_fills_the_cache_and_refreshes_tags(tmp_path, fake_runtime, capsys,
     assert main([*arguments, "--refresh"]) == 0
     refreshed = json.loads(capsys.readouterr().out)
     assert refreshed["sha256"] != first["sha256"] and len(fake_runtime.calls("pull")) == 2
+
+
+def test_pull_reports_local_image_files_and_prints_only_json(tmp_path, sif, fake_runtime, capsys):
+    import hashlib
+
+    assert main(["pull", "--runtime", "singularity", *common(tmp_path), str(sif)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {
+            "reference": str(sif),
+            "path": str(sif.resolve()),
+            "sha256": hashlib.sha256(sif.read_bytes()).hexdigest(),
+            "manifest_digest": None,
+        }
+    ]

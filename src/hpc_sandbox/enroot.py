@@ -813,6 +813,9 @@ class EnrootSandbox(SessionSandbox):
         # The launcher and the container's init (its only child) are protected.
         return self._anchor.pid if self._anchor and self._init_pid else None
 
+    def _container_pid(self) -> int | None:
+        return self._init_pid  # the launcher still sees the host's mounts
+
     def _prepare_rootfs(self) -> None:
         assert self._session is not None
         session = self._session

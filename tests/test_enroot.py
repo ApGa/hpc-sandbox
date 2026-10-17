@@ -9,6 +9,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1265,3 +1266,56 @@ async def test_working_directory_failures_keep_their_shape_whatever_the_path(
     reason = "it does not exist or cannot be reached"
     expected = ExecResult(126, "", f"{CWD_ERROR_PREFIX}/gone: {reason}\n")
     assert await sandbox.exec("true", cwd="/gone") == expected
+
+
+async def test_memory_watchdog_explains_a_command_killed_with_its_children(enroot_provider, sqsh):
+    from test_integration import POOL_AS_THE_COMMAND
+
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), memory_mb=100))
+    for _ in range(3):  # the note used to come too late now and then
+        result = await sandbox.exec(POOL_AS_THE_COMMAND, timeout_s=60)
+        assert result.exit_code == 137, (result.stdout, result.stderr)
+        assert "memory limit exceeded" in result.stderr and "descendant" in result.stderr
+    result = await sandbox.exec(f"({POOL_AS_THE_COMMAND}); echo sub=$?", timeout_s=60)
+    assert (result.exit_code, result.stdout) == (0, "sub=137\n"), result.stderr
+    assert "memory limit exceeded" in result.stderr
+    assert all(kill.exec_root is not None for kill in sandbox.memory_kills)
+
+
+async def test_memory_watchdog_explains_a_kill_while_worker_threads_are_busy(enroot_provider, sqsh):
+    # Other sandboxes keep the default executor busy; the note must still come in time.
+    from test_integration import POOL_AS_THE_COMMAND
+
+    sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), memory_mb=100))
+    busy = asyncio.Event()
+
+    async def occupy() -> None:
+        while not busy.is_set():
+            await asyncio.to_thread(time.sleep, 0.05)
+
+    workers = [asyncio.ensure_future(occupy()) for _ in range(64)]
+    try:
+        for _ in range(3):
+            result = await sandbox.exec(POOL_AS_THE_COMMAND, timeout_s=60)
+            assert result.exit_code == 137 and "memory limit exceeded" in result.stderr, result
+    finally:
+        busy.set()
+        await asyncio.gather(*workers)
+
+
+async def test_memory_watchdog_kills_a_runaway_pool_and_spares_the_harness(
+    tmp_path, sqsh, fake_enroot
+):
+    from test_integration import POOL_UNDER_A_HARNESS
+
+    provider = make_enroot_provider(tmp_path)
+    sandbox = await provider.start(SandboxSpec(image=str(sqsh), memory_mb=200))
+    assert (await sandbox.exec("head -c 30000000 /dev/zero > /dev/shm/blob")).exit_code == 0
+    result = await sandbox.exec(["/bin/sh", "-c", POOL_UNDER_A_HARNESS], timeout_s=60)
+    assert result.exit_code == 0, (result.stdout, result.stderr)
+    assert "pool exit 137" in result.stdout and "harness tails: 1" in result.stdout, result.stdout
+    (kill,) = sandbox.memory_kills
+    assert kill.processes >= 5 and kill.exec_root is not None
+    assert kill.tmpfs_bytes is not None and kill.tmpfs_bytes >= 30_000_000  # /dev/shm/blob
+    assert f"tmpfs files hold {kill.tmpfs_bytes} bytes" in result.stderr
+    await sandbox.stop()

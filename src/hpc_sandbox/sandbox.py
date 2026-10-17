@@ -30,7 +30,7 @@ from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Generic, NoReturn, Self, TypeVar
 
-from . import memory, safefs
+from . import memory, procfs, safefs
 from .images import ImageStore, ResolvedImage
 from .paths import default_scratch_root
 from .process import TIMEOUT_EXIT_CODE, ProcessResult, kill_tree, run_process
@@ -347,7 +347,10 @@ class SessionSandbox:
         self._lost: str | None = None
         # Active exec calls: host PID of the spawned process -> memory kills charged to it.
         self._execs: dict[int, list[memory.MemoryKill]] = {}
+        self._exec_starts: dict[int, str] = {}  # their start times
         self._watchdog: asyncio.Task[None] | None = None
+        # The sandbox's own processes (PID -> start time), which the watchdog spares.
+        self._protected: dict[int, str] = {}
         # Whether the rootfs comes from a snapshot, that is from files code in a
         # sandbox wrote, rather than from an image.
         self._restored = False
@@ -574,6 +577,23 @@ class SessionSandbox:
         """
         return None
 
+    def _container_pid(self) -> int | None:
+        """A host PID in the container's mount namespace (its tmpfs mounts are measured)."""
+        return self._watch_root()
+
+    def _exec_roots(self) -> list[tuple[int, str]]:
+        """The host processes of the running commands, with their start times."""
+        return [(pid, started) for pid, started in list(self._exec_starts.items())]
+
+    def _own_processes(self) -> list[int]:
+        """The processes that make up the sandbox once it started, which are never killed.
+
+        By default the watch root and its children at that time: commands
+        started later leave orphans there too, and those may be killed.
+        """
+        root = self._watch_root()
+        return [root, *procfs.children(root)] if root else []
+
     # Shared machinery.
 
     async def _boot(self, populate: Callable[[Session], Awaitable[None]]) -> None:
@@ -584,6 +604,11 @@ class SessionSandbox:
             await populate(self._session)
             await asyncio.to_thread(self._prepare_rootfs)
             await self._start_container()
+            self._protected = {
+                pid: started
+                for pid in self._own_processes()
+                if (started := procfs.start_time(pid)) is not None
+            }
             await self._probe()
         except BaseException as error:
             try:
@@ -602,9 +627,11 @@ class SessionSandbox:
                 memory.watch(
                     self.spec.memory_mb * 1024 * 1024,
                     instance_pid=self._watch_root,
-                    exec_roots=lambda: list(self._execs),
+                    exec_roots=self._exec_roots,
                     on_kill=self._on_memory_kill,
                     interval_s=provider.memory_poll_s,
+                    container_pid=self._container_pid,
+                    protected=lambda: self._protected,
                 )
             )
 
@@ -644,6 +671,8 @@ class SessionSandbox:
         def started(pid: int) -> None:
             roots.append(pid)
             self._execs[pid] = kills
+            if (start_time := procfs.start_time(pid)) is not None:
+                self._exec_starts[pid] = start_time
 
         try:
             result = await self._spawn(
@@ -655,6 +684,7 @@ class SessionSandbox:
         finally:
             for pid in roots:
                 self._execs.pop(pid, None)
+                self._exec_starts.pop(pid, None)
         if self._stop_task is not None:
             raise SandboxError(f"sandbox {self.id} was stopped while the command ran")
         started_command, raw_stderr = split_start_marker(result.stderr)
@@ -670,11 +700,14 @@ class SessionSandbox:
             state = "timed out" if result.timed_out else f"exit {result.returncode}"
             detail = (stderr + stdout).strip() or "no output"
             raise SandboxError(f"sandbox {self.id}: the command did not start ({state}): {detail}")
+        for kill in kills:  # what the watchdog killed of this command's tree
+            stderr = _append(stderr, kill.message())
         if result.timed_out:
             note = f"hpc-sandbox: command timed out after {timeout_s:g} s"
             return ExecResult(TIMEOUT_EXIT_CODE, stdout, _append(stderr, note), timed_out=True)
         if kills:
-            return ExecResult(137, stdout, _append(stderr, kills[-1].message()))
+            # The command's own status if it survived, as with the kernel's OOM killer.
+            return ExecResult(result.returncode, stdout, stderr)
         if result.returncode != 0 and not self._container_alive():
             self._mark_lost(stderr)
         return ExecResult(result.returncode, stdout, stderr)
