@@ -87,9 +87,14 @@ TRANSFER_DIR = ".hpc-sandbox-transfer"
 # How long removing a transfer's files may take: code in the sandbox can keep
 # refilling them, and the session's removal takes care of what is left.
 _TRANSFER_CLEANUP_S = 60.0
-# sh -c _DETACH DELETE_SCRIPT TREE LOG: start the deletion in the background and return at once; the deletion is
-# reparented to init, and its errors go to LOG, which it removes when it succeeds.
-_DETACH = '/bin/sh -c "$0" hpc-sandbox-delete "$1" "$2" </dev/null >/dev/null 2>"$2" &'
+# sh -c _DETACH DELETE_SCRIPT TREE LOG LOCK: start the deletion in the background and return at once; the deletion is
+# reparented to init, and its errors go to LOG, which it removes when it succeeds. Deletions of one session root run
+# one at a time (LOCK) and at the lowest CPU priority: in parallel they slowed starts, whose extractions or copies
+# create the same kind of metadata the deletions remove.
+_DETACH = (
+    'if command -v flock >/dev/null 2>&1; then serial="flock $3"; else serial=; fi; '
+    'nice -n 19 $serial /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2" </dev/null >/dev/null 2>"$2" &'
+)
 # Trash entries this process started deleting (wait_for_deletions).
 _DELETIONS: set[Path] = set()
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -338,9 +343,19 @@ class SessionProvider(Generic[S]):
         session root, and the deletion holds no lock, worker thread or GIL here. The process outlives this one if
         need be; if it is killed, a janitor finishes the deletion."""
         stderr_path = path.parent / f".{path.name}.log"
+        # The lock sits next to the janitor lock, in the session root.
+        lock_path = path.parent.parent / ".deletions.lock"
         try:
             subprocess.run(
-                ["/bin/sh", "-c", _DETACH, DELETE_SCRIPT, str(path), str(stderr_path)],
+                [
+                    "/bin/sh",
+                    "-c",
+                    _DETACH,
+                    DELETE_SCRIPT,
+                    str(path),
+                    str(stderr_path),
+                    str(lock_path),
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
