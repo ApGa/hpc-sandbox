@@ -21,6 +21,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import threading
 import time
 import uuid
@@ -41,6 +42,7 @@ from .sessions import (
     Session,
     Stopper,
     create_session,
+    delete_trash_entry,
     kill_exact,
     labels_match,
     new_instance_name,
@@ -86,18 +88,22 @@ TRANSFER_DIR = ".hpc-sandbox-transfer"
 # How long removing a transfer's files may take: code in the sandbox can keep
 # refilling them, and the session's removal takes care of what is left.
 _TRANSFER_CLEANUP_S = 60.0
-# sh -c _DETACH DELETE_SCRIPT TREE LOG LOCK: start the deletion in the background and return at once; the deletion is
-# reparented to init, and its errors go to LOG, which it removes when it succeeds. Deletions of one session root run
-# one at a time (LOCK) and at the lowest CPU priority: in parallel they slowed starts, whose extractions or copies
-# create the same kind of metadata the deletions remove. Each path stays one argument, whatever characters it holds.
+# sh -c _DETACH DELETE_SCRIPT TREE LOG LOCK: start the deletion in the background and return at once. The deletion
+# is reparented to init, holds an flock on TREE from the start (janitors leave such an entry alone), and its errors go
+# to the caller's stderr, the file LOG (removed when it succeeds) or nowhere. Deletions of one session root run one
+# at a time (LOCK) and at the lowest CPU priority: in parallel they slowed starts, whose extractions or copies create
+# the same kind of metadata the deletions remove. Each path stays one argument, whatever characters it holds.
 _DETACH = (
-    "log=$2; "
-    'if command -v flock >/dev/null 2>&1; then set -- flock "$3" /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; '
+    "if command -v flock >/dev/null 2>&1; then "
+    'set -- flock "$1" flock "$3" /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; '
     'else set -- /bin/sh -c "$0" hpc-sandbox-delete "$1" "$2"; fi; '
-    'nice -n 19 "$@" </dev/null >/dev/null 2>"$log" &'
+    'nice -n 19 "$@" </dev/null >/dev/null &'
 )
 # Trash entries this process started deleting (wait_for_deletions).
 _DELETIONS: set[Path] = set()
+# With this many of its deletions pending, a process deletes what it stops itself: under CPU load, deletions at the
+# lowest priority one at a time fall behind the starts, and the trash would grow without bound.
+_DELETION_BACKLOG = 16
 _DETACH_TIMEOUT_S = 30.0
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROBE_SCRIPT = """\
@@ -134,11 +140,23 @@ T = TypeVar("T")
 S = TypeVar("S", bound="SessionSandbox")
 
 
+def _deletion_log(path: Path) -> Path:
+    return path.parent / f".{path.name}.log"
+
+
+def _deleted(path: Path) -> bool:
+    return not os.path.lexists(path) and not os.path.lexists(_deletion_log(path))
+
+
 async def _detach_deletion(path: Path) -> None:
-    stderr_path = path.parent / f".{path.name}.log"
-    lock_path = (
-        path.parent.parent / ".deletions.lock"
-    )  # next to the janitor lock, in the session root
+    log_path: Path | None = _deletion_log(path)
+    # Next to the janitor lock, in the session root.
+    lock_path = path.parent.parent / ".deletions.lock"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        stderr = os.open(log_path, flags, 0o600)
+    except OSError:  # a full scratch: the deletion it needs must start all the same
+        stderr, log_path = subprocess.DEVNULL, None
     try:
         process = await asyncio.create_subprocess_exec(
             "/bin/sh",
@@ -146,19 +164,32 @@ async def _detach_deletion(path: Path) -> None:
             _DETACH,
             DELETE_SCRIPT,
             str(path),
-            str(stderr_path),
+            str(log_path or ""),
             str(lock_path),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
             start_new_session=True,
         )
         async with asyncio.timeout(_DETACH_TIMEOUT_S):
             await process.wait()
-    except (OSError, TimeoutError) as error:
-        log.warning("hpc-sandbox: could not start deleting %s: %s", path, error)
+    except OSError as error:
+        log.warning("hpc-sandbox: deleting %s here: %s", path, error)
+        await _delete_here(path)
         return
+    except TimeoutError:
+        log.warning("hpc-sandbox: deleting %s did not start within %s s", path, _DETACH_TIMEOUT_S)
+    finally:
+        if stderr != subprocess.DEVNULL:
+            os.close(stderr)
     _DELETIONS.add(path)
+
+
+async def _delete_here(path: Path) -> None:
+    try:
+        await asyncio.to_thread(delete_trash_entry, path)
+    except (OSError, SandboxError) as error:
+        log.warning("hpc-sandbox: could not delete %s: %s", path, error)
 
 
 class SessionProvider(Generic[S]):
@@ -369,9 +400,7 @@ class SessionProvider(Generic[S]):
         """Wait until the session files of the sandboxes this process stopped are deleted; False on timeout."""
         deadline = time.monotonic() + timeout_s
         while _DELETIONS:
-            _DELETIONS.difference_update(
-                [path for path in list(_DELETIONS) if not os.path.lexists(path)]
-            )
+            _DELETIONS.difference_update([path for path in list(_DELETIONS) if _deleted(path)])
             if not _DELETIONS:
                 break
             if time.monotonic() > deadline:
@@ -382,11 +411,13 @@ class SessionProvider(Generic[S]):
     async def _delete_in_background(self, path: Path) -> None:
         """Delete a trash entry with ``rm`` in a detached process, so that a stop returns once its session left the
         session root, and the deletion holds no lock, worker thread or GIL here. The process outlives this one if
-        need be; if it is killed, a janitor finishes the deletion. A cancelled caller still starts it."""
-        _DELETIONS.difference_update(
-            [done for done in list(_DELETIONS) if not os.path.lexists(done)]
-        )
-        await asyncio.shield(_detach_deletion(path))
+        need be; if it is killed, a janitor finishes the deletion. A cancelled caller still starts it. While too
+        many of this process's deletions are pending, the caller deletes the entry itself, at its own priority."""
+        _DELETIONS.difference_update([done for done in list(_DELETIONS) if _deleted(done)])
+        if len(_DELETIONS) >= _DELETION_BACKLOG:
+            await asyncio.shield(_delete_here(path))
+        else:
+            await asyncio.shield(_detach_deletion(path))
 
     async def copy_tree(self, source: Path, target: Path) -> None:
         """``cp -a --reflink=auto``: near-free on reflink filesystems, a full copy otherwise."""

@@ -48,6 +48,8 @@ _ENROOT_KEYS = (
 )
 _SHARED_FILESYSTEMS = {"lustre", "nfs", "nfs4", "gpfs", "beegfs", "cifs", "fuse.sshfs"}
 RUNTIMES = ("auto", "singularity", "enroot")
+# How long a command waits for the deletions of the sessions it stopped before it exits.
+_DELETION_WAIT_S = 60.0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -191,6 +193,7 @@ async def _run(args: argparse.Namespace) -> int:
         result = await sandbox.exec(command, timeout_s=args.timeout)
     finally:
         await sandbox.stop()
+        await provider.wait_for_deletions(_DELETION_WAIT_S)  # the end of a Slurm step kills them
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     return result.exit_code
@@ -444,7 +447,14 @@ async def _smoke(report: _Report, provider: SessionProvider[Any], image: str) ->
         report.line("FAIL", "sandbox use", str(error))
     finally:
         await sandbox.stop()
-        report.line("ok", "sandbox stop", "session removed")
+        deleted = await provider.wait_for_deletions(_DELETION_WAIT_S)
+        report.line(
+            "ok" if deleted else "FAIL",
+            "sandbox stop",
+            "session deleted"
+            if deleted
+            else f"session not deleted within {_DELETION_WAIT_S:.0f} s",
+        )
 
 
 async def site_config(runtime: ContainerRuntime) -> dict[str, str]:

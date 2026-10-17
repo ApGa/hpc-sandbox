@@ -17,9 +17,9 @@ A stopped session leaves the session root by one rename into ``.trash/``, under
 the janitor lock, and its files are deleted after the lock is released: no
 janitor can lease a session that is being deleted, and starts and other stops
 never wait for a deletion. A trash entry is named after the session and the
-process deleting it; janitors finish the deletions of processes that died
-(:data:`TRASH_GRACE_S` after the entry was moved, so that an ``rm`` the process
-left running is not raced).
+process that moved it, and whatever deletes it holds an flock on it; janitors
+take over the entries nobody holds whose process died, or that have waited for
+a deletion longer than :data:`TRASH_GRACE_S`.
 """
 
 from __future__ import annotations
@@ -53,8 +53,9 @@ OWNER_FILE = "owner.json"
 JANITOR_LOCK = ".janitor.lock"
 _KILL_WAIT_S = 5.0
 TRASH_DIR = ".trash"
-# How long after a trash entry was moved a janitor may take over its deletion.
-TRASH_GRACE_S = 600.0
+# How long after a trash entry was moved a janitor may take over its deletion while the process that moved it
+# lives, if no deletion holds it: that process may be about to start one.
+TRASH_GRACE_S = 60.0
 # sh -c DELETE_SCRIPT hpc-sandbox-delete TREE [LOG]: delete a trash entry as remove_tree does (refusing
 # directories this uid does not own, restoring owner access to directories first), without following links or
 # crossing into other mounts; LOG, where the caller sends its errors, is removed when it succeeds.
@@ -160,32 +161,6 @@ def leased(path: Path) -> bool:
     return False
 
 
-def remove_session(session: Session) -> None:
-    """Delete a stopped session's directory and drop its lease.
-
-    rmtree unlinks the lease before the directory disappears, and a janitor
-    could then lease a fresh inode and take the half-deleted session for an
-    abandoned one. So the directory first leaves the session root by a rename
-    into the trash, under the janitor lock (one metadata operation), and is
-    deleted after the lock is released.
-    """
-    doomed = trash_session(session)
-    if doomed is not None:
-        remove_tree(doomed)
-
-
-def trash_session(session: Session) -> Path | None:
-    """Move a stopped session into the trash under the janitor lock and drop its lease; the caller deletes the
-    returned trash entry (None: the session directory is gone already)."""
-    doomed = None
-    try:
-        with locked_sync(session.path.parent / JANITOR_LOCK):
-            doomed = move_to_trash(session.path)
-    finally:
-        session.release()
-    return doomed
-
-
 def _owner_tag() -> str:
     return f"{os.getpid()}-{procfs.start_time(os.getpid())}"
 
@@ -225,17 +200,16 @@ def _claim_dead_trash(root: Path) -> list[Path]:
         parts = entry.name.split(".")
         if len(parts) != 3 or not _NAME.fullmatch(parts[0]):
             continue
-        pid, _, started = parts[1].partition("-")
-        if pid.isdigit() and procfs.identity_matches(int(pid), started):
-            continue  # still being deleted by its live owner
         try:
             info = entry.lstat()
         except OSError:
             continue
-        if entry.is_symlink() or info.st_uid != os.getuid():
+        if entry.is_symlink() or info.st_uid != os.getuid() or _being_deleted(entry):
             continue
-        if time.time() - info.st_ctime < TRASH_GRACE_S:
-            continue  # an rm its owner left running may still be deleting it
+        pid, _, started = parts[1].partition("-")
+        owner_alive = pid.isdigit() and procfs.identity_matches(int(pid), started)
+        if owner_alive and time.time() - info.st_ctime < TRASH_GRACE_S:
+            continue  # its owner may be about to delete it
         moved = move_to_trash(entry, trash)
         if moved is not None:
             claimed.append(moved)
@@ -256,9 +230,15 @@ async def create_session(root: Path, name: str) -> Session:
 
 
 async def trash_session_awaiting(session: Session) -> Path | None:
-    """:func:`trash_session` for the event loop: the janitor lock is awaited,
-    never waited for in a worker thread, and the session is moved inline (see
-    :func:`create_session`)."""
+    """Move a stopped session into the trash under the janitor lock and drop its
+    lease; the caller deletes the returned trash entry (None: the session is gone
+    already). The lock is awaited, never waited for in a worker thread, and the
+    session is moved inline (see :func:`create_session`).
+
+    rmtree unlinks the lease before the directory disappears, and a janitor
+    could then lease a fresh inode and take the half-deleted session for an
+    abandoned one: so a session leaves the session root before it is deleted.
+    """
     doomed = None
     try:
         async with locked(session.path.parent / JANITOR_LOCK):
@@ -266,6 +246,38 @@ async def trash_session_awaiting(session: Session) -> Path | None:
     finally:
         session.release()
     return doomed
+
+
+def delete_trash_entry(path: Path) -> None:
+    """:func:`remove_tree` of a trash entry, holding it as a detached deletion does, so that janitors leave it be."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return  # someone else deletes it
+    try:
+        remove_tree(path)
+    finally:
+        os.close(descriptor)
+
+
+def _being_deleted(entry: Path) -> bool:
+    """Whether a deletion holds the trash entry ``entry``."""
+    try:
+        descriptor = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(descriptor)
+    return False
 
 
 def remove_tree(path: Path) -> None:
@@ -398,7 +410,7 @@ async def sweep(
             report.errors.append(f"could not claim the trash of {root}: {error}")
     for path in doomed:
         try:
-            await asyncio.to_thread(remove_tree, path)
+            await asyncio.to_thread(delete_trash_entry, path)
         except (OSError, SandboxError) as error:
             report.errors.append(f"could not delete {path.name}: {error}")
     return report
