@@ -220,14 +220,15 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
         freed[process.pid] = own + sum(freed[kid.pid] for kid in below)
 
     def frees(process: _Process) -> int:
-        """What killing ``process``'s branch frees. A fork copy of its parent with no children
-        of its own (a pool's fork worker) shares its pages with the parent, which keeps them:
-        only its own count. A copy's children share its pages too, and die with it."""
+        """What killing ``process``'s branch frees. A fork copy of its parent (a pool's fork
+        worker) shares its pages with the parent, which keeps them: only its private memory is
+        its own. Unless it has fork copies of its own, which share its pages and die with it:
+        then its whole branch counts, and the descent goes on below it."""
         parent = by_pid.get(process.parent) if process.parent is not None else None
         copy = parent is not None and process.command and process.command == parent.command
         if not copy or process.private_bytes is None or not killable(process):
             return freed[process.pid]
-        if candidates(process.pid):
+        if any(kid.command == process.command for kid in candidates(process.pid)):
             return freed[process.pid]
         own = min(process.private_bytes, process.pss_bytes)
         return freed[process.pid] - process.pss_bytes + own

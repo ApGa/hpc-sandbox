@@ -154,22 +154,28 @@ def resident_bytes(pid: int) -> int:
     return memory_bytes(pid)[0]
 
 
+# Where a process's PSS and private memory are read: smaps_rollup sums smaps, which kernels
+# before 4.14 have alone.
+_SMAPS = ("smaps_rollup", "smaps")
+
+
 def memory_bytes(pid: int) -> tuple[int, int]:
     """Proportional set size and private memory (what its death alone frees) of ``pid``.
 
-    Both fall back to the RSS where ``smaps_rollup`` is unreadable or missing: the setuid
-    Singularity starter is not dumpable, kernels before 4.14 have none, and charging the
-    RSS is conservative. A vanished or zombie process counts as zero.
+    They come from ``smaps_rollup``, or from ``smaps`` where the kernel has no rollup; a
+    process whose main thread exited answers through another thread. Both fall back to the
+    RSS where these cannot be read: the setuid Singularity starter is not dumpable, and
+    charging its RSS is conservative. A vanished or zombie process counts as zero.
     """
     proc = Path(f"/proc/{pid}")
+    name = next((name for name in _SMAPS if (proc / name).exists()), _SMAPS[0])
     try:
-        rollup = _rollup(proc / "smaps_rollup")
+        rollup = _rollup(proc / name)
         if rollup is None:  # its main thread exited: ask one of the others
             for thread in (proc / "task").iterdir():
-                if thread.name != str(pid) and (rollup := _rollup(thread / "smaps_rollup")):
+                if thread.name != str(pid) and (rollup := _rollup(thread / name)):
                     break
-        if rollup is not None:
-            return rollup
+        return rollup or (0, 0)
     except PermissionError:
         pass
     except OSError:
@@ -185,20 +191,27 @@ def memory_bytes(pid: int) -> tuple[int, int]:
 
 
 def _rollup(path: Path) -> tuple[int, int] | None:
+    """The Pss and private memory ``path`` (a smaps_rollup or smaps file) sums up, or None if
+    it holds no Pss. Not Private_Hugetlb: the Pss leaves hugetlb pages out, and the two are
+    compared."""
     try:
-        fields = dict(line.split(":", 1) for line in path.read_text().splitlines() if ":" in line)
+        text = path.read_text()
     except FileNotFoundError:
         return None
     except PermissionError:
         raise
     except OSError:
         return None
-    if "Pss" not in fields:
+    kib = dict.fromkeys(("Pss", "Private_Clean", "Private_Dirty"), 0)
+    found = False
+    for line in text.splitlines():
+        name, colon, value = line.partition(":")
+        if colon and name in kib and (fields := value.split()) and fields[0].isdigit():
+            kib[name] += int(fields[0])
+            found = found or name == "Pss"
+    if not found:
         return None
-    kib = {name: int(value.split()[0]) for name, value in fields.items() if value.split()}
-    # Not Private_Hugetlb: the Pss leaves hugetlb pages out, and the two are compared.
-    private = kib.get("Private_Clean", 0) + kib.get("Private_Dirty", 0)
-    return kib["Pss"] * 1024, private * 1024
+    return kib["Pss"] * 1024, (kib["Private_Clean"] + kib["Private_Dirty"]) * 1024
 
 
 def oom_score_adj(pid: int) -> int | None:

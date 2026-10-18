@@ -180,6 +180,51 @@ def test_a_fork_copy_never_frees_more_than_it_holds():
     assert killed(sandbox(launcher, child, tool), 1500 * MB) == [30]
 
 
+def test_a_pool_owner_that_grows_dies_with_workers_that_run_commands():
+    # The owner shares 600 MB with its 3 fork workers and grew 100 MB. Each worker runs a
+    # command or keeps a helper (an initializer started it): killing a worker with it frees
+    # nothing the owner keeps.
+    harness = proc(10, 2, 10, command=HARNESS, private=10)
+    owner = proc(20, 10, 250, command=TRAIN, private=100)
+    workers = [proc(30 + i, 20, 151, command=TRAIN, private=1) for i in range(3)]
+    helpers = [proc(40 + i, 30 + i, 1, command="sleep 60", private=1) for i in range(3)]
+    processes = sandbox(harness, owner, *workers, *helpers)
+    assert killed(processes, 670 * MB) == [20, 30, 31, 32, 40, 41, 42]
+
+
+def test_a_grader_that_grows_dies_with_the_solutions_it_runs():
+    # human-eval's check_correctness, one problem at a time: a Manager and a Process, forked
+    # from the grader, whose solution runs a command; the grader itself grew.
+    harness = proc(10, 2, 10, command="python3 run.py", private=10)
+    grader = proc(20, 10, 200, command=HARNESS, private=100)
+    manager = proc(30, 20, 101, command=HARNESS, private=1)
+    solution = proc(31, 20, 101, command=HARNESS, private=1)
+    command = proc(40, 31, 1, command="sleep 4", private=1)
+    processes = sandbox(harness, grader, manager, solution, command)
+    assert killed(processes, 400 * MB) == [20, 30, 31, 40]
+
+
+def test_a_worker_that_leaks_dies_before_one_that_runs_a_command():
+    owner = proc(20, 10, 400, command=TRAIN, private=1)
+    leaker = proc(30, 20, 700, command=TRAIN, private=300)
+    busy = proc(31, 20, 400, command=TRAIN, private=1)
+    idle = [proc(32 + i, 20, 400, command=TRAIN, private=1) for i in range(2)]
+    command = proc(40, 31, 1, command="sleep 60", private=1)
+    processes = sandbox(proc(10, 2, 10, command=HARNESS), owner, leaker, busy, *idle, command)
+    assert killed(processes, 2160 * MB) == [30]
+
+
+def test_a_chain_of_fork_copies_never_takes_the_harness():
+    # A child of the harness allocates 400 MB, then forks a worker, which forks another: the
+    # three share the 400 MB. The worker goes with its copy first, and the child, which then
+    # holds the 400 MB alone, at the next sample: the harness survives.
+    harness = proc(10, 2, 19, command=HARNESS, private=0)
+    chain = [proc(20 + 10 * i, 10 + 10 * i, 138, command=HARNESS, private=0) for i in range(3)]
+    assert killed(sandbox(harness, *chain), 235 * MB) == [30, 40]
+    child = proc(20, 10, 400, command=HARNESS, private=400)
+    assert killed(sandbox(harness, child), 235 * MB) == [20]
+
+
 def test_a_harness_running_code_in_children_with_a_manager_survives_a_leak():
     # human-eval's check_correctness, four at once: a Manager's server and a Process each.
     harness = proc(10, 2, 120, command=HARNESS)
@@ -597,13 +642,27 @@ def test_tmpfs_counts_whole_file_systems_only():
     assert procfs.sandbox_tmpfs(mountinfo) == ["/dev", "/dev/shm", "/run/lock"]
 
 
-def test_memory_falls_back_to_the_rss_without_smaps_rollup(tmp_path, monkeypatch):
-    # Kernels before 4.14 have no smaps_rollup: a process must not weigh nothing there.
+def test_memory_comes_from_smaps_where_the_kernel_has_no_smaps_rollup(tmp_path, monkeypatch):
+    # Kernels before 4.14 have no smaps_rollup: smaps gives the same figures, mapping by mapping.
     pid = tmp_path / "proc" / "100"
     (pid / "task" / "100").mkdir(parents=True)
-    (pid / "status").write_text("Name:\tpython3\nVmRSS:\t  102400 kB\n")
+    (pid / "status").write_text("Name:\tpython3\nVmRSS:\t  307200 kB\n")
+    (pid / "smaps").write_text(
+        "00400000-00452000 r-xp 00000000 08:02 173521  /usr/bin/python3\n"
+        "Rss:                 300 kB\n"
+        "Pss:                 100 kB\n"
+        "Pss_Anon:              0 kB\n"
+        "Private_Clean:        20 kB\n"
+        "Private_Dirty:         0 kB\n"
+        "7f0000000000-7f0010000000 rw-p 00000000 00:00 0\n"
+        "Rss:              204800 kB\n"
+        "Pss:              102300 kB\n"
+        "Private_Clean:         0 kB\n"
+        "Private_Dirty:     51180 kB\n"
+        "Private_Hugetlb:  819200 kB\n"
+    )
     monkeypatch.setattr(procfs, "Path", lambda path: tmp_path / str(path).lstrip("/"))
-    assert procfs.memory_bytes(100) == (100 * MB, 100 * MB)
+    assert procfs.memory_bytes(100) == (100 * MB, 50 * MB)
     # Hugetlb pages are not in the PSS, and not in what a death frees either.
     (pid / "smaps_rollup").write_text(
         "00400000-7ffe00000000 ---p 00000000 00:00 0  [rollup]\n"
@@ -614,3 +673,27 @@ def test_memory_falls_back_to_the_rss_without_smaps_rollup(tmp_path, monkeypatch
         "Private_Hugetlb:  819200 kB\n"
     )
     assert procfs.memory_bytes(100) == (150 * MB, 50 * MB)
+
+
+def test_without_smaps_rollup_pages_shared_with_a_fork_copy_count_once(monkeypatch):
+    monkeypatch.setattr(procfs, "_SMAPS", ("no-such-rollup", "smaps"))  # a kernel before 4.14
+    script = (
+        "import os, time\n"
+        "data = bytearray(200 * 2**20); data[::4096] = b'1' * (len(data) // 4096)\n"
+        "child = os.fork()\n"
+        "if child: print(child, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    owner = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE)
+    child = None
+    try:
+        assert owner.stdout is not None
+        child = int(owner.stdout.readline())
+        sizes = [procfs.memory_bytes(pid) for pid in (owner.pid, child)]
+        assert 200 * MB <= sum(pss for pss, _ in sizes) < 260 * MB  # not once per process
+        assert all(private < 20 * MB for _, private in sizes)
+    finally:
+        if child is not None:
+            os.kill(child, signal.SIGKILL)
+        owner.kill()
+        owner.wait()
