@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -734,6 +735,28 @@ async def test_the_janitor_removes_pod_directories_without_records(runtime):
     stray.mkdir(mode=0o700)
     report = await provider.reap()
     assert stray.name in report.removed and not stray.exists()
+
+
+async def test_the_janitor_clears_a_pod_without_services_on_a_full_scratch(runtime, monkeypatch):
+    provider, _ = runtime
+    session = sessions.open_session(provider.pod_root, sessions.new_instance_name())
+    session.write_owner_record(provider=provider.name, kind="pod", labels={})
+    record = json.loads((session.path / "owner.json").read_text())
+    record["owner_start_time"] = "0"  # its owner died before it started a service
+    (session.path / "owner.json").write_text(json.dumps(record))
+    (session.path / "services").mkdir(mode=0o700)
+    session.release()
+    original = sessions.locked
+
+    def full(path: Path, **options):  # no room for a new file, such as the services' lock
+        if path.parent.name == "services" and not path.exists():
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(path))
+        return original(path, **options)
+
+    monkeypatch.setattr(sessions, "locked", full)
+    report = await provider.reap()
+    assert (report.removed, report.errors) == ([session.name], [])
+    assert await provider.wait_for_deletions(30) and not session.path.exists()
 
 
 async def test_a_sweep_and_many_stops_do_not_wait_for_each_other(runtime, tmp_path):

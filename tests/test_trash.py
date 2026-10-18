@@ -380,17 +380,36 @@ async def test_a_cancelled_reap_lets_go_of_what_it_claimed(tmp_path, fake_runtim
     assert list((provider.session_root / TRASH_DIR).glob("hpcsb-*")) == []
 
 
-async def test_a_sweep_takes_so_many_dead_trash_entries_at_a_time(
-    tmp_path, fake_runtime, monkeypatch
+def held_in(directory: Path) -> int:
+    """How many of this process's descriptors are open on entries of ``directory``."""
+    count = 0
+    for descriptor in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            continue
+        count += Path(target).parent == directory
+    return count
+
+
+async def test_a_sweep_holds_so_many_trash_entries_at_a_time_and_takes_them_all(
+    tmp_path, sif, fake_runtime, monkeypatch
 ):
-    monkeypatch.setattr(sessions, "_CLAIMS_PER_SWEEP", 2)
+    monkeypatch.setattr(sessions, "_HELD_AT_ONCE", 2)
+    names = await crashed_sandboxes(tmp_path, sif, "a", "b", "c")
     provider = make_provider(tmp_path)
     dead_trash(provider, "a", "b", "c", "d", "e")
-    left = []
-    for _ in range(3):
-        assert (await provider.reap()).errors == []
-        left.append(len(list((provider.session_root / TRASH_DIR).glob("hpcsb-*"))))
-    assert left == [3, 1, 0]
+    trash, held, original = provider.session_root / TRASH_DIR, [], sessions.delete_tree
+
+    async def counting(path: Path) -> None:
+        held.append(held_in(trash))
+        await original(path)
+
+    monkeypatch.setattr(sessions, "delete_tree", counting)
+    report = await provider.reap()
+    assert report.errors == [] and sorted(report.removed) == sorted(names)
+    assert list(trash.glob("hpcsb-*")) == []
+    assert len(held) == 8 and max(held) == 2
 
 
 async def test_a_stop_takes_its_trash_entry_from_a_janitor_probing_it(

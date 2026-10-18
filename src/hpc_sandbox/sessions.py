@@ -61,9 +61,9 @@ DELETIONS_LOCK = ".deletions.lock"
 # A full scratch (blocks, inodes or quota): no room even to move a session into the trash.
 _NO_ROOM = (errno.ENOSPC, errno.EDQUOT)
 _DELETE_TIMEOUT_S = 3600.0
-# A sweep claims at most this many dead trash entries, each held by a descriptor until it is
-# deleted; the next sweep takes the rest.
-_CLAIMS_PER_SWEEP = 64
+# A sweep holds at most this many trash entries at once, each by a descriptor until it is
+# deleted: past that, it deletes them, takes the janitor lock again and goes on.
+_HELD_AT_ONCE = 64
 # How long after a trash entry was moved a janitor may take over its deletion while the process that moved it
 # lives, if no deletion holds it: that process may be about to start one.
 TRASH_GRACE_S = 60.0
@@ -209,17 +209,20 @@ def move_to_trash(path: Path, trash: Path | None = None) -> Path | None:
     return target
 
 
-def _claim_dead_trash(root: Path, claimed: list[tuple[Path, int | None]]) -> None:
+def _claim_dead_trash(root: Path, claimed: list[tuple[Path, int | None]], taken: set[str]) -> bool:
     """Add to ``claimed`` the trash entries no deletion holds whose mover is gone (or late), renamed
-    under this process's tag and held; janitor lock held."""
+    under this process's tag and held, until it holds :data:`_HELD_AT_ONCE`; janitor lock held.
+    ``taken`` names the entries the sweep claimed before. Returns whether it stopped there."""
     trash = root / TRASH_DIR
     try:
         entries = list(trash.iterdir())
     except OSError:
-        return
+        return False
     for entry in entries:
-        if len(claimed) >= _CLAIMS_PER_SWEEP:
-            return
+        if entry.name in taken:
+            continue  # the sweep could not delete it
+        if len(claimed) >= _HELD_AT_ONCE:
+            return True
         if entry.name.startswith(".") and entry.name.endswith(".log"):
             if not (trash / entry.name[1:-4]).exists():
                 entry.unlink(missing_ok=True)  # the error log of a deletion that ended
@@ -250,6 +253,8 @@ def _claim_dead_trash(root: Path, claimed: list[tuple[Path, int | None]]) -> Non
                 os.close(held)
         if moved is not None:
             claimed.append((moved, held))
+            taken.add(moved.name)
+    return False
 
 
 async def create_session(root: Path, name: str) -> Session:
@@ -443,40 +448,55 @@ async def sweep(
     reported and kept. With ``wait=False`` it sweeps only if no other process
     holds the root's janitor lock right now, and returns None when one does.
     With ``delete=False`` it only stops: the caller deletes ``root`` whole.
+
+    It holds at most :data:`_HELD_AT_ONCE` trash entries at once: past that, it
+    deletes them after the janitor lock and takes the lock again for the rest.
     """
     report = JanitorReport()
     if not root.is_dir():
         return report
+    seen: set[str] = set()  # the sessions it looked at
+    taken: set[str] = set()  # the trash entries it claimed
     doomed: list[tuple[Path, int | None]] = []
+    first = True
     try:
-        janitor = locked(root / JANITOR_LOCK) if wait else try_locked(root / JANITOR_LOCK)
-        async with janitor as held:
-            if held is False:
-                return None
-            for path in sorted(root.iterdir()):
-                if not _NAME.fullmatch(path.name) or path.is_symlink() or not path.is_dir():
-                    continue
-                info = path.lstat()
-                if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-                    report.errors.append(f"refusing foreign or non-private session {path}")
-                    continue
-                if provider is not None:
-                    owner = record_provider(_read_owner_record(path))
-                    if owner != provider and (owner is not None or not claim_unknown):
+        while True:
+            janitor = locked(root / JANITOR_LOCK) if wait else try_locked(root / JANITOR_LOCK)
+            async with janitor as acquired:
+                if acquired is False:  # another process holds it, and takes what is left
+                    return None if first else report
+                first = full = False
+                for path in sorted(root.iterdir()):
+                    if not _NAME.fullmatch(path.name) or path.name in seen:
                         continue
-                await _sweep_session(path, stop, labels, report, doomed if delete else None)
-            try:
-                if delete:
-                    _claim_dead_trash(root, doomed)
-            except (OSError, SandboxError) as error:
-                report.errors.append(f"could not claim the trash of {root}: {error}")
-        while doomed:  # each one handed over before it is deleted
-            path, held = doomed.pop(0)
-            try:
-                await delete_trash_entry(path, held)
-            except (OSError, SandboxError) as error:
-                report.errors.append(f"could not delete {path.name}: {error}")
-        return report
+                    if path.is_symlink() or not path.is_dir():
+                        continue
+                    if len(doomed) >= _HELD_AT_ONCE:
+                        full = True
+                        break
+                    seen.add(path.name)
+                    info = path.lstat()
+                    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                        report.errors.append(f"refusing foreign or non-private session {path}")
+                        continue
+                    if provider is not None:
+                        owner = record_provider(_read_owner_record(path))
+                        if owner != provider and (owner is not None or not claim_unknown):
+                            continue
+                    await _sweep_session(path, stop, labels, report, doomed if delete else None)
+                try:
+                    if delete and not full:
+                        full = _claim_dead_trash(root, doomed, taken)
+                except (OSError, SandboxError) as error:
+                    report.errors.append(f"could not claim the trash of {root}: {error}")
+            while doomed:  # each one handed over before it is deleted
+                path, held = doomed.pop(0)
+                try:
+                    await delete_trash_entry(path, held)
+                except (OSError, SandboxError) as error:
+                    report.errors.append(f"could not delete {path.name}: {error}")
+            if not full:
+                return report
     finally:  # cancelled or failed: let go of what is left, for other janitors to take
         for _, held in doomed:
             if held is not None:

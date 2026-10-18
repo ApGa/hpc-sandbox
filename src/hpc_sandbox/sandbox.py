@@ -40,6 +40,7 @@ from .process import TIMEOUT_EXIT_CODE, ProcessResult, kill_tree, run_process
 from .sessions import (
     DELETE_SCRIPT,
     DELETIONS_LOCK,
+    NAME_PREFIX,
     JanitorReport,
     Session,
     Stopper,
@@ -385,7 +386,11 @@ class SessionProvider(Generic[S]):
 
         stopped = False
         services = path / SERVICES_DIRECTORY
-        if services.is_dir() and not services.is_symlink():
+        if (  # none started: no lock to create, which a full scratch has no room for
+            services.is_dir()
+            and not services.is_symlink()
+            and any(entry.name.startswith(NAME_PREFIX) for entry in services.iterdir())
+        ):
             # Stop only: the pod's own sweep moves it whole, services and all, into the trash,
             # and deletes it once the pod root's janitor lock is released.
             swept = await sweep(
