@@ -412,6 +412,46 @@ async def test_a_sweep_holds_so_many_trash_entries_at_a_time_and_takes_them_all(
     assert len(held) == 8 and max(held) == 2
 
 
+async def test_a_first_start_stops_every_abandoned_session_but_deletes_so_many(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    monkeypatch.setattr(sessions, "_HELD_AT_ONCE", 2)
+    names = await crashed_sandboxes(tmp_path, sif, "a", "b", "c")
+    pids = [fake_runtime.instance_pid(name) for name in names]
+    provider = make_provider(tmp_path)
+    dead_trash(provider, "a", "b", "c", "d", "e")
+    root, trash = provider.session_root, provider.session_root / TRASH_DIR
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    assert [pid for pid in pids if sessions.procfs.owned_live_start_time(pid)] == []
+    assert not any((root / name).exists() for name in names)
+    assert len(list(trash.glob("hpcsb-*"))) == 1 + 5  # left for janitors: a start never waits
+    await sandbox.stop()
+    monkeypatch.setattr(sessions, "TRASH_GRACE_S", 0.0)  # this process moved one, and lives on
+    assert (await provider.reap()).errors == []
+    assert await provider.wait_for_deletions(30)
+    assert list(trash.glob("hpcsb-*")) == []
+
+
+async def test_a_session_that_cannot_be_deleted_is_tried_once_per_sweep(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    monkeypatch.setattr(sessions, "_HELD_AT_ONCE", 2)
+    monkeypatch.setattr(sessions, "TRASH_GRACE_S", 0.0)  # its entry may be taken over at once
+    names = await crashed_sandboxes(tmp_path, sif, "a", "b", "c", "d", "e")
+    provider = make_provider(tmp_path)
+    stuck, original = min(names), sessions.delete_tree
+
+    async def failing(path: Path) -> None:
+        if path.name.startswith(stuck):
+            raise sessions.SandboxError(f"could not delete {path}: a mount is in the way")
+        await original(path)
+
+    monkeypatch.setattr(sessions, "delete_tree", failing)
+    report = await provider.reap()
+    assert [error for error in report.errors if stuck in error] == [report.errors[0]]
+    assert len(report.errors) == 1 and sorted(report.removed) == sorted(names)
+
+
 async def test_a_stop_takes_its_trash_entry_from_a_janitor_probing_it(
     tmp_path, sif, fake_runtime, monkeypatch
 ):

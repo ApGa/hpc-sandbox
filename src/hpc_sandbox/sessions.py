@@ -62,7 +62,7 @@ DELETIONS_LOCK = ".deletions.lock"
 _NO_ROOM = (errno.ENOSPC, errno.EDQUOT)
 _DELETE_TIMEOUT_S = 3600.0
 # A sweep holds at most this many trash entries at once, each by a descriptor until it is
-# deleted: past that, it deletes them, takes the janitor lock again and goes on.
+# deleted (see sweep()).
 _HELD_AT_ONCE = 64
 # How long after a trash entry was moved a janitor may take over its deletion while the process that moved it
 # lives, if no deletion holds it: that process may be about to start one.
@@ -212,7 +212,7 @@ def move_to_trash(path: Path, trash: Path | None = None) -> Path | None:
 def _claim_dead_trash(root: Path, claimed: list[tuple[Path, int | None]], taken: set[str]) -> bool:
     """Add to ``claimed`` the trash entries no deletion holds whose mover is gone (or late), renamed
     under this process's tag and held, until it holds :data:`_HELD_AT_ONCE`; janitor lock held.
-    ``taken`` names the entries the sweep claimed before. Returns whether it stopped there."""
+    ``taken`` names the entries the sweep held before. Returns whether it stopped there."""
     trash = root / TRASH_DIR
     try:
         entries = list(trash.iterdir())
@@ -449,29 +449,32 @@ async def sweep(
     holds the root's janitor lock right now, and returns None when one does.
     With ``delete=False`` it only stops: the caller deletes ``root`` whole.
 
-    It holds at most :data:`_HELD_AT_ONCE` trash entries at once: past that, it
-    deletes them after the janitor lock and takes the lock again for the rest.
+    It holds at most :data:`_HELD_AT_ONCE` trash entries at once, and deletes them
+    after the janitor lock. Past that, a sweep that waits for the lock takes it
+    again for the rest; one that does not (a provider's first start) stops and
+    moves every abandoned session, but leaves what it does not hold in the trash,
+    for janitors.
     """
     report = JanitorReport()
     if not root.is_dir():
         return report
     seen: set[str] = set()  # the sessions it looked at
-    taken: set[str] = set()  # the trash entries it claimed
+    taken: set[str] = set()  # the trash entries it held
     doomed: list[tuple[Path, int | None]] = []
-    first = True
     try:
         while True:
             janitor = locked(root / JANITOR_LOCK) if wait else try_locked(root / JANITOR_LOCK)
             async with janitor as acquired:
-                if acquired is False:  # another process holds it, and takes what is left
-                    return None if first else report
-                first = full = False
+                if acquired is False:  # only a sweep that does not wait, in its one pass
+                    return None
+                full = False
                 for path in sorted(root.iterdir()):
                     if not _NAME.fullmatch(path.name) or path.name in seen:
                         continue
                     if path.is_symlink() or not path.is_dir():
                         continue
-                    if len(doomed) >= _HELD_AT_ONCE:
+                    hold = len(doomed) < _HELD_AT_ONCE
+                    if wait and not hold:
                         full = True
                         break
                     seen.add(path.name)
@@ -483,7 +486,10 @@ async def sweep(
                         owner = record_provider(_read_owner_record(path))
                         if owner != provider and (owner is not None or not claim_unknown):
                             continue
-                    await _sweep_session(path, stop, labels, report, doomed if delete else None)
+                    before = len(doomed)
+                    target = doomed if delete else None
+                    await _sweep_session(path, stop, labels, report, target, hold=hold)
+                    taken.update(moved.name for moved, _ in doomed[before:])
                 try:
                     if delete and not full:
                         full = _claim_dead_trash(root, doomed, taken)
@@ -495,7 +501,7 @@ async def sweep(
                     await delete_trash_entry(path, held)
                 except (OSError, SandboxError) as error:
                     report.errors.append(f"could not delete {path.name}: {error}")
-            if not full:
+            if not (wait and full):
                 return report
     finally:  # cancelled or failed: let go of what is left, for other janitors to take
         for _, held in doomed:
@@ -509,7 +515,11 @@ async def _sweep_session(
     labels: Mapping[str, str] | None,
     report: JanitorReport,
     doomed: list[tuple[Path, int | None]] | None,
+    *,
+    hold: bool = True,
 ) -> None:
+    """Stop an abandoned session and move it into the trash, adding it to ``doomed`` held, or
+    leaving it there for janitors unless ``hold``; with ``doomed`` None, only stop it."""
     try:
         lease = open_lock_file(path / LEASE_FILE)
     except (OSError, SandboxError) as error:
@@ -549,7 +559,7 @@ async def _sweep_session(
                 raise
             await delete_tree(path)  # no room to move it: here, under its lease and the lock
             moved = None
-        if moved is not None:
+        if moved is not None and hold:
             doomed.append((moved, hold_trash_entry(moved)))
         report.removed.append(path.name)
     except (OSError, SandboxError) as error:
