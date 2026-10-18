@@ -157,9 +157,9 @@ def resident_bytes(pid: int) -> int:
 def memory_bytes(pid: int) -> tuple[int, int]:
     """Proportional set size and private memory (what its death alone frees) of ``pid``.
 
-    Both fall back to the RSS when ``smaps_rollup`` is unreadable: the setuid
-    Singularity starter is not dumpable, and charging its RSS is conservative.
-    A vanished or zombie process counts as zero.
+    Both fall back to the RSS where ``smaps_rollup`` is unreadable or missing: the setuid
+    Singularity starter is not dumpable, kernels before 4.14 have none, and charging the
+    RSS is conservative. A vanished or zombie process counts as zero.
     """
     proc = Path(f"/proc/{pid}")
     try:
@@ -168,7 +168,8 @@ def memory_bytes(pid: int) -> tuple[int, int]:
             for thread in (proc / "task").iterdir():
                 if thread.name != str(pid) and (rollup := _rollup(thread / "smaps_rollup")):
                     break
-        return rollup or (0, 0)
+        if rollup is not None:
+            return rollup
     except PermissionError:
         pass
     except OSError:
@@ -195,9 +196,8 @@ def _rollup(path: Path) -> tuple[int, int] | None:
     if "Pss" not in fields:
         return None
     kib = {name: int(value.split()[0]) for name, value in fields.items() if value.split()}
-    private = sum(
-        kib.get(name, 0) for name in ("Private_Clean", "Private_Dirty", "Private_Hugetlb")
-    )
+    # Not Private_Hugetlb: the Pss leaves hugetlb pages out, and the two are compared.
+    private = kib.get("Private_Clean", 0) + kib.get("Private_Dirty", 0)
     return kib["Pss"] * 1024, private * 1024
 
 
@@ -293,7 +293,7 @@ def mounts(mountinfo: str | bytes) -> list[Mount]:
                 _path(fields[3]),
                 _path(fields[4]),
                 os.fsdecode(fstype),
-                os.fsdecode(source),
+                _path(source),
                 os.fsdecode(options),
             )
         )

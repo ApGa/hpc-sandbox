@@ -162,6 +162,24 @@ def test_a_fork_workers_share_of_its_owners_pages_is_not_what_its_death_frees():
     assert killed(sandbox(harness, owner, *workers), (total + 400 - 20) * MB) == [31]
 
 
+def test_a_forked_child_that_forks_again_dies_with_its_worker_and_the_harness_survives():
+    # Code under test, run in a child the harness forked, allocates and forks a worker: the
+    # two share what it allocated, and killing them frees it, whatever their private memory.
+    harness = proc(10, 2, 19, command=HARNESS, private=0)
+    child = proc(20, 10, 219, command=HARNESS, private=0)
+    worker = proc(30, 20, 219, command=HARNESS, private=0)
+    assert killed(sandbox(harness, child, worker), 200 * MB) == [20, 30]
+
+
+def test_a_fork_copy_never_frees_more_than_it_holds():
+    # Private memory beyond the PSS (hugetlb pages, which the PSS leaves out) frees nothing
+    # the limit counts: the tool that holds the excess goes.
+    launcher = proc(10, 2, 10, command=HARNESS)
+    child = proc(20, 10, 50, command=HARNESS, private=8000)
+    tool = proc(30, 10, 2000, command="python3 leak.py", private=2000)
+    assert killed(sandbox(launcher, child, tool), 1500 * MB) == [30]
+
+
 def test_a_harness_running_code_in_children_with_a_manager_survives_a_leak():
     # human-eval's check_correctness, four at once: a Manager's server and a Process each.
     harness = proc(10, 2, 120, command=HARNESS)
@@ -523,13 +541,15 @@ def test_mount_tables_are_read_as_the_kernel_writes_them():
         b"39 35 0:23 / /x\xe2\x80\xa8-\xe2\x80\xa8 rw - tmpfs tmpfs rw\n"
         b"garbage - x\n"
         b"38 35 0:22 /sub /mnt rw - ext4 /dev/sda rw\n"
+        b"40 35 0:24 / /src rw - tmpfs a\\040source\\134 rw\n"
     )
-    found = [(m.point, m.fstype, m.root) for m in procfs.mounts(raw)]
+    found = [(m.point, m.fstype, m.root, m.source) for m in procfs.mounts(raw)]
     assert found == [
-        ("/a b\tc\\d", "tmpfs", "/"),
-        ("/x\xa0y\u2028z", "tmpfs", "/"),
-        ("/x\u2028-\u2028", "tmpfs", "/"),
-        ("/mnt", "ext4", "/sub"),
+        ("/a b\tc\\d", "tmpfs", "/", "tmpfs"),
+        ("/x\xa0y\u2028z", "tmpfs", "/", "none"),
+        ("/x\u2028-\u2028", "tmpfs", "/", "tmpfs"),
+        ("/mnt", "ext4", "/sub", "/dev/sda"),
+        ("/src", "tmpfs", "/", "a source\\"),
     ]
     assert procfs.sandbox_tmpfs(raw) == []  # it read these as lines of their own and failed
 
@@ -575,3 +595,22 @@ def test_tmpfs_counts_whole_file_systems_only():
     # /tmp is a directory of the host's tmpfs; /var/lock is /dev's file system again;
     # /data is not one of the sandbox's own; /dev/shm counts once, as statvfs sees it.
     assert procfs.sandbox_tmpfs(mountinfo) == ["/dev", "/dev/shm", "/run/lock"]
+
+
+def test_memory_falls_back_to_the_rss_without_smaps_rollup(tmp_path, monkeypatch):
+    # Kernels before 4.14 have no smaps_rollup: a process must not weigh nothing there.
+    pid = tmp_path / "proc" / "100"
+    (pid / "task" / "100").mkdir(parents=True)
+    (pid / "status").write_text("Name:\tpython3\nVmRSS:\t  102400 kB\n")
+    monkeypatch.setattr(procfs, "Path", lambda path: tmp_path / str(path).lstrip("/"))
+    assert procfs.memory_bytes(100) == (100 * MB, 100 * MB)
+    # Hugetlb pages are not in the PSS, and not in what a death frees either.
+    (pid / "smaps_rollup").write_text(
+        "00400000-7ffe00000000 ---p 00000000 00:00 0  [rollup]\n"
+        "Rss:              204800 kB\n"
+        "Pss:              153600 kB\n"
+        "Private_Clean:      1024 kB\n"
+        "Private_Dirty:     50176 kB\n"
+        "Private_Hugetlb:  819200 kB\n"
+    )
+    assert procfs.memory_bytes(100) == (150 * MB, 50 * MB)

@@ -220,13 +220,17 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
         freed[process.pid] = own + sum(freed[kid.pid] for kid in below)
 
     def frees(process: _Process) -> int:
-        """What killing ``process``'s branch frees. A fork copy of its parent (a pool's fork
-        worker) shares its pages with the parent, which keeps them: only its own count."""
+        """What killing ``process``'s branch frees. A fork copy of its parent with no children
+        of its own (a pool's fork worker) shares its pages with the parent, which keeps them:
+        only its own count. A copy's children share its pages too, and die with it."""
         parent = by_pid.get(process.parent) if process.parent is not None else None
         copy = parent is not None and process.command and process.command == parent.command
         if not copy or process.private_bytes is None or not killable(process):
             return freed[process.pid]
-        return freed[process.pid] - process.pss_bytes + process.private_bytes
+        if candidates(process.pid):
+            return freed[process.pid]
+        own = min(process.private_bytes, process.pss_bytes)
+        return freed[process.pid] - process.pss_bytes + own
 
     def candidates(pid: int | None) -> list[_Process]:
         """The killable branches right below ``pid``, looking through processes that are not."""
