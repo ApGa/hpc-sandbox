@@ -34,10 +34,11 @@ that ends in `.sif`, names a local file; any other is pulled:
 
 `docker://` and bare references may also use enroot's `registry#path` spelling. A pulled image is
 validated with `sif list` and cached as `sha256-<hex>.sif`, named by the pointer
-`uri-<hash>.sif.json`, or `oci-<digest>.sif.json` for a digest-pinned reference ([Images and the
-image cache](architecture.md#images-and-the-image-cache)). Pin images by digest for reproducible
-runs. A squashfs image (a name ending in `.sqsh` or `.squashfs`, or a local file that starts like
-one) and a scheme that the runtime cannot pull raise `ValueError` before anything is created.
+`uri-<hash>.sif.json`, or `oci-<digest>.sif.json` for a digest-pinned reference
+([Images and the image cache](architecture.md#images-and-the-image-cache)). Pin images by digest
+for reproducible runs. A squashfs image (a name ending in `.sqsh` or `.squashfs`, or a local file
+that starts like one) and a scheme that the runtime cannot pull raise `ValueError` before anything
+is created.
 
 ## Root filesystem
 
@@ -83,9 +84,8 @@ Docker's semantics (whiteouts, opaque and renamed directories). The instance run
 - a snapshot copies only the upper layer, and a restore copies only that back.
 
 File operations in the sandbox go through FUSE: metadata-heavy ones (`find`, many small files) are
-slower than on a copy; Python imports are not. Before it mounts an overlay, the provider writes the
-mount's record (`fuse-overlay.json` in the session), so that a stop or a janitor unmounts whatever
-may be mounted.
+slower than on a copy. Before it mounts an overlay, the provider writes the mount's record
+(`fuse-overlay.json` in the session), so that a stop or a janitor unmounts whatever may be mounted.
 
 ```python
 # fuse_overlay.py: sandboxes whose root filesystem is an overlay over the node's template
@@ -94,7 +94,7 @@ import asyncio
 from hpc_sandbox import SandboxSpec, SingularityProvider
 
 
-async def main():
+async def main() -> None:
     provider = SingularityProvider(rootfs_layout="fuse-overlay")
     async with await provider.start(SandboxSpec(image="docker://python:3.12-slim")) as sandbox:
         result = await sandbox.exec(["python", "-c", "print(6 * 7)"])
@@ -143,8 +143,8 @@ Then it runs `singularity instance start` under the session's instance-control l
 
 `extra_start_args` come next, then the root filesystem and the instance's name, which is the
 sandbox's `id`. The provider never adds `--fakeroot`. With `gpu="nv"`, it sets
-`NVIDIA_VISIBLE_DEVICES=all` for the start unless your environment sets it ([Site
-notes](#site-notes)).
+`NVIDIA_VISIBLE_DEVICES=all` for the start unless your environment sets it
+([Site notes](#site-notes)).
 
 Startup then checks that the PID file appears and is safe (a regular file of yours that others
 cannot write), that the runtime lists exactly this instance (`instance list --json`) with the PID
@@ -201,9 +201,10 @@ stays mounted is kept, never deleted through the mount.
 
 Instances do not die with the process that started them: an instance whose owner died keeps running
 until a janitor stops it, which is the next `hpc-sandbox janitor` or `provider.reap()` on the node,
-or the first start of a later Singularity provider there. A janitor stops an abandoned instance only
-with an owner record bound to its session, and refuses to touch an instance that runs without one.
-Janitors and first starts also:
+or the first start of a later Singularity provider that finds the janitor lock free. A janitor stops
+an abandoned instance only with an owner record bound to its session, and refuses to touch an
+instance that runs without one. Janitors, and the first start of every Singularity provider whether
+it finds the lock free or not, also:
 
 - unmount the overlays whose `fuse-overlayfs` died, wherever their sessions lie on the node. A
   `fuse-overlayfs` killed with SIGKILL, as Slurm kills what outlives a step or a job, leaves its
@@ -244,11 +245,11 @@ Apptainer, it also prints the site settings that matter here: `allow setuid`, `a
   directory as the password database names it, and ignore `SINGULARITY_CONFIGDIR`, so every job of a
   user on a node sees the same instance list. Hence exact instance names, PID files and start-time
   identities, and never `instance stop --all`, which would stop other jobs' instances.
-- **Cgroups.** Most sites give users none, hence the [memory
-  watchdog](architecture.md#the-memory-watchdog). Where Apptainer has rootless cgroups v2 (systemd
-  user delegation), `cgroup_limits=True` turns `cpus` and `memory_mb` into real limits; otherwise
-  `cpus` is advisory. The setuid starter is not dumpable, so the watchdog charges its resident set
-  size instead of its PSS.
+- **Cgroups.** Most sites give users none, hence the
+  [memory watchdog](architecture.md#the-memory-watchdog). Where Apptainer has rootless cgroups v2
+  (systemd user delegation), `cgroup_limits=True` turns `cpus` and `memory_mb` into real limits;
+  otherwise `cpus` is advisory. The setuid starter is not dumpable, so the watchdog charges its
+  resident set size instead of its PSS.
 - **GPUs.** `gpu="nv"` passes NVIDIA GPUs (`--nv`), and `gpu="rocm"` AMD GPUs (`--rocm`). Where
   `singularity.conf` sets `use nvidia-container-cli = yes`, `--nv` with `--containall` exposes only
   the GPUs that `NVIDIA_VISIBLE_DEVICES` names, so the provider sets it to `all`, every GPU the
@@ -257,8 +258,8 @@ Apptainer, it also prints the site settings that matter here: `allow setuid`, `a
   `/dev/fuse`, and unprivileged user namespaces, which its instances run in (`--userns`); janitors
   need only `fusermount3` (or `fusermount`). Each overlay counts towards fusermount's `mount_max`
   (`/etc/fuse.conf`, 1000 by default), a limit on the FUSE mounts of all the node's users together.
-  An overlay whose `fuse-overlayfs` gets SIGKILL stays mounted, dead, until a janitor or a
-  provider's first start on the node unmounts it.
+  An overlay whose `fuse-overlayfs` gets SIGKILL stays mounted, dead, until a janitor, or the first
+  start of any Singularity provider, unmounts it ([Teardown](#teardown)).
 - **Templates are never evicted.** Every image version used on a node keeps an extracted root
   filesystem in `templates/` on scratch, as staged images do in `images/`. A per-job scratch root
   goes with the job. On a scratch root that outlives jobs, keep age-based cleaners such as

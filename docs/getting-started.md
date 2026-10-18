@@ -2,32 +2,33 @@
 
 This page takes you from installation to sandboxes in a batch job: what a node needs, how to
 install hpc-sandbox and check a compute node, your first sandbox from Python and from the command
-line, and Slurm and PBS batch scripts that leave nothing behind.
+line, Slurm and PBS batch scripts that leave nothing behind, and what to do when something fails.
 
 ## Requirements
 
 hpc-sandbox is a Python library and a command for Linux. It needs Python 3.11 or later and nothing
 outside Python's standard library, no daemon and no root: it runs sandboxes with the container
-runtime your site provides, on its compute nodes. What else a node needs depends on what you use:
+runtime your site provides, on its compute nodes. Every sandbox needs what the first five rows of
+this table list; the other rows are needed only for what they name:
 
 | Requirement | Needed for |
 |---|---|
 | Linux and Python 3.11 or later | everything |
-| Singularity CE or Apptainer, installed setuid or in user-namespace mode, or enroot 3.x | sandboxes: one of these runtimes on the compute nodes ([Singularity CE and Apptainer](singularity.md#requirements), [enroot](enroot.md#requirements)) |
-| a directory on the node's local disk | the scratch root, which holds the root filesystem of every sandbox ([Put the sandboxes on local disk](#put-the-sandboxes-on-local-disk)) |
+| Singularity CE or Apptainer, installed setuid or in user-namespace mode, or enroot 3.x | every sandbox: one of these runtimes on the compute nodes ([Singularity CE and Apptainer](singularity.md#requirements), [enroot](enroot.md#requirements)) |
+| a directory on the node's local disk | every sandbox: the scratch root, which holds each sandbox's root filesystem ([Put the sandboxes on local disk](#put-the-sandboxes-on-local-disk)) |
 | an image with `/bin/sh` and the basic tools `sleep`, `mkdir`, `rmdir`, `rm`, `cp` and `dirname` | every sandbox ([Image references](python-api.md#image-references)) |
+| GNU coreutils and `find` | every sandbox: deleting it once it stopped, with `find` and `rm --one-file-system`, in the background under `nice -n 19`; and copies with `cp -a --reflink=auto` (snapshots, restores and Singularity's templates) |
 | unprivileged user namespaces | enroot sandboxes, pods with either runtime, and Singularity's fuse-overlay layout |
 | enroot's `+caps` package, whose `enroot-aufs2ovlfs` converts layer whiteouts | importing images with enroot; local `.sqsh` files need none |
 | util-linux `nsenter` | every command in an enroot sandbox or a pod service |
 | util-linux `prlimit` | commands in pod services that set `ulimits` |
 | util-linux `flock` | optional: with it, the background deletions of stopped sandboxes run one at a time per session root; without it, all at once |
-| GNU coreutils and `find` | copies with `cp -a --reflink=auto` (snapshots, restores and Singularity's templates), and deleting stopped sandboxes with `find` and `rm --one-file-system`, in the background under `nice -n 19` |
 | slirp4netns 0.4 or later, or the one `hpc-sandbox fetch-tools` downloads, and a `/dev/net/tun` that users may open | pods with egress ([Pods](pods.md#egress)) |
 | `fuse-overlayfs`, `fusermount3` or `fusermount`, and `/dev/fuse` | Singularity's fuse-overlay layout; janitors need only `fusermount3` or `fusermount` ([Singularity CE and Apptainer](singularity.md#the-fuse-overlay-layout)) |
 
 `hpc-sandbox doctor` checks the runtime, the scratch root and the image cache on a node, and with
-enroot also the namespaces, `nsenter` and image imports ([Check the
-installation](#check-the-installation)).
+enroot also the namespaces, `nsenter` and image imports
+([Check the installation](#check-the-installation)).
 
 ## Install
 
@@ -43,8 +44,8 @@ pip install hpc-sandbox
 Where the node's `python3` is older than 3.11, load a newer one (sites often provide Python as an
 environment module) or use [uv](https://docs.astral.sh/uv/): `uv venv --python 3.12` creates the
 environment, with a Python that uv downloads if the node has none, and `uv pip install hpc-sandbox`
-installs into it. In a uv project, run `uv add hpc-sandbox`. hpc-sandbox has no dependencies and no
-compiled code.
+installs into it. In a uv project, run `uv add "hpc-sandbox>=0.3,<0.4"`. hpc-sandbox has no
+dependencies and no compiled code.
 
 This installs the `hpc_sandbox` package and the `hpc-sandbox` command. `python -m hpc_sandbox` runs
 the same command, for example with an environment that is not activated:
@@ -77,7 +78,7 @@ To change hpc-sandbox and run its tests, set up a development environment as
 
 ## Check the installation
 
-Both of these print the installed version:
+Both of these print the version of the hpc-sandbox that runs, the first as `hpc-sandbox <version>`:
 
 ```bash
 hpc-sandbox --version
@@ -90,7 +91,7 @@ example with `srun --nodes=1 --pty bash` on Slurm or `qsub -I` on PBS, adding th
 partition or queue and resources your site asks for. In the job, activate the environment and run:
 
 ```bash
-hpc-sandbox doctor --image docker://alpine:3.20
+hpc-sandbox doctor --image docker://python:3.12-slim
 ```
 
 `doctor` prints one line per check, each starting with its status: `[  ok]`, `[info]`, `[warn]` or
@@ -117,7 +118,7 @@ something from you:
 | `[FAIL] namespaces` | The node does not let users create the namespaces that enroot sandboxes need. Ask your site's administrators. |
 | `[warn] image imports` | enroot cannot import images here. Install enroot's `+caps` package, run on the host rather than inside a container, or use local `.sqsh` images. |
 | `[warn] scratch root` | Inside a batch job, the scratch root is on a shared filesystem or a tmpfs. Set `HPC_SANDBOX_SCRATCH` to a directory on the node's local disk ([Put the sandboxes on local disk](#put-the-sandboxes-on-local-disk)). |
-| `[FAIL] scratch root`, `[FAIL] image cache` | The directory cannot be written. Choose another with `HPC_SANDBOX_SCRATCH` or `HPC_SANDBOX_IMAGE_CACHE`. |
+| `[FAIL] scratch root`, `[FAIL] image cache` | The directory cannot be created or written, or the scratch root belongs to another user. Choose another with `HPC_SANDBOX_SCRATCH` or `HPC_SANDBOX_IMAGE_CACHE`. |
 | `[warn] pods: egress` | No slirp4netns that pods can use was found. Only pods with egress need one: run `hpc-sandbox fetch-tools` once, where there is internet access ([Pods](pods.md#egress)). |
 | `[FAIL] sandbox start` | The message says why. When the compute nodes cannot reach the registry, run `hpc-sandbox pull IMAGE` on a machine that can, into an image cache the compute nodes share ([The image cache](configuration.md#the-image-cache)). |
 
@@ -171,8 +172,8 @@ asyncio.run(main())
   when the sandbox uses more than that ([Memory limits](python-api.md#memory-limits)).
 - `async with` stops the sandbox when the block exits, however it exits. The stop returns once the
   sandbox's processes are gone, and a background process deletes its files;
-  `wait_for_deletions()` waits for that ([Wait for deletions before the program
-  exits](#wait-for-deletions-before-the-program-exits)).
+  `wait_for_deletions()` waits for that
+  ([Wait for deletions before the program exits](#wait-for-deletions-before-the-program-exits)).
 
 From the command line, `hpc-sandbox run` does the same for one command. It starts a fresh sandbox,
 runs the command that follows `--` (an argv, without a shell), prints its output, stops the sandbox,
@@ -186,8 +187,8 @@ hpc-sandbox run docker://python:3.12-slim -- python -c 'print(12 ** 2)'
 144
 ```
 
-Its options, such as `--env KEY=VALUE`, `--bind SRC:DST[:ro|rw]`, `--memory-mb N` and
-`--timeout S`, come before `--`; [Command line](cli.md#run) lists them all.
+Its options, such as `--env KEY=VALUE`, `--bind SRC:DST[:ro|rw]`, `--memory-mb MEMORY_MB` and
+`--timeout TIMEOUT`, come before `--`; [Command line](cli.md#run) lists them all.
 
 ## Run in a batch job
 
@@ -198,14 +199,15 @@ waits for its deletions before it exits, and a janitor at the end of the batch s
 ### Put the sandboxes on local disk
 
 The root filesystem of every sandbox, and everything it writes, lives on the scratch root, which
-must be on the node's local disk. Unless `HPC_SANDBOX_SCRATCH` names it, the scratch root is the
-job's directory on local disk on PBS sites that provide one as `$PBS_LOCALDIR` or as
-`/local/$PBS_JOBID`, else a directory in `$TMPDIR` ([The scratch
-root](configuration.md#the-scratch-root) has the exact rules). Many Slurm sites point `TMPDIR` at a
-directory of the job's own on local disk. Where yours does not, or where that directory is small,
-shared or a tmpfs, set `HPC_SANDBOX_SCRATCH` to a directory on the node's local disk, such as one
-your site gives each job. `hpc-sandbox doctor`, run inside a job, shows where the scratch root is,
-its filesystem and its free space, and warns when it is on a shared filesystem or a tmpfs.
+must be on the node's local disk. Unless `HPC_SANDBOX_SCRATCH` names it, the scratch root is
+`hpc-sandbox` in the job's directory on local disk, on PBS sites that provide one as `$PBS_LOCALDIR`
+or as `/local/$PBS_JOBID`, else `hpc-sandbox-<uid>` in `$TMPDIR`
+([The scratch root](configuration.md#the-scratch-root) has the exact rules). Many Slurm sites point
+`TMPDIR` at a directory of the job's own on local disk. Where yours does not, or where that
+directory is small, shared or a tmpfs, set `HPC_SANDBOX_SCRATCH` to a directory on the node's local
+disk, such as one your site gives each job. `hpc-sandbox doctor`, run inside a job, shows where the
+scratch root is, its filesystem and its free space, and warns when it is on a shared filesystem or a
+tmpfs.
 
 A per-job directory that the site deletes when the job ends takes whatever sandboxes left in it
 along. A scratch root that outlives jobs keeps staged copies of images and, with Singularity,
@@ -283,8 +285,9 @@ inside a container that pyxis starts (`srun --container-image`): enroot cannot i
 cd "$PBS_O_WORKDIR"
 source .venv/bin/activate
 
-# The scratch root defaults to the job's local directory where the site provides $PBS_LOCALDIR or
-# /local/$PBS_JOBID. Where it provides neither, name a directory on the node's local disk:
+# The scratch root defaults to hpc-sandbox in the job's local directory where the site provides
+# $PBS_LOCALDIR or /local/$PBS_JOBID. Where it provides neither, name a directory on the node's
+# local disk:
 # export HPC_SANDBOX_SCRATCH="/path/on/local/disk/$PBS_JOBID"
 
 trap 'hpc-sandbox janitor' EXIT    # removes what run.py leaves behind, however the script ends
@@ -333,6 +336,24 @@ pbsdsh -- /usr/bin/env PBS_JOBID="$PBS_JOBID" HPC_SANDBOX_SCRATCH="$HPC_SANDBOX_
 
 Pass paths and identifiers this way, never secrets: every user of a node can read the command lines
 of its processes.
+
+## When something fails
+
+The messages of hpc-sandbox's exceptions and commands say what failed. This is what to do about the
+failures you are most likely to meet:
+
+| What you see | What to do |
+|---|---|
+| A `[FAIL]` or `[warn]` line from `hpc-sandbox doctor` | See [Check the installation](#check-the-installation). |
+| `ValueError` from `start()` | Nothing was created: the spec is invalid, or the image is one the provider can never run, as the message says ([Describing a sandbox](python-api.md#describing-a-sandbox)). |
+| `SandboxError` from `start()` that says `could not pull` | When the compute nodes cannot reach the registry, pull the image where it can be reached, with `hpc-sandbox pull IMAGE`, into an image cache that the compute nodes share ([The image cache](configuration.md#the-image-cache)). |
+| `SandboxStartError` from `start()` | The message says why the sandbox could not start. What the start created is stopped already and deleted in the background; when the message says that this cleanup failed too, `hpc-sandbox janitor` can remove what is left once your program has exited. Run `hpc-sandbox doctor --image IMAGE` with the same image on the same node. |
+| `SandboxError` from `stop()` | The sandbox's session is kept: a later `stop()` tries again, and `hpc-sandbox janitor` can remove it once your program has exited. |
+| `hpc-sandbox janitor` exits with status 1 | Each of its `errors` says what it could not do. It kept the sessions concerned, and a later run tries them again ([`janitor`](cli.md#janitor)). |
+| Anything else | Run `hpc-sandbox doctor --image IMAGE` on the node where it happens. If its output does not explain the problem, open a [bug report](https://github.com/ApGa/hpc-sandbox/issues/new?template=bug_report.yml) with it. |
+
+Ask questions in [GitHub issues](https://github.com/ApGa/hpc-sandbox/issues) as well, and report
+security issues privately, as [SECURITY.md](../SECURITY.md) describes.
 
 ## Next steps
 

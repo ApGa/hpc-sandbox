@@ -4,10 +4,11 @@ Run on a compute node (never a login node) with::
 
     HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_integration.py -v
 
-``HPC_SANDBOX_TEST_RUNTIME`` picks the runtime (``singularity``, ``enroot``,
-or ``auto``: the first of singularity, apptainer and enroot on PATH).
+``HPC_SANDBOX_TEST_RUNTIME`` picks the runtime (``singularity``, ``enroot``, or
+``auto``: the first of singularity, apptainer and enroot on PATH).
 ``HPC_SANDBOX_TEST_IMAGE`` picks the image (default ``docker://alpine:3.20``;
-any image with /bin/sh, sleep, tail and cp works, including a local .sif or
+any image hpc-sandbox can start that has the usual command-line tools of
+BusyBox or a distribution's base system works, including a local .sif or
 .sqsh). Scratch defaults to the job-local directory, as in real runs; with
 Singularity, set ``HPC_SANDBOX_TEST_NETWORK_NONE=1`` where the site allows
 network namespaces. On a GPU node, ``HPC_SANDBOX_TEST_GPUS`` (``all`` with

@@ -9,7 +9,7 @@ hpc-sandbox does not do these things yet. Each row says what happens today inste
 | enroot | an overlay layout | every enroot sandbox extracts its own root filesystem with `enroot create`, which is the copy layout |
 | root filesystems | an ext3 overlay mode, as an alternative to root filesystem directories | root filesystems are directories on node-local scratch, or fuse-overlay mounts over a directory |
 | snapshots | memory snapshots | snapshots hold files (the root filesystem and the private `/tmp` and `/var/tmp`), never processes or memory |
-| sandboxes | per-node PID namespaces inside one shared sandbox | each sandbox has one PID namespace, shared by all its commands |
+| sandboxes | separate PID namespaces for groups of commands inside one sandbox | each sandbox has one PID namespace, shared by all its commands |
 | pods | snapshots of services | `snapshot()` on a pod service raises `SandboxError` |
 | pods | GPUs | services get no GPUs |
 | pods | services that switch to other users | a pod maps one id, your uid, to root; more users would need subordinate id ranges |

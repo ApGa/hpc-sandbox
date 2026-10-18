@@ -23,8 +23,9 @@ the image cache can be reached, and `fetch-tools` wherever there is internet acc
 | `hpc-sandbox fetch-tools [--arch ARCH]` | Downloads the pinned slirp4netns that pods use for egress when the host has none. |
 | `hpc-sandbox janitor [--label KEY=VALUE]...` | Stops and removes the sandboxes and pods that dead processes left on this node, and prints a JSON report. |
 
-`hpc-sandbox --version` prints the installed version, and `hpc-sandbox COMMAND --help` lists a
-command's options.
+`hpc-sandbox --version` prints `hpc-sandbox <version>`: the version that a source checkout's
+`pyproject.toml` sets when hpc-sandbox runs from one, else the installed distribution's.
+`hpc-sandbox COMMAND --help` lists a command's options.
 
 ## Common options
 
@@ -32,9 +33,9 @@ command's options.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--runtime {auto,singularity,enroot}` | `$HPC_SANDBOX_RUNTIME`, else `auto` | The container runtime, and with it the provider. `auto` takes the first of `singularity`, `apptainer` and `enroot` found on `PATH`. |
+| `--runtime {auto,singularity,enroot}` | `$HPC_SANDBOX_RUNTIME`, else `auto` | The container runtime, and with it the provider. `auto` takes the first of `singularity`, `apptainer` and `enroot` found on `PATH`. A `$HPC_SANDBOX_RUNTIME` that is none of the three ends the command with status 2. |
 | `--binary BINARY` | detected | The runtime's executable, a name on `PATH` or a path. With `--runtime auto`, a file name that starts with `enroot` selects enroot, and any other Singularity. |
-| `--scratch-root SCRATCH_ROOT` | `$HPC_SANDBOX_SCRATCH`, the PBS job's local directory, else `$TMPDIR/hpc-sandbox-<uid>` | Node-local scratch for sessions, snapshots, staged images and the runtime's temporary files; see [The scratch root](configuration.md#the-scratch-root). |
+| `--scratch-root SCRATCH_ROOT` | `$HPC_SANDBOX_SCRATCH`, else `hpc-sandbox` in the PBS job's local directory, else `$TMPDIR/hpc-sandbox-<uid>` | Node-local scratch for sessions, snapshots, staged images and the runtime's temporary files; see [The scratch root](configuration.md#the-scratch-root). |
 | `--image-cache IMAGE_CACHE` | `$HPC_SANDBOX_IMAGE_CACHE`, else `${XDG_CACHE_HOME:-~/.cache}/hpc-sandbox/images` | Where pulled images, SIF or squashfs files, are cached; see [The image cache](configuration.md#the-image-cache). |
 
 A command builds one provider from these options and leaves every other provider option at its
@@ -62,20 +63,22 @@ compute node of a new site, with the image you plan to use.
 | `nsenter` | enroot | util-linux `nsenter`, which every command uses. `FAIL` when it is missing. |
 | `namespaces` | enroot | Whether new user, mount, PID, IPC and network namespaces can be created. `FAIL` if not. |
 | `user namespace` | enroot | `warn` when this process runs inside a container's user namespace, where `enroot import` cannot use its file capabilities. |
-| `image imports` | enroot | Whether `enroot-aufs2ovlfs` can convert layer whiteouts on the scratch root, as imports need. `warn` when it cannot: only local `.sqsh` images work then. |
-| `site: <setting>` | both | Singularity and Apptainer: `allow setuid`, `allow user ns`, `sessiondir max size`, `max loop devices`, `enable overlay`, `enable underlay` and `mount home` from the installation's configuration file; `allow setuid = no` and a `sessiondir max size` below 1024 are shown as `warn`. enroot: the `enroot.conf` settings the provider overrides for every sandbox, such as `ENROOT_MOUNT_HOME`. |
+| `image imports` | enroot | Whether `enroot-aufs2ovlfs` can convert layer whiteouts on the scratch root, as imports need. `warn` when it cannot, so that only local `.sqsh` images work, or when the scratch root does not let `doctor` test it. |
+| `site: <setting>` | both | Singularity CE and Apptainer: `allow setuid`, `allow user ns`, `sessiondir max size`, `max loop devices`, `enable overlay`, `enable underlay` and `mount home` from the installation's configuration file; a `sessiondir max size` below 1024 is shown as `warn`. enroot: the `enroot.conf` settings the provider overrides for every sandbox, such as `ENROOT_MOUNT_HOME`. |
 | `site hooks` | enroot | The hooks the enroot installation runs. |
 | `sandbox hooks` | enroot | Which of the hooks sandboxes use (`10-aptfix.sh`, `10-shadow.sh` and `98-nvidia.sh`) the installation has enabled. `warn` names those it lacks, which sandboxes start without. |
 | `batch job` | both | `$PBS_JOBID` or `$SLURM_JOB_ID`, or none. |
-| `scratch root` | both | Its path, filesystem type and free space. `FAIL` when it is not writable; inside a batch job, `warn` when it is on a shared filesystem or a tmpfs. |
-| `image cache` | both | Its path, filesystem type and free space. `FAIL` when it is not writable. |
+| `scratch root` | both | Its path, filesystem type and free space. `FAIL` when it cannot be created or written, or belongs to another user; inside a batch job, `warn` when it is on a shared filesystem or a tmpfs. |
+| `image cache` | both | Its path, filesystem type and free space. `FAIL` when it cannot be created or written. |
 | `image staging` | both | The directory images are staged to, or `off`. |
 | `reflink on scratch` | both | Whether the scratch root's filesystem makes reflink copies: snapshots are cheap with them, and full copies without. |
 | `pods: egress` | both | The slirp4netns that pods with egress would run, or `warn` with how to get one. |
 | `sandbox start`, `exec`, `upload/download`, `sandbox stop` | both | With `--image` only: the steps above, each `ok` or `FAIL`. |
 
-`doctor` creates the scratch root and the image cache when they do not exist. It exits with status
-1 when a check failed, else 0: warnings do not fail it. An abridged example from an enroot node:
+Once it has found the runtime, `doctor` creates the scratch root, with mode 0700, and the image
+cache when they do not exist, as a start does. One that cannot be created or written is a `[FAIL]`
+line. `doctor` exits with status 1 when a check failed, else 0: warnings do not fail it. An abridged
+example from an enroot node:
 
 ```text
 [  ok] runtime: /usr/bin/enroot (3.5.0)
@@ -161,7 +164,7 @@ refresh a tag.
 | `sha256` | The SHA-256 of the image file. |
 | `manifest_digest` | `"sha256:<hex>"` for a digest-pinned remote reference, else `null`. |
 
-These keys are stable. For example:
+These keys are stable. For example, on an enroot node:
 
 ```bash
 hpc-sandbox pull docker://alpine:3.20
@@ -228,8 +231,8 @@ is gone. Sessions of live processes are never touched: the report lists them as 
 - It finishes the deletions that killed processes left in a trash. With Singularity's sessions, it
   also unmounts the fuse-overlays that killed jobs left dead on the node, and deletes the
   extractions of templates whose process died.
-- It waits for other janitors of the same scratch root, unlike a provider's own sweep, and it
-  deletes what it removes before it exits.
+- It waits for other janitors of the same scratch root, as `reap()` does and unlike the sweep at a
+  provider's first start, and it deletes what it removes before it exits.
 
 The report merges those of the runtimes it swept. Each key holds a list of strings; sandboxes and
 pods are named by their ids, `hpcsb-` and 32 hexadecimal digits:
@@ -255,8 +258,8 @@ These keys are stable. After a process that had started one enroot sandbox was k
 ```
 
 `janitor` exits with status 0 when `errors` is empty, 1 when it is not, and 2 for a malformed
-`--label`. Run it at the end of your batch script, with the scratch root your sandboxes used, for
-example from a trap:
+`--label` or an invalid `HPC_SANDBOX_RUNTIME`. Run it at the end of your batch script, with the
+scratch root your sandboxes used, for example from a trap:
 
 ```bash
 trap 'hpc-sandbox janitor' EXIT
@@ -274,7 +277,7 @@ scripts.
 | `1` | `doctor` | At least one check failed: a `[FAIL]` line. |
 | `1` | `janitor` | The report lists errors. Everything else was swept. |
 | `1` | all | An unexpected error, with a Python traceback, such as a download of `fetch-tools` that failed. |
-| `2` | all | Invalid arguments or values: argparse's usage errors, a `KEY=VALUE` without `=`, a relative `--workdir`, an image the runtime can never run. Or an infrastructure failure: a runtime that is missing, a pull that failed, a sandbox that could not start. The reason follows `hpc-sandbox: ` on stderr. |
+| `2` | all | Invalid arguments or values: argparse's usage errors, an `HPC_SANDBOX_RUNTIME` that is not one of `--runtime`'s choices, a `KEY=VALUE` without `=`, a relative `--workdir`, an image the runtime can never run. Or an infrastructure failure: a runtime that is missing, a pull that failed, a sandbox that could not start. The reason follows `hpc-sandbox: ` on stderr. |
 | the command's | `run` | The command's own status, including `124` (timed out), `126` (working directory) and `137` (killed by the memory watchdog). |
 
 ## Next steps

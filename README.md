@@ -1,4 +1,4 @@
-<img src="assets/hpc_sandbox_icon.png" width="320">
+<img src="assets/hpc_sandbox_icon.png" alt="hpc-sandbox" width="320">
 
 Rootless sandboxes for HPC clusters, on Singularity/Apptainer or enroot.
 
@@ -26,13 +26,14 @@ What it gives you:
   databases, tool servers or graders it works with by name.
 - **Clean nodes.** Teardown proves each process's identity before signalling it, and janitors
   recover what a crashed process or job left behind, from running containers to files and mounts.
-- **Fast on busy nodes.** Images are cached and staged once per node, sessions are deleted in the
+- **Built for busy nodes.** Images are cached and staged once per node, sessions are deleted in the
   background, and an optional overlay layout makes a Singularity sandbox's start and stop cost the
   same whatever the size of its image.
 
-Sandboxes keep commands apart from each other and from the host's files and environment, but they
-are not a security boundary: they run as your user, share the host's kernel and, unless you choose
-otherwise, its network. [docs/security.md](docs/security.md) explains what the isolation covers.
+Sandboxes keep their commands apart from other sandboxes and from the host's files and environment,
+but they are not a security boundary: they run as your user, share the host's kernel and, unless you
+choose otherwise, its network. [Security model](docs/security.md) explains what the isolation
+covers.
 
 ## Requirements
 
@@ -44,7 +45,7 @@ runtimes:
 | Singularity CE or Apptainer | the runtime, in setuid or user-namespace mode |
 | enroot 3.x | unprivileged user namespaces, util-linux `nsenter`, and enroot's `+caps` package to import images |
 
-Pods need unprivileged user namespaces with either runtime.
+Pods need unprivileged user namespaces and util-linux `nsenter` with either runtime.
 [Getting started](docs/getting-started.md#requirements) lists every tool and what needs it.
 
 ## Install
@@ -97,25 +98,25 @@ memory limits and errors; [pods](docs/pods.md) start services next to a sandbox.
 
 | | `SingularityProvider` | `EnrootProvider` |
 |---|---|---|
-| Runtime | Singularity CE / Apptainer, setuid or user-namespace mode | enroot 3.x, unprivileged |
+| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x, unprivileged |
 | Images | SIF (`singularity pull`) | squashfs (`enroot import`) |
 | Inside the sandbox | your user | root mapped to your user (or your user) |
-| Per command | one `singularity exec` | a few milliseconds (`nsenter`) |
-| `network="none"` | where the site allows network namespaces | always, unless `allow_network_none=False` |
+| Per command | one `singularity exec`, which starts the runtime | `nsenter` into the running container |
+| `network="none"` | with `allow_network_none=True`, where the site lets users create network namespaces | always, unless `allow_network_none=False` |
 | When the owning process dies | instances run until a janitor stops them | everything dies with it; a janitor removes the files |
 
-[Singularity](docs/singularity.md) and [enroot](docs/enroot.md) describe each provider and what to
-check on a new cluster.
+[Singularity CE and Apptainer](docs/singularity.md) and [enroot](docs/enroot.md) describe each
+provider and what to check on a new cluster.
 
 ## Commands
 
-| Command | Does |
+| Command | What it does |
 |---|---|
 | `hpc-sandbox doctor [--image IMAGE]` | reports what the node supports for the runtime; with an image, starts a sandbox and exercises it |
-| `hpc-sandbox run IMAGE [OPTIONS] -- CMD [ARG...]` | runs one command in a fresh sandbox and exits with its status |
-| `hpc-sandbox pull [--refresh] IMAGE...` | pulls images into the cache and prints one JSON line per image |
-| `hpc-sandbox janitor [--label K=V]...` | stops and removes what dead processes left on this node and prints a JSON report |
-| `hpc-sandbox fetch-tools` | downloads the pinned slirp4netns that pods use for egress where the host has none |
+| `hpc-sandbox run [OPTIONS] IMAGE -- CMD [ARG...]` | runs one command in a fresh sandbox and exits with its status |
+| `hpc-sandbox pull [--refresh] IMAGE [IMAGE...]` | pulls images into the cache and prints one JSON line per image |
+| `hpc-sandbox janitor [--label KEY=VALUE]...` | stops and removes what dead processes left on this node and prints a JSON report |
+| `hpc-sandbox fetch-tools [--arch ARCH]` | downloads the pinned slirp4netns that pods use for egress where the host has none |
 
 Run `hpc-sandbox janitor` at the end of batch scripts that use hpc-sandbox.
 [docs/cli.md](docs/cli.md) has every option, the JSON outputs and the exit codes.
@@ -123,13 +124,13 @@ Run `hpc-sandbox janitor` at the end of batch scripts that use hpc-sandbox.
 ## Documentation
 
 - [docs/README.md](docs/README.md): the table of contents.
-- [Getting started](docs/getting-started.md): requirements, install, the first sandbox, and Slurm
-  and PBS batch scripts.
+- [Getting started](docs/getting-started.md): requirements, install, the first sandbox, Slurm and
+  PBS batch scripts, and what to do when something fails.
 - [Python API](docs/python-api.md), [command line](docs/cli.md) and
   [configuration](docs/configuration.md): the reference.
 - [Pods](docs/pods.md): services that share one network.
-- [Singularity](docs/singularity.md) and [enroot](docs/enroot.md): each provider, its layouts and
-  site notes.
+- [Singularity CE and Apptainer](docs/singularity.md) and [enroot](docs/enroot.md): each provider,
+  its layouts and site notes.
 - [Architecture](docs/architecture.md): how a sandbox is built, watched and torn down.
 - [Security](docs/security.md): what the isolation covers, and what it does not.
 
@@ -150,7 +151,9 @@ The unit tests run wherever unprivileged user namespaces work; the integration t
 node with a runtime. Commit messages and pull request titles follow Conventional Commits, such as
 `fix: Keep a session whose overlay cannot be unmounted`.
 
-Report security issues privately, as [SECURITY.md](SECURITY.md) describes.
+Report bugs and ask questions in [GitHub issues](https://github.com/ApGa/hpc-sandbox/issues), with
+the output of `hpc-sandbox doctor --image IMAGE` from the node where the problem happens. Report
+security issues privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 

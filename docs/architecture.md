@@ -2,9 +2,10 @@
 
 This page explains how hpc-sandbox builds a sandbox, runs commands in it and tears it down: the
 mechanics that both providers share. It is for contributors, and for users who want to know what
-happens on the node. What is specific to each runtime is in [Singularity CE and
-Apptainer](singularity.md) and [enroot](enroot.md), the contract your code relies on is in the
-[Python API](python-api.md), and what isolation means is in the [security model](security.md).
+happens on the node. What is specific to each runtime is in
+[Singularity CE and Apptainer](singularity.md) and [enroot](enroot.md), the contract your code
+relies on is in the [Python API](python-api.md), and what isolation means is in the
+[security model](security.md).
 
 ## Terms
 
@@ -32,9 +33,10 @@ Starting a sandbox takes these steps:
    provider can never run, a network mode it does not offer, a relative `workdir`, a `memory_mb` or
    `cpus` that is not positive, a mount whose target is not absolute, is `/` or lies in `/tmp` or
    `/var/tmp`, a mount whose source is missing, or an invalid environment variable.
-2. **Prepare the node.** Every start makes sure the scratch directories exist. The first start of
-   each provider also sweeps the sessions of dead processes ([Janitors](#janitors)), and an enroot
-   provider writes its system configuration ([enroot](enroot.md#what-enroot-is-allowed-to-add)).
+2. **Prepare the node.** Every start makes sure the scratch directories exist. A provider's first
+   start that finds the janitor lock free also sweeps the sessions of dead processes
+   ([Janitors](#janitors)), and an enroot provider's first start writes its system configuration
+   ([enroot](enroot.md#what-enroot-is-allowed-to-add)).
 3. **Resolve the image** to an image file: a local file, or one pulled once into the image cache
    ([Images and the image cache](#images-and-the-image-cache)).
 4. **Open a session** on node-local scratch, lease it and write its owner record
@@ -50,9 +52,9 @@ Starting a sandbox takes these steps:
 The first three steps create no session, and their failures raise `ValueError` or `SandboxError` (an
 image that cannot be pulled, for example). A start that fails later stops what it started, discards
 its session and raises `SandboxStartError`. Once started, a sandbox runs [commands](#commands) and
-[transfers](#transfers), takes [snapshots](#snapshots-and-restores), and runs under the [memory
-watchdog](#the-memory-watchdog) when its spec sets `memory_mb`. [Teardown](#teardown) stops the
-container and deletes the session in the background, and [janitors](#janitors) clean up after
+[transfers](#transfers), takes [snapshots](#snapshots-and-restores), and runs under the
+[memory watchdog](#the-memory-watchdog) when its spec sets `memory_mb`. [Teardown](#teardown) stops
+the container and deletes the session in the background, and [janitors](#janitors) clean up after
 processes that died before they could stop their sandboxes.
 
 ## The scratch root
@@ -178,9 +180,11 @@ then the call's `env`; the host's environment never reaches it.
 - Values pass verbatim, newlines included. They appear neither on command lines, which every user of
   a node can read, nor in the environment of the host-side processes that enter the container, and
   they need nothing from the sandbox's filesystem.
-- Names that the image's `/bin/sh` reserves cannot be set: with bash, read-only names such as `UID`,
-  `EUID`, `PPID` and `BASHPID`; with dash, an `OPTIND` that is not a number. The prologue skips them
-  rather than let the shell exit.
+- A shell that refuses to assign a name exits: bash keeps `UID` and `EUID` read-only, for example,
+  and dash takes only a number for `OPTIND`. So the prologue sets `BASHOPTS`, `BASHPID`,
+  `BASH_VERSINFO`, `EUID`, `OPTIND`, `PPID`, `SHELLOPTS` and `UID` only where the shell accepts
+  them, and skips them otherwise. Any other name that the shell refuses ends the prologue before the
+  start announcement, and the call raises `SandboxError`.
 
 The start announcement is how hpc-sandbox tells a command that ran from one that never started, and
 it is removed from the result:
@@ -248,18 +252,18 @@ With `memory_mb` set, a watchdog samples the sandbox's memory every `memory_poll
 default) and, when the sandbox holds more than the limit, kills one branch of its processes: a
 process with all its descendants. Most sites give users no cgroups, so this is a sampled guard, not
 a cgroup: usage can overshoot between samples. Where rootless cgroups work, Singularity's
-`cgroup_limits` also turns `memory_mb` into a real limit ([Singularity CE and
-Apptainer](singularity.md#site-notes)).
+`cgroup_limits` also turns `memory_mb` into a real limit
+([Singularity CE and Apptainer](singularity.md#site-notes)).
 
 ### What it measures
 
 Each sample walks the container's process tree, from the Singularity instance or from the launcher,
 and the host-side process tree of every running command, transfers included. For each process it
-reads the proportional set size (PSS) and the private memory from `/proc/<pid>/smaps_rollup`, the
-`oom_score_adj`, the command line and the session ID. A process whose `smaps_rollup` cannot be read,
-or that has none (kernels before 4.14), counts its resident set size instead: the setuid Singularity
-starter is not dumpable, and charging the RSS is conservative. What the sandbox holds is the sum of
-the PSS of these processes, and the excess is what it holds above the limit.
+reads the proportional set size (PSS) and the private memory from `/proc/<pid>/smaps_rollup` (or
+from `smaps`, on kernels before 4.14, which have no rollup), the `oom_score_adj`, the command line
+and the session ID. A process whose memory cannot be read counts its resident set size instead: the
+setuid Singularity starter is not dumpable, and charging the RSS is conservative. What the sandbox
+holds is the sum of the PSS of these processes, and the excess is what it holds above the limit.
 
 The watchdog never kills:
 
@@ -276,7 +280,7 @@ The watchdog weighs processes in three ways:
 |---|---|
 | what a branch holds | the PSS of its processes, where a process whose `oom_score_adj` is below its parent's counts that much less (a thousandth of the limit per point, never below zero) |
 | a process's mark | a thousandth of the limit for each point by which its `oom_score_adj` is above its parent's; a process that is not above its parent has no mark |
-| what a branch frees | the PSS of its processes that may be killed; when a child is weighed, a child that is a fork copy of its parent (the same command line, such as a `multiprocessing` fork worker) and has no children of its own counts only its private memory, never more than its PSS, since the pages it still shares with its parent stay; a copy's children share its pages too, and die with it |
+| what a branch frees | the PSS of its processes that may be killed; when a child is weighed, a child that is a fork copy of its parent (the same command line, such as a `multiprocessing` fork worker) and has no fork copies of its own counts only its private memory, never more than its PSS, since the pages it still shares with its parent stay; a copy with fork copies below it shares its pages with them, which die with it, so its whole branch counts |
 
 It then chooses:
 
@@ -428,8 +432,9 @@ SIGKILL, or the end of a batch job. It runs:
 - in `await provider.reap(labels)`, which first stops this provider's own live sandboxes and pods
   whose labels include `labels`, then sweeps, waiting for the lock, and filtered by the labels when
   they are given;
-- in `hpc-sandbox janitor`, which sweeps the sessions of the runtimes it selects ([Command
-  line](cli.md)). Run it at the end of your batch script ([Getting started](getting-started.md)).
+- in `hpc-sandbox janitor`, which sweeps the sessions of the runtimes it selects
+  ([Command line](cli.md)). Run it at the end of your batch script
+  ([Getting started](getting-started.md)).
 
 A sweep holds the janitor lock of a session root while it looks at each `hpcsb-<id>` directory
 there:
@@ -447,11 +452,13 @@ there:
 
 A sweep also takes over the trash entries that no deletion holds, once the process that moved them
 has died, or a minute after the move if it still lives. It holds at most 64 trash entries at once,
-the sessions it moved and the entries it took over alike: past that, it deletes them after the
-janitor lock and takes the lock again for the rest. A cancelled sweep lets go of what it holds, for
-other janitors. Janitors never delete through a mount point. Singularity janitors also unmount the
-overlays that killed jobs left dead on the node, and delete abandoned template extractions
-([Singularity CE and Apptainer](singularity.md#teardown)).
+the sessions it moved and the entries it took over alike, and deletes them after the janitor lock.
+Past that, `reap()` and `hpc-sandbox janitor` take the lock again for the rest, until nothing is
+left; a provider's first start stops and moves every abandoned session, but leaves the rest in the
+trash for janitors, so that the start does not wait for them. A cancelled sweep lets go of what it
+holds, for other janitors. Janitors never delete through a mount point. Singularity janitors also
+unmount the overlays that killed jobs left dead on the node, and delete abandoned template
+extractions ([Singularity CE and Apptainer](singularity.md#teardown)).
 
 Creating and removing sessions take the janitor lock briefly, so they wait while a sweep stops
 abandoned sandboxes, or while a session that a full scratch left no room to move is deleted in

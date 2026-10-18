@@ -1292,7 +1292,7 @@ async def test_memory_watchdog_explains_a_command_killed_with_its_children(enroo
     from test_integration import POOL_AS_THE_COMMAND
 
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), memory_mb=100))
-    for _ in range(3):  # the note used to come too late now and then
+    for _ in range(3):  # a note that comes too late shows only now and then
         result = await sandbox.exec(POOL_AS_THE_COMMAND, timeout_s=60)
         assert result.exit_code == 137, (result.stdout, result.stderr)
         assert "memory limit exceeded" in result.stderr and "descendant" in result.stderr

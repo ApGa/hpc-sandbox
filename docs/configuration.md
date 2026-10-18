@@ -29,7 +29,7 @@ so one set of options works for both runtimes; see
 | `slirp4netns` | `None` | The slirp4netns that pods use for egress, a name on `PATH` or a path. `None` means the one on `PATH` if it has the options pods need, else the one that `hpc-sandbox fetch-tools` downloaded. |
 | `service_stop_grace_s` | `0.0` | How long the commands of pod services get between SIGTERM and SIGKILL when their pod stops. |
 
-### SingularityProvider options
+### `SingularityProvider` options
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -45,7 +45,7 @@ so one set of options works for both runtimes; see
 layout. When the layout comes from `HPC_SANDBOX_ROOTFS_LAYOUT` instead, such a provider stays on the
 copy layout.
 
-### EnrootProvider options
+### `EnrootProvider` options
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -113,9 +113,9 @@ deletion; [Architecture](architecture.md) describes them.
 
 A scratch root that belongs to a job goes with the job. One that outlives jobs keeps staged images
 and templates for every image version used on the node: remove them when no job of yours uses the
-node, after `hpc-sandbox janitor` has run. Keep age-based cleaners, such as systemd-tmpfiles, out of
-`templates/`: a template that lost its marker file is extracted again, but one that lost other files
-is not noticed.
+node, after `hpc-sandbox janitor` has run. Keep age-based cleaners, such as `systemd-tmpfiles`, out
+of `templates/`: a template that lost its marker file is extracted again, but one that lost other
+files is not noticed.
 
 ### The image cache
 
@@ -181,8 +181,8 @@ quota:
 temporary and configuration paths, whatever your environment and the site's `enroot.conf` say;
 [enroot](enroot.md) describes what else the provider sets for them.
 
-Some variables are removed from the environment Singularity and Apptainer run in, because they would
-add binds, environment or configuration that sandboxes must not get: `SINGULARITY_BIND`,
+Some variables are removed from the environment Singularity CE and Apptainer run in, because they
+would add binds, environment or configuration that sandboxes must not get: `SINGULARITY_BIND`,
 `SINGULARITY_BINDPATH`, `APPTAINER_BIND`, `APPTAINER_BINDPATH`, `SINGULARITY_CONFIGDIR`,
 `APPTAINER_CONFIGDIR`, and every `SINGULARITYENV_*` and `APPTAINERENV_*` variable. The commands
 that enter a container also lose `TERM` and the proxy variables (`http_proxy`, `https_proxy`,
@@ -196,7 +196,7 @@ containers even with `--cleanenv`, and whose URLs may hold credentials. Give the
 |---|---|---|
 | `HPC_SANDBOX_SCRATCH` | Both providers, every command but `fetch-tools` | The scratch root when no `scratch_root` or `--scratch-root` is given; see [The scratch root](#the-scratch-root). |
 | `HPC_SANDBOX_IMAGE_CACHE` | Both providers, every command but `fetch-tools` | The image cache when no `image_cache` or `--image-cache` is given. |
-| `HPC_SANDBOX_RUNTIME` | The command line | The default of `--runtime`: `auto`, `singularity` or `enroot`. The Python API does not read it. |
+| `HPC_SANDBOX_RUNTIME` | The command line | The default of `--runtime`: `auto`, `singularity` or `enroot`. An empty value counts as unset; with any other value, `doctor`, `run`, `pull` and `janitor` exit with status 2 unless `--runtime` is given. The Python API does not read it. |
 | `HPC_SANDBOX_ROOTFS_LAYOUT` | `SingularityProvider` | The default of `rootfs_layout`, for a whole job: `copy` or `fuse-overlay`. Another value raises `ValueError`. A provider whose options need the copy layout stays on it, and `EnrootProvider` ignores the variable. |
 | `HPC_SANDBOX_TOOLS` | Pods, `hpc-sandbox fetch-tools` | Where `fetch-tools` puts the slirp4netns it downloads, and where pods look for it; default `${XDG_CACHE_HOME:-~/.cache}/hpc-sandbox/tools`. |
 | `HPC_SANDBOX_REAL_AUFS2OVLFS` | Internal | Set by `EnrootProvider` in the environment of `enroot import`, for the whiteout converter it wraps. Never read from yours. |

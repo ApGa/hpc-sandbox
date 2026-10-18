@@ -19,7 +19,7 @@ async def main() -> None:
     async with await provider.start(spec) as sandbox:  # stopped when the block exits
         result = await sandbox.exec("python -c 'print(6 * 7)'", timeout_s=60)
         print(result.exit_code, result.stdout, end="")
-    await provider.wait_for_deletions()  # the stopped sandbox's files are gone now
+    await provider.wait_for_deletions()  # waits for the background deletion of the sandbox's files
 
 
 asyncio.run(main())
@@ -104,7 +104,7 @@ provider was created with `bind_resolv_conf=False`.
 
 | Reference | `SingularityProvider` | `EnrootProvider` |
 |---|---|---|
-| `docker://repo:tag`, `docker://registry/repo:tag` | pulled as a SIF file | imported as a squashfs file; enroot's `registry#repo` spelling works too |
+| `docker://repo:tag`, `docker://registry/repo:tag` | pulled as a SIF file | imported as a squashfs file |
 | `docker://repo[:tag]@sha256:<hex>` | pinned to that manifest digest | pinned to that manifest digest |
 | `repo:tag`, without a scheme | read as `docker://repo:tag` | read as `docker://repo:tag` |
 | `oras://...`, `library://...`, `shub://...` | pulled by the runtime | `ValueError` |
@@ -112,6 +112,9 @@ provider was created with `bind_resolv_conf=False`.
 | A local file: `/path`, `./path`, `../path`, `~/path` or `file:///path` | a `.sif` file | a `.sqsh` or `.squashfs` file |
 | A local file with `@sha256:<hex>` appended | the file, checked against that digest before use | the file, checked against that digest before use |
 | An image of the other provider's format | `ValueError` | `ValueError` |
+
+Both providers also accept enroot's `registry#repo` spelling, in `docker://` references and in
+references without a scheme.
 
 A remote image is pulled once into the image cache. A tag keeps the image it named when it was first
 pulled until you refresh it (see [Images](#images)), so pin images by digest, or use local files
@@ -257,9 +260,12 @@ and appear neither on command lines, which every user of a node can read, nor in
 the host-side processes that enter the container.
 
 Names must match `[A-Za-z_][A-Za-z0-9_]*`, and values may hold any text but NUL; anything else
-raises `ValueError`. Names the image's `/bin/sh` reserves cannot be set: with bash, `UID`, `EUID`,
-`PPID`, `BASHPID`, `GROUPS`, `FUNCNAME` and the like; with dash or BusyBox, an `OPTIND` that is not
-a number.
+raises `ValueError`. `BASHOPTS`, `BASHPID`, `BASH_VERSINFO`, `EUID`, `OPTIND`, `PPID`, `SHELLOPTS`
+and `UID` are names that a shell may refuse to assign: bash keeps `UID` and `EUID` read-only, for
+example, and dash takes only a number for `OPTIND`. The prologue sets them only where the image's
+`/bin/sh` accepts them; otherwise it skips them without an error, and the command still runs. Any
+other name that the shell refuses ends the prologue before the command starts, and the call raises
+`SandboxError`.
 
 ## Transfers
 
@@ -478,7 +484,9 @@ asyncio.run(main())
 | `errors` | One message for each thing it could not do. The sessions concerned are kept. |
 
 - A sweep needs the janitor lock of each session root, and `reap()` waits for it. A provider also
-  sweeps at its first start that finds the lock free, and a start never waits for it.
+  sweeps at its first start that finds the lock free, and a start never waits for it. That sweep
+  stops every abandoned session and moves it into the trash, but deletes at most 64 trash entries:
+  `reap()` and `hpc-sandbox janitor` delete the rest.
 - Singularity instances whose owner died keep running until a janitor stops them. enroot sandboxes
   die with their owner, and a janitor only deletes their files, so they usually appear in `removed`
   but not in `stopped`.
@@ -497,9 +505,12 @@ default). When their sum exceeds the limit, it kills one branch of processes, ne
 own:
 
 - It starts from the heaviest of the running commands and of the processes they left running in the
-  background, and descends into the child branch that holds the most while that child alone holds
+  background, and descends into the child whose death frees the most, while that child alone frees
   the excess over the limit. So the command that ran away dies, and a harness survives a tool
   command it started, whatever their sizes.
+- A fork copy of its parent, such as a `multiprocessing` fork worker, with no fork copies of its own
+  counts only its private memory towards what killing its branch frees, since the pages it shares
+  with its parent stay.
 - A process whose `oom_score_adj` is higher than its parent's (`choom -n 1000 -- cmd`) goes first
   when what it holds, plus a thousandth of the limit per point, outweighs the alternatives, as with
   the kernel's OOM killer.
@@ -612,8 +623,8 @@ service: a `SingularityService` or an `EnrootService`, both `PodService` sandbox
 | `gpu` | With Singularity, when `gpu` is set; with enroot, when `gpus` (or `gpu="nv"`) is set. |
 
 Isolation keeps sandboxes apart from one another and from the host's files and processes. It is not
-a security boundary against code that runs as your uid with host networking; see the
-[Security model](security.md).
+a security boundary against hostile code: commands run as your uid, on the host's kernel and, by
+default, on the host's network; see the [Security model](security.md).
 
 ## Protocols
 
@@ -661,7 +672,7 @@ asyncio.run(main())
 | Exception | Raised when |
 |---|---|
 | `SandboxError` | The sandbox infrastructure failed, as opposed to the command in it: a runtime that cannot be run or cannot enter the container, a pull that failed, a teardown that could not prove a process's identity. A subclass of `RuntimeError`. |
-| `SandboxStartError` | A sandbox or a pod service could not start. What it started has been stopped, and its files are being deleted in the background. A subclass of `SandboxError`. |
+| `SandboxStartError` | A sandbox, a pod or a pod service could not start. What it started has been stopped, and its files are being deleted in the background. A subclass of `SandboxError`. |
 | `SandboxLostError` | The container of a running sandbox died, or the holder of a pod. A subclass of `SandboxError`. |
 | `ValueError` | A spec, an option or an argument is invalid, or an image is one the provider can never run. Raised before anything is created. |
 | `OSError` | A problem on the host's side: a transfer's host path (`FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `shutil.SpecialFileError`, ...), or a scratch root or image cache that cannot be written. |
@@ -701,7 +712,8 @@ describes them so that you can place, size and clean them, and a minor release m
 hpc-sandbox's version is below 1.0: a minor release (0.4.0) may change the public API, and a patch
 release (0.3.1) only fixes bugs. To stay on one minor release, require a range such as
 `hpc-sandbox>=0.3,<0.4`. [CHANGELOG.md](../CHANGELOG.md) lists what each release changes, and
-`hpc_sandbox.__version__` holds the installed version.
+`hpc_sandbox.__version__` holds the version of the running copy: the one that `pyproject.toml` sets
+when it runs from a source checkout, else the installed distribution's.
 
 ## Next steps
 

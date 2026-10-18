@@ -31,8 +31,8 @@ support of another runtime or scheduler, so that the design is agreed on before 
 **Goal:** a checkout where the `hpc-sandbox` command runs and the unit tests pass.
 
 **Prerequisites:** Linux, git and [uv](https://docs.astral.sh/uv/). The unit tests need no
-container runtime and no compute node, but most of them need unprivileged user namespaces; [What
-the unit tests need](#what-the-unit-tests-need) lists what else they use.
+container runtime and no compute node, but most of them need unprivileged user namespaces;
+[What the unit tests need](#what-the-unit-tests-need) lists what else they use.
 
 1. Fork [ApGa/hpc-sandbox](https://github.com/ApGa/hpc-sandbox) on GitHub and clone your fork:
 
@@ -49,9 +49,11 @@ the unit tests need](#what-the-unit-tests-need) lists what else they use.
    ```
 
    uv creates the virtual environment `.venv` with Python 3.11 or later, which it downloads if the
-   machine has none, and `uv run` runs commands in it. To work in an environment that you activate
-   yourself, for example with the oldest Python that hpc-sandbox supports, create it and install
-   into it instead, and leave `uv run` out of the commands below:
+   machine has none, and `uv run` runs commands in it. It also records the versions it resolved in
+   `uv.lock`, which git ignores: the repository keeps no lock file, and CI resolves the versions
+   afresh on every run. To work in an environment that you activate yourself, for example with the
+   oldest Python that hpc-sandbox supports, create it and install into it instead, and leave
+   `uv run` out of the commands below:
 
    ```bash
    uv venv --python 3.11          # the oldest version hpc-sandbox supports
@@ -119,12 +121,13 @@ uv run pytest tests/test_memory.py -q -k oom_score    # the tests whose names ma
 | Need | Without it |
 |---|---|
 | Linux and Python 3.11 or later | Nothing runs. |
-| Unprivileged user namespaces, and util-linux `unshare` and `nsenter` | The enroot provider's tests, the pod tests, and the tests that mount file systems in a namespace skip. `unshare --user --map-root-user --mount --pid --ipc --net --fork true` succeeds where they work. Ubuntu 24.04 and later restrict them with AppArmor; `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts that until the next boot. |
+| Unprivileged user namespaces and util-linux `nsenter` | The enroot provider's tests, the pod tests, and the tests that mount file systems in a namespace skip. `unshare --user --map-root-user --mount --pid --ipc --net --fork true` succeeds where user namespaces work. Ubuntu 24.04 and later restrict them with AppArmor; `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts that until the next boot. |
+| util-linux `unshare` | The tests that mount file systems in a namespace skip (in `tests/test_trash.py` and `tests/test_fuse_overlay.py`). |
 | `/usr/bin/python3` | The pod tests (`tests/test_pods.py`) skip, and so do the memory watchdog tests that run Python in a fake sandbox. |
 | util-linux `flock` | One test of background deletions in `tests/test_trash.py` skips. |
 | `bash` | The environment tests in `tests/test_commands.py` skip their `bash` cases; they test `dash` and `busybox` too where installed. |
 | `/etc/localtime` | The enroot provider's time zone tests skip. |
-| `sshfs`, an `sftp-server` (`/usr/lib/openssh/sftp-server`, `/usr/libexec/openssh/sftp-server` or `/usr/lib/sftp-server`), `fusermount3`, and a `/dev/fuse` you can read and write | The test that has janitors unmount real, dead FUSE mounts, which it makes with sshfs as `fuse-overlayfs` would, skips (`tests/test_fuse_overlay.py`). CI does not install sshfs: run it yourself when you change how overlays are found or unmounted. |
+| `sshfs`, an `sftp-server` (`/usr/lib/openssh/sftp-server`, `/usr/libexec/openssh/sftp-server` or `/usr/lib/sftp-server`), `fusermount3`, and a `/dev/fuse` you can read and write | The test that has janitors unmount real, dead FUSE mounts, which it makes with `sshfs` as `fuse-overlayfs` would, skips (`tests/test_fuse_overlay.py`). CI does not install `sshfs`: run it yourself when you change how overlays are found or unmounted. |
 
 ### Integration tests
 
@@ -138,17 +141,17 @@ HPC_SANDBOX_INTEGRATION=1 uv run pytest tests/test_integration.py -v
 HPC_SANDBOX_INTEGRATION=1 uv run pytest tests/test_pods_integration.py -v
 ```
 
-Their sandboxes live under the default scratch root ([The scratch
-root](docs/configuration.md#the-scratch-root)): where that is not on the node's local disk, set
-`HPC_SANDBOX_SCRATCH` to a directory that is. They pull their images into the image cache, so the
-node needs to reach the registry unless you give them local image files. These variables choose
-what they test:
+Their sandboxes live under the default scratch root
+([The scratch root](docs/configuration.md#the-scratch-root)): where that is not on the node's local
+disk, set `HPC_SANDBOX_SCRATCH` to a directory that is. They pull their images into the image cache,
+so the node needs to reach the registry unless you give them local image files. These variables
+choose what they test:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `HPC_SANDBOX_INTEGRATION` | unset | `1` runs the integration tests; without it, they skip. |
 | `HPC_SANDBOX_TEST_RUNTIME` | `auto` | `singularity`, `enroot`, or `auto`: Singularity when `singularity` or `apptainer` is on `PATH`, else enroot. |
-| `HPC_SANDBOX_TEST_IMAGE` | `docker://alpine:3.20` | The image of `tests/test_integration.py`: any image with `/bin/sh`, `sleep`, `tail` and `cp`, also a local `.sif` or `.sqsh` file. |
+| `HPC_SANDBOX_TEST_IMAGE` | `docker://alpine:3.20` | The image of `tests/test_integration.py`: any image that hpc-sandbox can start ([Image references](docs/python-api.md#image-references)) and that has the usual command-line tools, as BusyBox or a distribution's base system provides them: the tests use `tail`, `find`, `xargs`, `stat` and others. A local `.sif` or `.sqsh` file works too. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | unset | `1` also tests `network="none"` with Singularity, where the site lets users create network namespaces. With enroot it is always tested. |
 | `HPC_SANDBOX_TEST_GPUS` | unset | On a GPU node, tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity, with an image in which the runtime makes `nvidia-smi` or `rocm-smi` available. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | `docker://alpine:3.20` | The image of the pod tests' services; its busybox serves and fetches HTTP. |
@@ -266,9 +269,9 @@ right after stopping sandboxes must first await
 provider.wait_for_deletions().
 ```
 
-The `conventional-pre-commit` hook, installed in [step 3 of the
-setup](#set-up-a-development-environment), checks the message of every `git commit` and
-`git merge`. It rejects a message whose subject is not one of these types, an optional scope, an
+The `conventional-pre-commit` hook, installed in
+[step 3 of the setup](#set-up-a-development-environment), checks the message of every `git commit`
+and `git merge`. It rejects a message whose subject is not one of these types, an optional scope, an
 optional `!`, a colon, a space and a summary, or whose body does not follow a blank line. It
 accepts a scope and does not check the summary's case or wording; reviewers check those. It accepts
 `fixup!`, `squash!` and `amend!` commits, so `git rebase --autosquash` works as usual, and merge
@@ -306,8 +309,8 @@ request into `main`; the `lint` and `test` jobs also run for every push to `main
 | `test` | On Python 3.11, 3.12 and 3.13: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, then `uv sync --group dev` and `uv run pytest -v -ra` | Unprivileged user namespaces do not work, or a test fails |
 | `build` (the release workflow) | The build and the checks of [Cut a release](#cut-a-release), without publishing | The sdist or the wheel does not build or does not pass `twine check --strict`, or the wheel's `hpc-sandbox --version` fails |
 
-The `test` job has no container runtime and no sshfs: the fakes stand in for the runtimes, the
-test that needs sshfs skips, and the integration tests never run there.
+The `test` job has no container runtime and no `sshfs`: the fakes stand in for the runtimes, the
+test that needs `sshfs` skips, and the integration tests never run there.
 
 **The pull request itself.** The [pull request template](.github/pull_request_template.md) asks
 for each of these:

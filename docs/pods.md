@@ -255,10 +255,10 @@ On images based on Debian (those with `/etc/debian_version`), hpc-sandbox lets a
 ## Commands
 
 `exec`, `upload`, `download` and health checks enter a service in two steps: the pod's user and
-network namespaces with `nsenter`, then the container's own namespaces and root directory. They
-take a few milliseconds, and run like the service's command, as root of its nested user namespace,
-with its `ulimits` (applied with `prlimit`). `exec` follows the rules of every sandbox: the same
-environment, timeouts, exit codes and errors ([Running commands](python-api.md#running-commands)).
+network namespaces with `nsenter`, then the container's own namespaces and root directory. They run
+like the service's command, as root of its nested user namespace, with its `ulimits` (applied with
+`prlimit`). `exec` follows the rules of every sandbox: the same environment, timeouts, exit codes
+and errors ([Running commands](python-api.md#running-commands)).
 
 Once a service's command has exited, its container is gone: `exec` and transfers raise
 `SandboxLostError`, while `health()` and `logs()` still answer. A service without a command runs
@@ -350,11 +350,12 @@ tries again. Services stop with their pod; a command that ends early ends only i
 
 Pods die with the process that started them, with either runtime: the kernel kills the holder, and
 each service's launcher and init, when that process exits, even by SIGKILL. What remains are files,
-which a janitor removes: a provider's first start on the node, `await provider.reap()`, or
-`hpc-sandbox janitor`; the last two take labels to limit the sweep to the pods that carry them
-([Reaping and janitors](python-api.md#reaping-and-janitors)). With labels, `reap()` also stops the
-provider's own live pods whose labels include them. A pod's files are on the scratch root, in
-`pods-singularity/` or `pods-enroot/` ([Where files go](configuration.md#where-files-go)).
+which a janitor removes: a provider's first start that finds the janitor lock free,
+`await provider.reap()`, or `hpc-sandbox janitor`; the last two take labels to limit the sweep to
+the pods that carry them ([Reaping and janitors](python-api.md#reaping-and-janitors)). With labels,
+`reap()` also stops the provider's own live pods whose labels include them. A pod's files are on the
+scratch root, in `pods-singularity/` or `pods-enroot/`
+([Where files go](configuration.md#where-files-go)).
 
 ## Requirements and site notes
 

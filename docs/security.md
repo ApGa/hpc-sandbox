@@ -18,7 +18,7 @@ Both providers have the `isolation` capability. Each sandbox gets:
 | `/tmp` and `/var/tmp` | private directories of the session |
 | environment | the host's environment never reaches a command, which gets the image's environment, `HOME=/root`, the spec's `env` and the call's `env` |
 | host files | only what the runtime mounts into every container as the site configures it (such as `/proc`, `/sys` and `/dev`), the host's `/etc/resolv.conf` with host networking and, on enroot, its `/etc/hosts`, both read-only, and the `mounts` you give, read-only unless you ask otherwise; never your home directory, your working directory or the site's bind paths |
-| network, with `network="none"` | a network namespace whose only interface is loopback: always on enroot, and on Singularity where the site lets users create network namespaces |
+| network, with `network="none"` | a network namespace whose only interface is loopback: always on enroot, unless `allow_network_none=False`, and on Singularity with `allow_network_none=True`, where the site lets users create network namespaces |
 
 The services of a [pod](pods.md) share a network namespace of their own: loopback only, or egress
 through slirp4netns, which never reaches the host's loopback but does reach what the node's network
@@ -115,14 +115,14 @@ network, through the mounts you give it or with memory between two samples, and 
 when the runtime runs it. Report problems of the runtimes themselves (Singularity CE, Apptainer,
 enroot, fuse-overlayfs, slirp4netns) to their projects.
 
-Report a vulnerability privately, through GitHub's private vulnerability reporting: open the
-repository's [Security tab](https://github.com/ApGa/hpc-sandbox/security) and choose **Report a
-vulnerability**. Do not open a public issue for it. Include the hpc-sandbox version, the runtime and
-its version, whether the runtime is installed setuid or runs in user-namespace mode, and the steps
-that reproduce the problem; the output of `hpc-sandbox doctor` helps.
+Report a vulnerability privately, as [SECURITY.md](../SECURITY.md) describes: through the
+repository's [Security tab](https://github.com/ApGa/hpc-sandbox/security), never in a public issue.
+[SECURITY.md](../SECURITY.md) also says what to include, which versions get fixes and what happens
+after you report.
 
 ## Next steps
 
+- [Security policy](../SECURITY.md): how to report a vulnerability, and what happens next.
 - [Architecture](architecture.md): how sandboxes are built, run and torn down.
 - [Singularity CE and Apptainer](singularity.md) and [enroot](enroot.md): what each runtime adds.
 - [Python API](python-api.md): `SandboxSpec`, with its network, mounts and memory limit.
