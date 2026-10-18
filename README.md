@@ -82,7 +82,7 @@ the runtime underneath.
 | `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
 | `python -m hpc_sandbox pull [--refresh] IMAGE...` | Pulls images into the image cache unless cached, and checks local image files, printing on stdout only one JSON line per image, with the stable keys `reference`, `path`, `sha256` (of the image file) and `manifest_digest` (from a digest-pinned remote reference, else null); logs go to stderr. `--refresh` pulls tags again; sandboxes started afterwards get the new image, and starts never wait for a refresh. |
 | `python -m hpc_sandbox fetch-tools [--arch ARCH]` | Downloads the pinned static slirp4netns that pods use for egress when the host has none (`$HPC_SANDBOX_TOOLS`, else `hpc-sandbox/tools` in `$XDG_CACHE_HOME` or `~/.cache`), checks its SHA-256 and prints its path as a JSON line. Run it once where there is internet access; compute nodes need none. |
-| `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes and pods abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless `--runtime` names one, it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
+| `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes and pods abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless a runtime is chosen (`--runtime`, `$HPC_SANDBOX_RUNTIME` or `--binary`), it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
 
 All commands but `fetch-tools` take `--runtime auto|singularity|enroot`
 (default `$HPC_SANDBOX_RUNTIME`, else the first of `singularity`, `apptainer`
@@ -170,31 +170,35 @@ What both providers share:
    of the container's processes and of every running command once a second. On
    a breach it kills one branch of processes, never the sandbox's own. It
    starts from the heaviest of the running commands and the processes left
-   running in the background, and descends into the child branch that holds
-   the most while that child alone holds the excess over the limit. So the
-   command that ran away dies and a harness survives a tool command it started,
+   running in the background, and descends into the child branch that holds the
+   most while that child alone holds the excess over the limit. So the command
+   that ran away dies and a harness survives a tool command it started,
    whatever their sizes; when the memory is spread over several children, their
-   parent's branch dies whole. As with the kernel's OOM killer, a pool's worker
-   that holds the excess alone dies alone: a harness that runs code in
-   children it joins (`multiprocessing.Process`, with a `Manager` or several
-   at once, as code-eval graders do) learns that one was killed, and so do a
-   `ProcessPoolExecutor` and joblib, but a `multiprocessing.Pool`, which never
-   notices a lost worker, waits for its task until the command times out. The
-   process tree cannot tell a pool from such a harness. It may also kill a
+   parent's branch dies whole. What a branch holds is what killing it frees: a
+   fork copy of its parent (a `multiprocessing` fork worker) counts its private
+   memory only, since the pages it still shares with its parent stay, so a pool
+   owner that grows dies with its workers. As with the kernel's OOM killer, a
+   pool's worker that holds the excess alone dies alone: a harness that runs
+   code in children it joins (`multiprocessing.Process`, with a `Manager` or
+   several at once, as code-eval graders do) learns that one was killed, and so
+   do a `ProcessPoolExecutor` and joblib, but a `multiprocessing.Pool`, which
+   never notices a lost worker, waits for its task until the command times out.
+   The process tree cannot tell a pool from such a harness. It may also kill a
    larger idle process before a smaller one that is growing. A process with a
    higher `oom_score_adj` than its parent (`choom -n 1000 -- cmd`) goes first
    when what it holds, plus a thousandth of the limit per point, outweighs the
-   branch the memory leads to; as the kernel scores each process alone, marks
-   never add up (a browser's renderers mark themselves), and a value every
-   process inherited changes nothing. The branch dies whole, with what it
-   forks meanwhile (but for a process its root moves into a new session in the
-   instant before the kill, which stays watched); its root is killed, never
-   stopped, so its parent sees a kill. A command the watchdog killed
-   returns 137; one whose descendants it killed keeps its own exit status (or
-   times out). Either way the explanation is appended to stderr and recorded
-   in `Sandbox.memory_kills`, with the processes the branch held (`pids`) and
-   how much the sandbox's own tmpfs mounts (`/dev/shm`, `/run`...) hold, which
-   no kill frees. This is a sampled guard, not a cgroup: usage can overshoot
+   heaviest of the running commands and background processes, or its parent on
+   the way down; as the kernel scores each process alone, marks never add up (a
+   browser's renderers mark themselves), and a value every process inherited
+   changes nothing. The branch dies whole, with what it forks meanwhile (but
+   for a process its root moves into a new session in the instant before the
+   kill, which stays watched); its root is killed, never stopped, so its parent
+   sees a kill. A command the watchdog killed returns 137; one whose
+   descendants it killed keeps its own exit status (or times out). Either way
+   the explanation is appended to stderr and recorded in
+   `Sandbox.memory_kills`, with the processes the branch held (`pids`) and how
+   much the sandbox's own tmpfs mounts (`/dev/shm`, `/run`...) hold, which no
+   kill frees. This is a sampled guard, not a cgroup: usage can overshoot
    between samples.
 6. **Snapshots** copy the rootfs and the private tmp directories with
    `cp -a --reflink=auto` (near free on reflink filesystems), after a `sync`.
@@ -224,8 +228,9 @@ What both providers share:
    holds once the process that moved them died (a minute later if it lives).
    Each provider sweeps abandoned sessions at its first start that finds the
    janitor lock free: a start never waits to sweep (janitors and `reap()` do),
-   though creating and removing sessions take that lock for an instant, so they
-   wait while a sweep stops abandoned sandboxes.
+   though creating and removing sessions take that lock briefly, so they wait
+   while a sweep stops abandoned sandboxes, or while a session that a full
+   scratch left no room to move is deleted in place.
 
 ### Singularity CE / Apptainer
 
@@ -461,7 +466,7 @@ Options both providers take:
 |---|---|---|
 | `binary` | `singularity`, else `apptainer` / `enroot` | Runtime executable (name or path). |
 | `scratch_root` | see below | Node-local directory for sessions, snapshots, staged images and runtime temp/cache. |
-| `image_cache` | `$HPC_SANDBOX_IMAGE_CACHE` or `~/.cache/hpc-sandbox/images` | Image cache; may be shared storage with `flock`. |
+| `image_cache` | `$HPC_SANDBOX_IMAGE_CACHE`, else `hpc-sandbox/images` in `$XDG_CACHE_HOME` or `~/.cache` | Image cache; may be shared storage with `flock`. |
 | `stage_images` | auto | Stage images to scratch; auto = inside a batch job when the cache is on another filesystem. |
 | `default_timeout_s` | 600 | Timeout of `exec` and transfers without an explicit one. |
 | `start_timeout_s` | 1800 | Pull, extraction, container start and snapshot copy timeout. |
