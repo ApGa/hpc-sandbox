@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import stat
 from pathlib import Path
+
+import pytest
 
 from hpc_sandbox import SandboxSpec
 from hpc_sandbox.cli import main, resolve_runtime
@@ -42,12 +46,13 @@ def test_run_needs_a_command(tmp_path, sif, fake_runtime, capsys):
 def test_doctor_checks_the_site_and_smoke_tests_an_image(tmp_path, sif, fake_runtime, capsys):
     config = fake_runtime.state / "etc" / "singularity.conf"
     config.parent.mkdir()
-    config.write_text("# site\nallow setuid = yes\nsessiondir max size = 64\nother = 1\n")
+    config.write_text("# site\nallow setuid = no\nsessiondir max size = 64\nother = 1\n")
     assert main(["doctor", *common(tmp_path), "--image", str(sif)]) == 0
     output = capsys.readouterr().out
     assert "singularity-ce version 4.4.1-fake" in output
-    assert "[warn] site: sessiondir max size: 64" in output
-    assert "[info] site: allow setuid: yes" in output and "other" not in output
+    assert "[warn] site: sessiondir max size: 64 (never use --writable-tmpfs here)" in output
+    # User-namespace mode, which runs sandboxes as well as setuid mode does.
+    assert "[info] site: allow setuid: no\n" in output and "other" not in output
     for check in ("sandbox start", "exec", "upload/download", "sandbox stop"):
         assert f"[  ok] {check}" in output
 
@@ -83,6 +88,71 @@ def test_doctor_checks_enroot_and_smoke_tests_an_image(
         assert f"[  ok] {check}" in output
 
 
+def whiteout_converter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Put first on PATH an enroot-aufs2ovlfs that converts whiteouts, whatever the host has."""
+    directory = tmp_path / "converter"
+    directory.mkdir()
+    converter = directory / "enroot-aufs2ovlfs"
+    converter.write_text('#!/bin/sh\ncd "$1" && rm opaque/.wh..wh..opq && mv .wh.deleted deleted\n')
+    converter.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
+    return converter
+
+
+def test_doctor_creates_a_private_scratch_root_before_the_enroot_checks(
+    tmp_path, fake_enroot, capsys, monkeypatch
+):
+    converter = whiteout_converter(tmp_path, monkeypatch)  # its check writes in the scratch root
+    scratch = tmp_path / "fresh" / "scratch"
+    arguments = ["doctor", "--runtime", "enroot", "--scratch-root", str(scratch)]
+    previous = os.umask(0o022)  # directories created without a mode would be readable by all
+    try:
+        assert main([*arguments, "--image-cache", str(tmp_path / "cache")]) == 0
+    finally:
+        os.umask(previous)
+    output = capsys.readouterr().out
+    assert f"[  ok] image imports: {converter} converts whiteouts" in output
+    assert f"[  ok] scratch root: {scratch} (" in output
+    assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
+
+
+def test_doctor_reports_directories_it_cannot_write_as_failures(
+    tmp_path, fake_enroot, capsys, monkeypatch
+):
+    converter = whiteout_converter(tmp_path, monkeypatch)
+    scratch, cache = tmp_path / "scratch", tmp_path / "cache"
+    for directory in (scratch, cache):
+        directory.mkdir()
+        directory.chmod(0o500)
+    try:
+        assert main(["doctor", "--runtime", "enroot", *common(tmp_path)]) == 1
+    finally:
+        for directory in (scratch, cache):
+            directory.chmod(0o700)
+    output = capsys.readouterr().out
+    assert f"[warn] image imports: could not test whether {converter} converts whiteouts" in output
+    assert f"[FAIL] scratch root: {scratch} is not writable: " in output
+    assert f"[FAIL] image cache: {cache} is not writable: " in output
+    assert output.count("[FAIL]") == 2 and "pods: egress" in output  # the other checks ran
+
+
+def test_doctor_reports_a_start_its_scratch_root_prevents_as_a_failure(
+    tmp_path, sqsh, fake_enroot, capsys, monkeypatch
+):
+    whiteout_converter(tmp_path, monkeypatch)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    scratch.chmod(0o500)
+    try:
+        arguments = ["doctor", "--runtime", "enroot", *common(tmp_path), "--image", str(sqsh)]
+        assert main(arguments) == 1
+    finally:
+        scratch.chmod(0o700)
+    output = capsys.readouterr().out
+    assert f"[FAIL] scratch root: {scratch} is not writable: " in output
+    assert "[FAIL] sandbox start: " in output
+
+
 def test_runtime_resolution(monkeypatch):
     assert resolve_runtime("enroot") == "enroot"
     assert resolve_runtime("auto", "/opt/enroot/bin/enroot") == "enroot"
@@ -91,6 +161,38 @@ def test_runtime_resolution(monkeypatch):
     assert resolve_runtime("auto") == "enroot"
     monkeypatch.setattr(shutil, "which", lambda name, *_: "/bin/x")
     assert resolve_runtime("auto") == "singularity"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [["doctor"], ["run", "task.sif", "--", "true"], ["pull", "docker://alpine:3.20"], ["janitor"]],
+    ids=lambda command: command[0],
+)
+def test_every_command_with_a_runtime_refuses_an_unknown_one_from_the_environment(
+    tmp_path, fake_runtime, command, capsys, monkeypatch
+):
+    monkeypatch.setenv("HPC_SANDBOX_RUNTIME", "Enroot")  # argparse checks no default
+    assert main([command[0], *common(tmp_path), *command[1:]]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "hpc-sandbox: HPC_SANDBOX_RUNTIME must be one of auto, singularity, enroot, not 'Enroot'\n"
+    )
+    assert not (tmp_path / "scratch").exists()  # the command did not start
+
+
+def test_the_runtime_from_the_environment_is_only_a_default(
+    tmp_path, fake_runtime, capsys, monkeypatch
+):
+    from hpc_sandbox import tools
+
+    monkeypatch.setenv("HPC_SANDBOX_RUNTIME", "bogus")
+    assert main(["janitor", "--runtime", "singularity", *common(tmp_path)]) == 0
+    monkeypatch.setattr(tools, "fetch_slirp4netns", lambda arch: tmp_path / "slirp4netns")
+    assert main(["fetch-tools"]) == 0  # which has no --runtime
+    monkeypatch.setenv("HPC_SANDBOX_RUNTIME", "")  # unset, as with the other variables
+    assert main(["janitor", *common(tmp_path)]) == 0
+    assert "HPC_SANDBOX_RUNTIME" not in capsys.readouterr().err
 
 
 async def _abandon(provider, image):

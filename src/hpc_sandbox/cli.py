@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -66,6 +66,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(arguments[:split])
     args.command = arguments[split + 1 :]
     try:
+        # argparse checks a --runtime given on the command line, never the default it takes from
+        # $HPC_SANDBOX_RUNTIME: a typo there would quietly select Singularity, and a janitor
+        # would skip enroot's sessions. fetch-tools has no --runtime.
+        if getattr(args, "runtime", "auto") not in RUNTIMES:
+            raise ValueError(
+                f"HPC_SANDBOX_RUNTIME must be one of {', '.join(RUNTIMES)}, not {args.runtime!r}"
+            )
         return asyncio.run(args.handler(args))
     except (SandboxError, ValueError) as error:
         print(f"hpc-sandbox: {error}", file=sys.stderr)
@@ -79,7 +86,8 @@ def _parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--runtime",
         choices=RUNTIMES,
-        default=os.environ.get("HPC_SANDBOX_RUNTIME", "auto"),
+        # Empty counts as unset, as with the other HPC_SANDBOX_* variables.
+        default=os.environ.get("HPC_SANDBOX_RUNTIME") or "auto",
         help="container runtime (default: $HPC_SANDBOX_RUNTIME, else auto: the one --binary "
         "names, else the first of singularity, apptainer and enroot on PATH)",
     )
@@ -373,25 +381,30 @@ async def _doctor(args: argparse.Namespace) -> int:
     except SandboxError as error:
         report.line("FAIL", "runtime", str(error))
         return 1
+    # The runtime's checks write in the scratch root: create it and the image cache before them,
+    # as a start and a pull do, so that the scratch root is private. Their lines keep their place.
+    cache = provider.images.cache_dir
+    directories = [
+        _check_directory(
+            "scratch root", provider.scratch_root, provider._make_scratch_directories, local=True
+        ),
+        _check_directory(
+            "image cache", cache, lambda: cache.mkdir(parents=True, exist_ok=True), local=False
+        ),
+    ]
     if isinstance(provider, EnrootProvider):
         await _enroot_checks(report, provider)
     else:
         assert isinstance(runtime, ContainerRuntime)
         for key, value in (await site_config(runtime)).items():
-            risky = (key == "allow setuid" and value == "no") or (
-                key == "sessiondir max size" and value.isdigit() and int(value) < 1024
-            )
-            note = " (never use --writable-tmpfs here)" if key == "sessiondir max size" else ""
-            report.line(
-                "warn" if risky else "info", f"site: {key}", value + (note if risky else "")
-            )
+            # allow setuid = no is user-namespace mode: sandboxes run there as in setuid mode.
+            risky = key == "sessiondir max size" and value.isdigit() and int(value) < 1024
+            note = " (never use --writable-tmpfs here)" if risky else ""
+            report.line("warn" if risky else "info", f"site: {key}", value + note)
     job = os.environ.get("PBS_JOBID") or os.environ.get("SLURM_JOB_ID")
     report.line("info", "batch job", job or "none (login node or laptop)")
-    for name, path in (
-        ("scratch root", provider.scratch_root),
-        ("image cache", provider.images.cache_dir),
-    ):
-        _check_directory(report, name, path, local=name == "scratch root")
+    for line in directories:
+        report.line(*line)
     staging = provider.images.stage_dir
     report.line("info", "image staging", f"to {staging}" if staging else "off")
     report.line(
@@ -415,14 +428,16 @@ async def _enroot_checks(report: _Report, provider: EnrootProvider) -> None:
         report.line("ok", "nsenter", provider.nsenter)
     except SandboxError as error:
         report.line("FAIL", "nsenter", str(error))
-    probe = await run_process(
-        [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid()), "none", "--", "true"],
-        timeout_s=60,
-    )
-    if probe.returncode == 0:
-        report.line("ok", "namespaces", "user, mount, PID, IPC and network namespaces")
+    argv = [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid()), "none", "--", "true"]
+    try:
+        probe = await run_process(argv, timeout_s=60)
+    except OSError as error:  # such as a fork refused at the process limit
+        report.line("FAIL", "namespaces", f"could not run the probe: {error}")
     else:
-        report.line("FAIL", "namespaces", probe.detail() or f"exit {probe.returncode}")
+        if probe.returncode == 0:
+            report.line("ok", "namespaces", "user, mount, PID, IPC and network namespaces")
+        else:
+            report.line("FAIL", "namespaces", probe.detail() or f"exit {probe.returncode}")
     if not outside_user_namespaces():
         report.line(
             "warn",
@@ -452,21 +467,24 @@ def _whiteout_check(temp_dir: Path) -> tuple[str, str, str]:
     converter = shutil.which("enroot-aufs2ovlfs")
     if converter is None:
         return "warn", name, "enroot-aufs2ovlfs is not on PATH; only local .sqsh images work"
-    temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=temp_dir) as scratch:
-        layer = Path(scratch)
-        (layer / "opaque").mkdir()
-        (layer / "opaque" / ".wh..wh..opq").touch()
-        (layer / ".wh.deleted").touch()
-        result = subprocess.run(
-            [converter, str(layer)], capture_output=True, timeout=60, check=False
-        )
-        converted = (
-            result.returncode == 0
-            and not (layer / "opaque" / ".wh..wh..opq").exists()
-            and not (layer / ".wh.deleted").exists()
-            and (layer / "deleted").exists()
-        )
+    try:  # in the runtime's temporary directory, which doctor created with the scratch root
+        with tempfile.TemporaryDirectory(dir=temp_dir) as scratch:
+            layer = Path(scratch)
+            (layer / "opaque").mkdir()
+            (layer / "opaque" / ".wh..wh..opq").touch()
+            (layer / ".wh.deleted").touch()
+            result = subprocess.run(
+                [converter, str(layer)], capture_output=True, timeout=60, check=False
+            )
+            converted = (
+                result.returncode == 0
+                and not (layer / "opaque" / ".wh..wh..opq").exists()
+                and not (layer / ".wh.deleted").exists()
+                and (layer / "deleted").exists()
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        # Such as a scratch root that cannot be written, which its own line reports as FAIL.
+        return "warn", name, f"could not test whether {converter} converts whiteouts: {error}"
     if converted:
         return "ok", name, f"{converter} converts whiteouts"
     detail = result.stderr.decode(errors="replace").strip() or f"exit {result.returncode}"
@@ -498,20 +516,24 @@ def enroot_site_config(conf: Path) -> dict[str, str]:
     return values
 
 
-def _check_directory(report: _Report, name: str, path: Path, *, local: bool) -> None:
+def _check_directory(
+    name: str, path: Path, create: Callable[[], None], *, local: bool
+) -> tuple[str, str, str]:
+    """Whether ``path``, which ``create`` creates if need be, can be written, and where it is."""
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        create()
         with tempfile.NamedTemporaryFile(dir=path):
             pass
+    except SandboxError as error:  # a scratch root that another user owns
+        return "FAIL", name, str(error)
     except OSError as error:
-        report.line("FAIL", name, f"{path} is not writable: {error}")
-        return
+        return "FAIL", name, f"{path} is not writable: {error}"
     usage = os.statvfs(path)
     free_gib = usage.f_bavail * usage.f_frsize / 2**30
     filesystem = filesystem_type(path)
     detail = f"{path} ({filesystem}, {free_gib:.0f} GiB free)"
     shared = filesystem in _SHARED_FILESYSTEMS or filesystem == "tmpfs"
-    report.line("warn" if local and shared and in_batch_job() else "ok", name, detail)
+    return "warn" if local and shared and in_batch_job() else "ok", name, detail
 
 
 def _reflink_works(directory: Path) -> bool:
@@ -534,7 +556,7 @@ async def _smoke(report: _Report, provider: SessionProvider[Any], image: str) ->
     started = time.monotonic()
     try:
         sandbox = await provider.start(SandboxSpec(image=image, labels={"hpc-sandbox": "doctor"}))
-    except SandboxError as error:
+    except (SandboxError, OSError) as error:  # OSError: a scratch root it cannot create
         report.line("FAIL", "sandbox start", str(error))
         await provider.wait_for_deletions(_DELETION_WAIT_S)  # what its cleanup left to delete
         return
