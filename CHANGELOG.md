@@ -4,7 +4,7 @@ What each release of hpc-sandbox changes. Its version is below 1.0: a minor rele
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
 one minor release, require a range such as `hpc-sandbox>=0.3,<0.4`.
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-18)
 
 The first release on PyPI. It adds pods, a fuse-overlay root filesystem layout and per-node image
 templates for Singularity, deletes stopped sessions in the background, and replaces the memory
