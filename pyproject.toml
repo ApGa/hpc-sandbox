@@ -92,7 +92,7 @@ replacement = '<img src="https://raw.githubusercontent.com/ApGa/hpc-sandbox/v$HF
 dev = [
     "pre-commit>=3.2",  # the stage names of .pre-commit-config.yaml (pre-commit, commit-msg)
     "pytest>=8",
-    "pytest-asyncio>=0.23",
+    "pytest-asyncio>=0.24",  # the first with asyncio_default_fixture_loop_scope (set below)
     "ruff==0.17.0",  # the ruff that .pre-commit-config.yaml's hooks run: upgrade both together
 ]
 

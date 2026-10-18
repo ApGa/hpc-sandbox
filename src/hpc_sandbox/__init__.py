@@ -78,7 +78,8 @@ __all__ = [
 ]
 
 # Where a source checkout keeps its pyproject.toml: this file is src/hpc_sandbox/__init__.py.
-_CHECKOUT_PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
+# Not parents[2], which raises IndexError when the package sits right below / (/hpc_sandbox).
+_CHECKOUT_PYPROJECT = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
 
 
 def _running_version(pyproject: Path = _CHECKOUT_PYPROJECT) -> str:
