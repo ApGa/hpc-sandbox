@@ -132,7 +132,10 @@ async def test_upload_and_download_files_and_directories(provider, sif, tmp_path
 async def test_snapshot_and_restore_copy_files(provider, sif):
     spec = SandboxSpec(image=str(sif), labels={"rollout_id": "r1"})
     sandbox = await provider.start(spec)
-    await sandbox.exec("echo v1 > state.txt && echo scratch > /tmp/note")
+    await sandbox.exec("echo v1 > state.txt")
+    # The fake maps only path arguments: in a shell command, /tmp would be the host's. So the
+    # sandbox's private /tmp is written and read from the host.
+    (sandbox.session_dir / "tmp" / "note").write_text("scratch\n")
     snapshot = await sandbox.snapshot()
     await sandbox.exec("echo v2 > state.txt")
     assert snapshot.provider == "singularity" and snapshot.image == str(sif)
@@ -140,7 +143,8 @@ async def test_snapshot_and_restore_copy_files(provider, sif):
 
     restored = await provider.restore(snapshot, spec)
     assert restored.id != sandbox.id
-    assert (await restored.exec("cat state.txt /tmp/note")).stdout == "v1\nscratch\n"
+    assert (await restored.exec("cat state.txt")).stdout == "v1\n"
+    assert (restored.session_dir / "tmp" / "note").read_text() == "scratch\n"
     assert (await sandbox.exec("cat state.txt")).stdout == "v2\n"
 
     with pytest.raises(ValueError, match="not"):
