@@ -1,57 +1,105 @@
 # Changelog
 
-## Unreleased
+What each release of hpc-sandbox changes. Its version is below 1.0: a minor release (0.4.0) may
+change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
+one minor release, require a range such as `hpc-sandbox>=0.3,<0.4`.
+
+## 0.3.0 (unreleased)
+
+The first release on PyPI. It adds pods, a fuse-overlay root filesystem layout and per-node image
+templates for Singularity, deletes stopped sessions in the background, and replaces the memory
+watchdog's victim rule. [Upgrading](#upgrading) lists what callers of 0.2.0 may need to change.
 
 ### Changed behaviour
 
-- **The memory watchdog kills the branch of processes that holds the memory**,
-  not the largest single process. It starts from the heaviest of the running
-  commands and the processes left running in the background, and descends
-  into the child branch that holds the most while that child alone holds the
-  excess over the limit. So a harness survives a tool command that ran away,
-  even when the harness is the largest process, and a worker pool dies with its
-  parent, never one worker at a time. The branch dies whole, with whatever it
-  forks meanwhile. `oom_score_adj` counts as for the kernel's OOM killer,
-  relative to the parent's value: tool commands started with `choom -n 1000`
-  go first, and a value every process inherited changes nothing.
-- **A command whose descendants the watchdog killed keeps its own exit
-  status**, with the explanation appended to stderr (also when it then times
-  out); only a command the watchdog killed itself returns 137.
-- **Processes that commands leave running in a Singularity sandbox can be
-  killed by the watchdog.** Only the processes that make up the sandbox when
-  it starts are spared.
+- **A stop returns once its session left the session root**: it is moved into the root's `.trash`
+  under the janitor lock, and a detached `rm` deletes it afterwards, one deletion per session root
+  at a time, at the lowest CPU priority (while 16 of a process's deletions are pending, its stops
+  delete their sessions themselves). `await provider.wait_for_deletions()` waits for them; call it
+  before a process or a Slurm step ends, which kills them, and before removing a scratch root
+  yourself. On a scratch too full even to move a session, the stop deletes it in place, and a stop
+  that failed is retried by the next. Janitors take over the trash entries no deletion holds once
+  the process that moved them died.
+- **Singularity instances start and stop under their own control lock**, not a node-wide one, so
+  they start and stop in parallel.
+- **A provider sweeps abandoned sessions at its first start that finds the janitor lock free**, and
+  at a later start otherwise: a start never waits to sweep. Janitors and `reap()` still do.
+- **The memory watchdog kills the branch of processes that holds the memory**, not the largest
+  single process. It starts from the heaviest of the running commands and the processes left running
+  in the background, and descends into the child branch that holds the most while that child alone
+  holds the excess over the limit. What a branch holds is what killing it frees: a fork copy of its
+  parent with no children of its own counts its private memory only. So a harness survives a tool
+  command that ran away, even when the harness is the largest process; a child it joins (as
+  code-eval graders run each sample, with a `multiprocessing.Manager`) dies alone; and a pool owner
+  that grows dies with its fork workers. As with the kernel, a pool's worker that holds the excess
+  alone dies alone: a `multiprocessing.Pool`, which never notices a lost worker, then waits for its
+  task until the command times out. The branch dies whole, with what it forks meanwhile.
+  `oom_score_adj` counts as for the kernel's OOM killer, relative to the parent's value and for each
+  process alone: tool commands started with `choom -n 1000` go first, the marks of a browser's
+  renderers do not add up, and a value every process inherited changes nothing.
+- **A command whose descendants the watchdog killed keeps its own exit status**, with the
+  explanation appended to stderr (also when it then times out); only a command the watchdog killed
+  itself returns 137.
+- **Processes that commands leave running in a Singularity sandbox can be killed by the watchdog.**
+  Only the processes that make up the sandbox when it starts are spared.
 
 ### Added
 
 - **Pods**: services sharing one network, like a docker-compose project.
-  `provider.start_pod(PodSpec(...))` returns a pod; `pod.start_service(
-  ServiceSpec(...), wait="started" | "healthy")` starts each service, with
-  compose healthchecks (`HealthCheck`), `health()`, `logs()`, upstream relays
-  to host Unix sockets (`pod.routes`), `set_network("none" | "egress")` and
-  `stop()`. Both providers have the `pods` capability. See the README's Pods
-  section.
-- **`python -m hpc_sandbox fetch-tools`** downloads the pinned slirp4netns
-  pods use for egress, for hosts that have none; providers take a
-  `slirp4netns` path and a `service_stop_grace_s`.
-- **`MemoryKill.processes` and `MemoryKill.tmpfs_bytes`**: how many processes
-  the killed branch held, and how much the sandbox's own tmpfs mounts held
-  (memory no kill frees). `MemoryKill.pid` and `pss_bytes` now describe the
-  killed branch.
-- **`pull` reports local image files too**, and its stdout holds only the JSON
-  lines, whose keys are stable.
+  `provider.start_pod(PodSpec(...))` returns a pod; `pod.start_service(ServiceSpec(...),
+  wait="started" | "healthy")` starts each service, with compose healthchecks (`HealthCheck`),
+  `health()`, `logs()`, upstream relays to host Unix sockets (`pod.routes`),
+  `set_network("none" | "egress")` and `stop()`. Both providers have the `pods` capability; see
+  [docs/pods.md](docs/pods.md).
+- **`hpc-sandbox fetch-tools`** downloads the pinned slirp4netns that pods use for egress, for
+  hosts that have none; providers take a `slirp4netns` path and a `service_stop_grace_s`.
+- **A fuse-overlay layout for Singularity sandboxes**: `rootfs_layout="fuse-overlay"` (or
+  `HPC_SANDBOX_ROOTFS_LAYOUT` for a whole job) mounts each sandbox's root filesystem as a
+  `fuse-overlayfs` of the node's template of the image and a per-session upper layer, run by an
+  unprivileged instance. Starts and stops no longer depend on the image's size, and a snapshot holds
+  only what the sandbox wrote. It needs `fuse-overlayfs`, `fusermount3` and unprivileged user
+  namespaces. GPUs, cgroup limits and `--fakeroot` need the copy layout: with an explicit
+  `rootfs_layout="fuse-overlay"` they raise `ValueError`, and `HPC_SANDBOX_ROOTFS_LAYOUT` leaves
+  such a provider on the copy layout. Pod services always get the copy layout. Janitors unmount the
+  overlays of abandoned sessions, and the dead overlays that killed `fuse-overlayfs` processes left
+  anywhere on the node; see [docs/singularity.md](docs/singularity.md).
+- **Templates** (`rootfs_templates`): each image extracted once per node, the fuse-overlay layout's
+  lower layer; with the copy layout, sandboxes copy it. A template that lost its marker is
+  extracted again, and extractions cut short are deleted by janitors. `EnrootProvider` accepts
+  `rootfs_templates` and `rootfs_layout="copy"` too.
+- **`provider.wait_for_deletions()`** on both providers, and `MemoryKill.pids` (in
+  `sandbox.memory_kills`), the processes of the killed branch.
+- **`MemoryKill.processes` and `MemoryKill.tmpfs_bytes`**: how many processes the killed branch
+  held, and how much the sandbox's own tmpfs mounts held (memory no kill frees). `MemoryKill.pid`
+  and `pss_bytes` now describe the killed branch.
+- **`hpc-sandbox --version`**, `hpc_sandbox.__version__` and a `py.typed` marker.
+- **Documentation**: the README is a landing page, and `docs/` holds the guides and the reference;
+  `CONTRIBUTING.md` and `SECURITY.md` are new. `pull`'s JSON keys are documented as stable.
 
 ### Fixed
 
-- **Cancelling a command while it starts no longer hangs.** On Python 3.11,
-  asyncio waits forever when the creation of a subprocess is cancelled while
-  what it started keeps its output open (as commands behind `nsenter` do);
-  cancelled `exec` calls and teardowns could hang that way.
-- **A janitor sweep no longer stalls a process starting or stopping many
-  sandboxes.** Session directories were created and removed in worker threads
-  that waited for the janitor's lock, while the sweep holding it needed a
-  worker thread too.
-- **A start cancelled while its session directory is created leaves nothing**:
-  the directory and its lease were kept until the process exited.
+- **Cancelling a command while it starts no longer hangs.** On Python 3.11, asyncio waits forever
+  when the creation of a subprocess is cancelled while what it started keeps its output open (as
+  commands behind `nsenter` do); cancelled `exec` calls and teardowns could hang that way.
+- **A janitor sweep no longer stalls a process starting or stopping many sandboxes.** Session
+  directories were created and removed in worker threads that waited for the janitor's lock, while
+  the sweep holding it needed a worker thread too.
+- **A start cancelled while its session directory is created leaves nothing**: the directory and
+  its lease were kept until the process exited.
+
+### Upgrading
+
+- **Stops return before their sessions are deleted.** Code that removes a scratch root, or ends its
+  process or Slurm step, right after stopping sandboxes should first
+  `await provider.wait_for_deletions()`; otherwise the removal races the deletions, and what the end
+  of a step kills is left for a janitor.
+- **`hpc_sandbox.sessions.remove_session` is gone**: it blocked a worker thread on the janitor lock.
+  Stopping a sandbox deletes its session.
+- **A relative `scratch_root` is made absolute.** Sessions and snapshots that 0.2.0 recorded under a
+  relative scratch root are not recognised as bound to it: stop such sandboxes with 0.2.0, or
+  delete their files by hand.
+- **The `test` extra is gone**: development tools are in the `dev` dependency group
+  (`uv sync --group dev`; see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## 0.2.0
 
