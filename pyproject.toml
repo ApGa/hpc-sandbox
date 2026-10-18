@@ -1,28 +1,104 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
 name = "hpc-sandbox"
+# The release version, set here and nowhere else: hpc_sandbox.__version__ and `hpc-sandbox --version`
+# read it from this file in a checkout and from the installed metadata otherwise (CONTRIBUTING.md,
+# "Release a version").
 version = "0.2.0"
-description = "Rootless HPC sandboxes on Singularity/Apptainer instances and enroot containers"
+description = "Rootless sandboxes for HPC clusters, on Singularity/Apptainer or enroot."
+authors = [
+    {name = "Apurva Gandhi", email = "apurvag@cs.cmu.edu"}
+]
+# PyPI shows README.md with its relative links and images pointed at the repository
+# (fancy-pypi-readme, below).
+dynamic = ["readme"]
 license = "MIT"
 license-files = ["LICENSE"]
-readme = "README.md"
 requires-python = ">=3.11"
+keywords = [
+    "agents",
+    "apptainer",
+    "code-execution",
+    "containers",
+    "enroot",
+    "hpc",
+    "pbs",
+    "rootless",
+    "sandbox",
+    "singularity",
+    "slurm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+# None: hpc-sandbox imports only Python's standard library (tests/test_packaging.py checks it). What
+# only development needs is in the dev group, below.
 dependencies = []
 
-[project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.23"]
+[project.urls]
+Homepage = "https://github.com/ApGa/hpc-sandbox"
+Documentation = "https://github.com/ApGa/hpc-sandbox/tree/main/docs"
+Source = "https://github.com/ApGa/hpc-sandbox"
+Issues = "https://github.com/ApGa/hpc-sandbox/issues"
+Changelog = "https://github.com/ApGa/hpc-sandbox/blob/main/CHANGELOG.md"
 
 [project.scripts]
 hpc-sandbox = "hpc_sandbox.cli:main"
 
+[build-system]
+# hatchling 1.27 writes PEP 639 license metadata (license and license-files).
+requires = ["hatchling>=1.27", "hatch-fancy-pypi-readme>=24.1"]
+build-backend = "hatchling.build"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/hpc_sandbox"]
 
+# The sdist holds what builds the wheel: the package, the license, README.md (the PyPI description)
+# and the release notes. Tests and docs stay in the repository.
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "LICENSE", "README.md", "CHANGELOG.md"]
+
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+# PyPI cannot resolve README.md's relative links and images: point them at the repository, at the
+# tag of the release being built ($HFPR_VERSION is the version; hatch-fancy-pypi-readme 24.1 added
+# it), so that a release's description keeps matching its code and docs after main moves on.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?![a-z][a-z0-9+.-]*:|#)([^)\s]+)\)'
+replacement = '](https://github.com/ApGa/hpc-sandbox/blob/v$HFPR_VERSION/\1)'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '<img src="(?![a-z][a-z0-9+.-]*:)([^"]+)"'
+replacement = '<img src="https://raw.githubusercontent.com/ApGa/hpc-sandbox/v$HFPR_VERSION/\1"'
+
+# What developing hpc-sandbox needs, which is never published: `uv sync --group dev` installs it
+# (CONTRIBUTING.md, "Set up a development environment").
+[dependency-groups]
+dev = [
+    "pre-commit>=3.2",  # the stage names of .pre-commit-config.yaml (pre-commit, commit-msg)
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff==0.17.0",  # the ruff that .pre-commit-config.yaml's hooks run: upgrade both together
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The tests import hpc_sandbox from this checkout's src/, whatever the environment has installed.
 pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
@@ -33,3 +109,10 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# The tests import their helper modules (conftest, fake_enroot, test_trash...) by their bare names:
+# with tests/ here, import sorting counts them as first-party, as it does hpc_sandbox.
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# pycodestyle errors (E), pyflakes (F) and import sorting (I).
+select = ["E", "F", "I"]

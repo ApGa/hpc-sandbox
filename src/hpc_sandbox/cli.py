@@ -1,4 +1,11 @@
-"""``python -m hpc_sandbox``: check a node, pull images, run one command, sweep sessions."""
+"""The ``hpc-sandbox`` command, which ``python -m hpc_sandbox`` runs too.
+
+- ``doctor``: check whether this node can run sandboxes; with ``--image``, start one and use it.
+- ``run``: run one command in a fresh sandbox and exit with its status.
+- ``pull``: pull images into the image cache, or check local image files, and print JSON lines.
+- ``fetch-tools``: download the pinned slirp4netns that pods use for egress.
+- ``janitor``: stop and remove what dead processes left on this node, and print a JSON report.
+"""
 
 from __future__ import annotations
 
@@ -66,50 +73,129 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
+    from . import __version__
+
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--runtime",
         choices=RUNTIMES,
         default=os.environ.get("HPC_SANDBOX_RUNTIME", "auto"),
-        help="container runtime (default: $HPC_SANDBOX_RUNTIME, else the first of "
-        "singularity, apptainer and enroot on PATH)",
+        help="container runtime (default: $HPC_SANDBOX_RUNTIME, else auto: the one --binary "
+        "names, else the first of singularity, apptainer and enroot on PATH)",
     )
-    common.add_argument("--binary", help="runtime executable (default: detect)")
-    common.add_argument("--scratch-root", help="node-local scratch (default: job-local dir)")
-    common.add_argument("--image-cache", help="SIF cache directory")
+    common.add_argument(
+        "--binary", help="the runtime's executable, a name on PATH or a path (default: detect)"
+    )
+    common.add_argument(
+        "--scratch-root",
+        help="node-local scratch for sessions, snapshots and staged images (default: "
+        "$HPC_SANDBOX_SCRATCH, else hpc-sandbox in the PBS job's local directory, else "
+        "$TMPDIR/hpc-sandbox-UID)",
+    )
+    common.add_argument(
+        "--image-cache",
+        help="where pulled images are cached, as SIF or squashfs files (default: "
+        "$HPC_SANDBOX_IMAGE_CACHE, else ${XDG_CACHE_HOME:-~/.cache}/hpc-sandbox/images)",
+    )
 
     parser = argparse.ArgumentParser(
-        prog="python -m hpc_sandbox",
-        description="Rootless HPC sandboxes on Singularity/Apptainer instances or enroot.",
+        prog="hpc-sandbox",
+        description="Rootless sandboxes for HPC clusters, on Singularity/Apptainer or enroot.",
+        epilog="Run 'hpc-sandbox COMMAND --help' for the options of a command.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="print hpc-sandbox's version and exit",
     )
     commands = parser.add_subparsers(required=True, metavar="COMMAND")
 
-    doctor = commands.add_parser("doctor", parents=[common], help="check this node")
+    doctor = commands.add_parser(
+        "doctor",
+        parents=[common],
+        help="check whether this node can run sandboxes",
+        description="Check whether this node can run sandboxes, one line per check; exit with "
+        "status 1 if a check failed.",
+    )
     doctor.add_argument("--image", help="also start a sandbox from IMAGE and exercise it")
     doctor.set_defaults(handler=_doctor)
 
     run = commands.add_parser(
-        "run", parents=[common], help="run a command in a fresh sandbox: run IMAGE -- CMD [ARG...]"
+        "run",
+        parents=[common],
+        help="run one command in a fresh sandbox: run IMAGE -- CMD [ARG...]",
+        usage="%(prog)s [OPTIONS] IMAGE -- CMD [ARG...]",
+        description="Start a fresh sandbox from IMAGE, run CMD in it, stop the sandbox and exit "
+        "with the command's status. Everything after the first -- is the command, run without a "
+        "shell. When the sandbox cannot start or the command cannot run, the reason follows "
+        "'hpc-sandbox: ' on stderr and the exit status is 2.",
     )
-    run.add_argument("image")
-    run.add_argument("--workdir", default="/app")
-    run.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
-    run.add_argument("--bind", action="append", default=[], metavar="SRC:DST[:ro|rw]")
-    run.add_argument("--label", action="append", default=[], metavar="KEY=VALUE")
-    run.add_argument("--network", choices=("host", "none"), default="host")
+    run.add_argument(
+        "image",
+        metavar="IMAGE",
+        help="a remote reference such as docker://alpine:3.20, or a local .sif (Singularity) or "
+        ".sqsh (enroot) file; @sha256:<hex> pins it",
+    )
+    run.add_argument(
+        "--workdir", default="/app", help="the command's working directory (default: /app)"
+    )
+    run.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="an environment variable of the command; repeat it for more",
+    )
+    run.add_argument(
+        "--bind",
+        action="append",
+        default=[],
+        metavar="SRC:DST[:ro|rw]",
+        help="bind the host path SRC at DST, read-only unless :rw; repeat it for more",
+    )
+    run.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="a label of the sandbox, which janitor --label selects by; repeat it for more",
+    )
+    run.add_argument(
+        "--network",
+        choices=("host", "none"),
+        default="host",
+        help="the host's network, or none: a loopback interface only (default: host)",
+    )
     run.add_argument(
         "--allow-network-none",
         action="store_true",
         help="let Singularity use --network none (enroot always can)",
     )
-    run.add_argument("--memory-mb", type=int)
-    run.add_argument("--timeout", type=float, default=600.0, help="seconds (default 600)")
+    run.add_argument(
+        "--memory-mb", type=int, help="memory limit in MiB, which the memory watchdog enforces"
+    )
+    run.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="seconds after which the command is killed, with exit status 124 (default: 600)",
+    )
     run.set_defaults(handler=_run)
 
     pull = commands.add_parser(
-        "pull", parents=[common], help="pull images into the cache: pull IMAGE [IMAGE...]"
+        "pull",
+        parents=[common],
+        help="pull images into the cache: pull IMAGE [IMAGE...]",
+        description="Pull each IMAGE into the image cache unless it is cached, or check a local "
+        "image file, and print a JSON line for each.",
     )
-    pull.add_argument("references", nargs="+", metavar="IMAGE")
+    pull.add_argument(
+        "references",
+        nargs="+",
+        metavar="IMAGE",
+        help="a remote reference, or a local image file to check",
+    )
     pull.add_argument(
         "--refresh",
         action="store_true",
@@ -120,14 +206,28 @@ def _parser() -> argparse.ArgumentParser:
     fetch = commands.add_parser(
         "fetch-tools",
         help="download the pinned slirp4netns pods use for egress when the host has none",
+        description="Download the pinned slirp4netns that pods use for egress when the host has "
+        "none, check its SHA-256, and print a JSON line.",
     )
-    fetch.add_argument("--arch", help="machine architecture (default: this one's)")
+    fetch.add_argument("--arch", help="x86_64 or aarch64 (default: this machine's)")
     fetch.set_defaults(handler=_fetch_tools)
 
     janitor = commands.add_parser(
-        "janitor", parents=[common], help="stop and remove abandoned sessions on this node"
+        "janitor",
+        parents=[common],
+        help="stop and remove abandoned sessions on this node",
+        description="Stop and remove the sandboxes and pods that dead processes left on this "
+        "node, and print a JSON report; exit with status 1 if it lists errors. Unless --runtime, "
+        "$HPC_SANDBOX_RUNTIME or --binary selects one runtime, it sweeps enroot's sessions, and "
+        "Singularity's when singularity or apptainer is on PATH.",
     )
-    janitor.add_argument("--label", action="append", default=[], metavar="KEY=VALUE")
+    janitor.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="only sessions with this label; repeat it for more, which must all match",
+    )
     janitor.set_defaults(handler=_janitor)
     return parser
 
