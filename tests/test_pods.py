@@ -796,6 +796,20 @@ async def test_a_graceful_stop_reaches_the_command_and_statuses_are_shell_like(
     assert victim.exit_status == 137  # still, once stopped
 
 
+async def test_a_pod_stopping_gracefully_refuses_new_commands_meanwhile(runtime):
+    provider, image = runtime
+    provider.service_stop_grace_s = 10.0
+    pod = await provider.start_pod(PodSpec())
+    slow = ["sh", "-c", "trap 'sleep 2; exit 3' TERM; while :; do sleep 0.1; done"]
+    await pod.start_service(ServiceSpec("slow", SandboxSpec(image=image), command=slow))
+    idle = await pod.start_service(ServiceSpec("idle", SandboxSpec(image=image)))
+    stopping = asyncio.ensure_future(pod.stop())
+    await asyncio.sleep(0.5)
+    with pytest.raises(SandboxError, match="being stopped"):
+        await idle.exec("true")
+    await stopping
+
+
 async def test_an_exec_running_while_its_pod_stops_gracefully_was_stopped_not_lost(runtime):
     provider, image = runtime
     provider.service_stop_grace_s = 5.0

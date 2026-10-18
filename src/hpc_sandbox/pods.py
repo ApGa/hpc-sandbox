@@ -772,6 +772,8 @@ class SessionPod:
         await asyncio.gather(
             *(h.task for h in self._health.values() if h.task), return_exceptions=True
         )
+        for service in self._services.values():
+            service._stopping = True  # no new commands; what ends from now on was stopped, not lost
         grace = self._provider.service_stop_grace_s
         commands = [s for s in self._services.values() if s.service.command is not None]
         if grace > 0 and commands:  # an idle loop has nothing to finish
@@ -1154,7 +1156,6 @@ class PodService(SessionSandbox):
 
     def terminate(self) -> None:
         """Ask the command to stop: SIGTERM to the init, which passes it on."""
-        self._stopping = True  # what it ends meanwhile was stopped, not lost
         init = self._service_init
         if init is not None and procfs.owned_live_start_time(init) == self._service_init_start:
             with contextlib.suppress(ProcessLookupError):

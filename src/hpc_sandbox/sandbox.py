@@ -1046,6 +1046,8 @@ class SessionSandbox:
             raise SandboxLostError(f"sandbox {self.id} lost its container: {self._lost}")
         if not self._running:
             raise SandboxError(f"sandbox {self.id} is not running")
+        if self._stopping:
+            raise SandboxError(f"sandbox {self.id} is being stopped")
 
     def _on_memory_kill(self, kill: memory.MemoryKill) -> None:
         log.warning("sandbox %s: %s", self.id, kill.message())
