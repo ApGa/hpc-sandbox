@@ -649,7 +649,8 @@ class SessionPod:
                 if status != "healthy":
                     detail = health.output.strip() or service.log_tail(4096).strip()
                     raise SandboxStartError(
-                        f"service {spec.name!r} of pod {self.id} is {status}: {detail or 'no output'}"
+                        f"service {spec.name!r} of pod {self.id} is {status}: "
+                        f"{detail or 'no output'}"
                     )
         except BaseException:
             await self._drop(spec.name)

@@ -1,0 +1,119 @@
+name: Bug report
+description: Something hpc-sandbox does wrong, or a sandbox that fails on your cluster
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thank you for reporting. Most problems depend on the cluster: the runtime and how it is
+        installed, the scheduler, the kernel and the filesystems. The answers below let us
+        reproduce yours. Leave out what you do not want to make public, such as host names, user
+        names and your site's paths. Report a security problem privately instead, as
+        [SECURITY.md](https://github.com/ApGa/hpc-sandbox/blob/main/SECURITY.md) describes.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >-
+        What you did, what you expected and what happened instead, with the full error message or
+        traceback.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: >-
+        The smallest Python script or `hpc-sandbox` command that shows the problem, the image it
+        uses, and how you ran it, for example in a batch script, with `srun` or with `pbsdsh`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `hpc-sandbox doctor --image IMAGE`
+      description: >-
+        Run it on the compute node where the problem happens, inside your batch job, with the image
+        of the reproduction and the `--runtime` you use. If `doctor` itself fails, paste what it
+        printed.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: hpc-sandbox version
+      description: What `hpc-sandbox --version` prints.
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and version
+      description: What `singularity --version`, `apptainer --version` or `enroot version` prints.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime-mode
+    attributes:
+      label: Runtime mode
+      description: >-
+        How the runtime is installed. For Singularity CE and Apptainer, `doctor` prints the site's
+        `allow setuid` setting.
+      options:
+        - Singularity CE or Apptainer, setuid
+        - Singularity CE or Apptainer, user-namespace mode (no setuid)
+        - enroot
+        - I do not know
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scheduler
+    attributes:
+      label: Scheduler
+      options:
+        - Slurm
+        - PBS Pro or OpenPBS
+        - Another scheduler (name it under "Anything else")
+        - None
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel and distribution
+      description: What `uname -r` prints on the compute node, and its Linux distribution.
+    validations:
+      required: true
+
+  - type: input
+    id: filesystems
+    attributes:
+      label: Filesystems of the scratch root and the image cache
+      description: >-
+        Their filesystem types, such as xfs, ext4, tmpfs, lustre, nfs or gpfs, as `doctor` prints
+        them.
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: What `python --version` prints in the environment that runs hpc-sandbox.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: >-
+        Log messages (hpc-sandbox logs through Python's `logging` module), settings you changed,
+        such as `HPC_SANDBOX_*` variables or provider options, and what you tried.

@@ -1,5 +1,6 @@
-"""The fuse-overlay rootfs layout: a fuse-overlayfs of the node's template and a per-session upper layer, run by
-an unprivileged instance, unmounted before its session is deleted (by its owner or a janitor)."""
+"""The fuse-overlay rootfs layout: a fuse-overlayfs of the node's template and a per-session upper
+layer, run by an unprivileged instance, unmounted before its session is deleted (by its owner or a
+janitor)."""
 
 from __future__ import annotations
 
@@ -16,9 +17,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pytest
-from conftest import FakeRuntime, in_mount_namespace, make_provider, namespaces_unavailable
-from test_janitor import crashed_sandboxes
 
+from conftest import FakeRuntime, in_mount_namespace, make_provider, namespaces_unavailable
 from hpc_sandbox import (
     PodSpec,
     SandboxSnapshot,
@@ -29,6 +29,7 @@ from hpc_sandbox import (
 )
 from hpc_sandbox import singularity as singularity_module
 from hpc_sandbox.singularity import OVERLAY_RECORD, OVERLAY_SNAPSHOT_FORMAT, TEMPLATE_DIR
+from test_janitor import crashed_sandboxes
 
 FAKE_FUSE = Path(__file__).with_name("fake_fuse.py")
 SFTP_SERVERS = (
@@ -56,7 +57,8 @@ def fake_fuse(tmp_path: Path, fake_runtime: FakeRuntime, monkeypatch: pytest.Mon
 
 @pytest.fixture
 def sshfs(tmp_path: Path) -> Iterator[Callable[[Path], int]]:
-    """Mount real FUSE file systems, which sshfs over a local sftp-server makes as fuse-overlayfs does."""
+    """Mount real FUSE file systems, which sshfs over a local sftp-server makes as fuse-overlayfs
+    does."""
     binary = shutil.which("sshfs")
     server = next((path for path in SFTP_SERVERS if os.access(path, os.X_OK)), None)
     if binary is None or server is None or shutil.which("fusermount3") is None:
@@ -243,7 +245,11 @@ for name in names:
     os.mkdir(odd)
     subprocess.run([b"mount", b"-t", b"tmpfs", b"tmpfs", odd], check=True)
     mounted.append(singularity._mounted(Path(os.fsdecode(odd))))
-print(all(mounted), asyncio.run(singularity.unmount_dead_overlays()), procfs.tmpfs_bytes(os.getpid()) is not None)
+print(
+    all(mounted),
+    asyncio.run(singularity.unmount_dead_overlays()),
+    procfs.tmpfs_bytes(os.getpid()) is not None,
+)
 """
     assert in_mount_namespace(script, str(tmp_path)).split() == ["True", "[]", "True"]
 
@@ -377,7 +383,8 @@ def test_layouts_are_checked(tmp_path, fake_runtime, monkeypatch):
     monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")
     assert make_provider(tmp_path).rootfs_layout == "fuse-overlay"
     assert make_provider(tmp_path, rootfs_layout="copy").rootfs_layout == "copy"
-    # A site-wide default a provider cannot take falls back to copies rather than refusing the provider.
+    # A site-wide default a provider cannot take falls back to copies rather than refusing the
+    # provider.
     assert make_provider(tmp_path, gpu="nv").rootfs_layout == "copy"
     assert make_provider(tmp_path, extra_start_args=["--fakeroot"]).rootfs_layout == "copy"
     assert make_provider(tmp_path, rootfs_templates=False).rootfs_layout == "copy"

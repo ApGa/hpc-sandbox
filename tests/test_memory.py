@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import make_provider
 
+from conftest import make_provider
 from hpc_sandbox import SandboxSpec, memory, procfs
 from hpc_sandbox.memory import _Process, choose_branch, choose_victim, sample
 
@@ -132,7 +132,10 @@ def test_like_the_kernel_a_larger_independent_command_goes_first_unless_marked()
 
 
 POOL = "python3 pool.py"  # fork workers are copies of their parent
-SPAWNED = "python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork"
+SPAWNED = (
+    "python3 -c from multiprocessing.spawn import spawn_main; "
+    "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork"
+)
 FORKSERVER = (
     "python3 -c from multiprocessing.forkserver import main; main(10, 11, ['__main__'], **{})"
 )
@@ -347,7 +350,10 @@ def test_a_marked_pool_counts_its_mark_once():
     assert killed(sandbox(proc(10, 2, 257), *tools)) == [30]
 
 
-# Scenarios of the watchdog of the fuse-overlay pull request (its tests 0010 and 0014).
+# Process trees seen in integration runs of the watchdog, and variations on them: an agent harness
+# whose training script runs 192 workers (unnamed, joblib's loky workers, or forked copies of the
+# script), a small excess on a Singularity instance, a bystander smaller than the process that
+# holds the memory, and two such processes under one harness.
 HARNESS = "python3 /opt/agent/harness.py --task 17"
 TRAIN = "python3 train.py"
 LOKY = (

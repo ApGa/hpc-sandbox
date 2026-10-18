@@ -11,20 +11,21 @@ On a breach the watchdog kills one branch of the process forest, never the
 sandbox's own processes (recorded when it starts). It starts from the heaviest
 of the sandbox's top-level branches (each ``exec``'s tree, and each tree below
 the sandbox's own processes: commands left running in the background by earlier
-ones) and descends into the child branch that holds the most while that child
-alone holds the excess over the limit. So the command that ran away dies and a
+ones) and descends into the child whose death frees the most while that child
+alone frees the excess over the limit. So the command that ran away dies and a
 harness survives a tool command it started, whatever their sizes; when the
-memory is spread over several children, their parent's branch dies whole. What
-a branch holds is what killing it frees: a fork copy of its parent (a
-``multiprocessing`` fork worker) counts its private memory only, since the
-pages it still shares with its parent stay, so a pool owner that grows dies
-with its workers. As with the kernel's OOM killer, a pool's worker that holds
-the excess alone dies alone, so a harness that runs code in children it joins
-(with a ``multiprocessing.Manager``, or several at once) learns that one was
-killed, while a ``multiprocessing.Pool``, which never notices a lost worker,
-waits for its task until the command times out (``concurrent.futures`` and
-joblib raise an error instead): the process tree cannot tell the two apart. It
-may also kill a larger idle process before a smaller one that is growing.
+memory is spread over several children, their parent's branch dies whole. A
+fork copy of its parent (a ``multiprocessing`` fork worker) with no fork copies
+of its own frees its private memory only, since the pages it still shares with
+its parent stay, so a pool owner that grows dies with its workers; one with
+fork copies below it frees its whole branch, which shares its pages. As with
+the kernel's OOM killer, a pool's worker that holds the excess alone dies
+alone, so a harness that runs code in children it joins (with a
+``multiprocessing.Manager``, or several at once) learns that one was killed,
+while a ``multiprocessing.Pool``, which never notices a lost worker, waits for
+its task until the command times out (``concurrent.futures`` and joblib raise
+an error instead): the process tree cannot tell the two apart. It may also kill
+a larger idle process before a smaller one that is growing.
 
 ``oom_score_adj`` counts the way the kernel's OOM killer counts it, relative to
 the parent's value, so that what every process inherited changes nothing:

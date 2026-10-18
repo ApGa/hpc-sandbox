@@ -29,11 +29,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_integration import RUNTIME, make_provider
 
 from hpc_sandbox import SandboxSpec
 from hpc_sandbox.procfs import owned_live_start_time
 from hpc_sandbox.types import HealthCheck, PodSpec, SandboxError, ServiceSpec
+from test_integration import RUNTIME, make_provider
 
 pytestmark = [
     pytest.mark.integration,

@@ -1,0 +1,41 @@
+name: Feature request
+description: Something hpc-sandbox should do that it does not do yet
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        The [roadmap](https://github.com/ApGa/hpc-sandbox/blob/main/docs/roadmap.md) lists what is
+        not built yet. If your request is there, say what you need it for: that helps decide what
+        comes first.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to do
+      description: >-
+        The workload, not only the feature: what you run in sandboxes, how many at once, and what
+        stops you today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: >-
+        How it could work, for example the Python API or the command you would like to use.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What you do today instead, and what else you considered.
+
+  - type: input
+    id: environment
+    attributes:
+      label: Runtime and scheduler
+      description: >-
+        The runtime (Singularity CE, Apptainer or enroot) and how it is installed, and the
+        scheduler of the cluster where you need the feature.

@@ -1,4 +1,5 @@
-"""Stopped sessions leave the session root under the janitor lock and are deleted after it, in the background."""
+"""Stopped sessions leave the session root under the janitor lock and are deleted after it, in
+the background."""
 
 from __future__ import annotations
 
@@ -14,15 +15,15 @@ import uuid
 from pathlib import Path
 
 import pytest
-from conftest import in_mount_namespace, make_provider
-from test_janitor import crashed_sandboxes
 
+from conftest import in_mount_namespace, make_provider
 from hpc_sandbox import SandboxSpec, sessions
 from hpc_sandbox import sandbox as sandbox_module
 from hpc_sandbox import singularity as singularity_module
 from hpc_sandbox.sandbox import _DELETIONS
 from hpc_sandbox.sessions import JANITOR_LOCK, TRASH_DIR, remove_tree
 from hpc_sandbox.singularity import CONTROL_LOCK
+from test_janitor import crashed_sandboxes
 
 
 def janitor_lock_held(root: Path) -> bool:
@@ -43,7 +44,8 @@ async def test_a_stop_moves_the_session_out_and_deletes_it_in_the_background(
 ):
     provider = make_provider(tmp_path)
     sandbox = await provider.start(SandboxSpec(image=str(sif)))
-    # Tasks leave directories they took the owner's permissions from; the deletion restores them first.
+    # Tasks leave directories they took the owner's permissions from; the deletion restores them
+    # first.
     result = await sandbox.exec("mkdir -p locked/inner && touch locked/inner/f && chmod 000 locked")
     assert result.exit_code == 0, result.stderr
     moved: list[tuple[Path, bool]] = []
@@ -231,7 +233,9 @@ from pathlib import Path
 from hpc_sandbox import sessions
 from hpc_sandbox import sandbox as sandbox_module
 scratch = Path(sys.argv[1])
-subprocess.run(["mount", "-t", "tmpfs", "-o", "size=16m,nr_inodes=64", "tmpfs", str(scratch)], check=True)
+subprocess.run(
+    ["mount", "-t", "tmpfs", "-o", "size=16m,nr_inodes=64", "tmpfs", str(scratch)], check=True
+)
 root = scratch / "sessions"
 async def main():
     session = await sessions.create_session(root, sessions.new_instance_name())

@@ -25,7 +25,8 @@ TIME_NS = 1_500_000_000_000_000_000
 
 
 def make_deep_tree(parent: Path, depth: int) -> None:
-    """``parent/d/d/...``, ``depth`` levels, built through descriptors (paths would get too long)."""
+    """``parent/d/d/...``, ``depth`` levels, built through descriptors (paths would get too
+    long)."""
     current = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for _ in range(depth):

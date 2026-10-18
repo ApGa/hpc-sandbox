@@ -1,57 +1,141 @@
 # Changelog
 
-## Unreleased
+What each release of hpc-sandbox changes. Its version is below 1.0: a minor release (0.4.0) may
+change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
+one minor release, require a range such as `hpc-sandbox>=0.3,<0.4`.
+
+## 0.3.0 (2026-10-18)
+
+The first release on PyPI. It adds pods, a fuse-overlay root filesystem layout and per-node image
+templates for Singularity, deletes stopped sessions in the background, and replaces the memory
+watchdog's victim rule. [Upgrading](#upgrading) lists what callers of 0.2.0 may need to change.
 
 ### Changed behaviour
 
-- **The memory watchdog kills the branch of processes that holds the memory**,
-  not the largest single process. It starts from the heaviest of the running
-  commands and the processes left running in the background, and descends
-  into the child branch that holds the most while that child alone holds the
-  excess over the limit. So a harness survives a tool command that ran away,
-  even when the harness is the largest process, and a worker pool dies with its
-  parent, never one worker at a time. The branch dies whole, with whatever it
-  forks meanwhile. `oom_score_adj` counts as for the kernel's OOM killer,
-  relative to the parent's value: tool commands started with `choom -n 1000`
-  go first, and a value every process inherited changes nothing.
-- **A command whose descendants the watchdog killed keeps its own exit
-  status**, with the explanation appended to stderr (also when it then times
-  out); only a command the watchdog killed itself returns 137.
-- **Processes that commands leave running in a Singularity sandbox can be
-  killed by the watchdog.** Only the processes that make up the sandbox when
-  it starts are spared.
+- **A stop returns once its session left the session root**: it is moved into the root's `.trash`
+  under the janitor lock, and a detached `rm` deletes it afterwards, one deletion per session root
+  at a time, at the lowest CPU priority (while 16 of a process's deletions are pending, its stops
+  delete their sessions themselves). `await provider.wait_for_deletions()` waits for them; call it
+  before your program exits inside a batch job, since the end of the job or of its Slurm step kills
+  them, and before removing a scratch root yourself. On a scratch too full even to move a session,
+  the stop deletes it in place, and a stop that failed is retried by the next. Janitors take over
+  the trash entries that no deletion holds: at once when the process that moved them died, a minute
+  after the move otherwise. [Stopping and deleting](docs/python-api.md#stopping-and-deleting)
+  describes it.
+- **Singularity instances start and stop under their own control lock**, not a node-wide one, so
+  they start and stop in parallel; see [Instances](docs/singularity.md#instances).
+- **A provider sweeps abandoned sessions at its first start that finds the janitor lock free**, and
+  at a later start otherwise: a start never waits for the janitor lock. Janitors and `reap()` still
+  do. A first start stops and moves every abandoned session it finds, but deletes at most 64 trash
+  entries; `reap()` and `hpc-sandbox janitor` take the rest, holding at most 64 entries at a time.
+  See [Janitors](docs/architecture.md#janitors).
+- **The memory watchdog kills the branch of processes that holds the memory**, not the largest
+  single process. It starts from the heaviest of the running commands and the processes left running
+  in the background, and descends into the child whose death frees the most, while that child alone
+  frees the excess over the limit. A fork copy of its parent with no fork copies of its own counts
+  only its private memory towards what killing its branch frees, since the pages it shares with its
+  parent stay; one with fork copies below it counts its whole branch. So a harness survives a tool
+  command that ran away, even when the harness is the largest process; a child it joins (as
+  code-evaluation graders run each sample, with a `multiprocessing.Manager`) dies alone; and a pool
+  owner that grows dies with its fork workers. As with the kernel, a pool's worker that holds the
+  excess alone dies alone: a `multiprocessing.Pool`, which never notices a lost worker, then waits
+  for its task until the command times out. The branch dies whole, with what it forks meanwhile.
+  `oom_score_adj` counts as for the kernel's OOM killer, relative to the parent's value and for each
+  process alone: tool commands started with `choom -n 1000` go first, the marks of a browser's
+  renderers do not add up, and a value every process inherited changes nothing.
+  [The memory watchdog](docs/architecture.md#the-memory-watchdog) has the complete rules.
+- **A command whose descendants the watchdog killed keeps its own exit status**, with the
+  explanation appended to stderr (also when it then times out); only a command the watchdog killed
+  itself returns 137. See [Memory limits](docs/python-api.md#memory-limits).
+- **Processes that commands leave running in a Singularity sandbox can be killed by the watchdog.**
+  Only the processes that make up the sandbox when it starts are spared; see
+  [What it measures](docs/architecture.md#what-it-measures).
 
 ### Added
 
 - **Pods**: services sharing one network, like a docker-compose project.
-  `provider.start_pod(PodSpec(...))` returns a pod; `pod.start_service(
-  ServiceSpec(...), wait="started" | "healthy")` starts each service, with
-  compose healthchecks (`HealthCheck`), `health()`, `logs()`, upstream relays
-  to host Unix sockets (`pod.routes`), `set_network("none" | "egress")` and
-  `stop()`. Both providers have the `pods` capability. See the README's Pods
-  section.
-- **`python -m hpc_sandbox fetch-tools`** downloads the pinned slirp4netns
-  pods use for egress, for hosts that have none; providers take a
-  `slirp4netns` path and a `service_stop_grace_s`.
-- **`MemoryKill.processes` and `MemoryKill.tmpfs_bytes`**: how many processes
-  the killed branch held, and how much the sandbox's own tmpfs mounts held
-  (memory no kill frees). `MemoryKill.pid` and `pss_bytes` now describe the
-  killed branch.
-- **`pull` reports local image files too**, and its stdout holds only the JSON
-  lines, whose keys are stable.
+  `provider.start_pod(PodSpec(...))` returns a pod; `pod.start_service(ServiceSpec(...),
+  wait="started" | "healthy")` starts each service, with compose healthchecks (`HealthCheck`),
+  `health()`, `logs()`, upstream relays to host Unix sockets (`pod.routes`),
+  `set_network("none" | "egress")` and `stop()`. Both providers have the `pods` capability; see
+  [docs/pods.md](docs/pods.md).
+- **`hpc-sandbox fetch-tools`** downloads the pinned slirp4netns that pods use for egress, for
+  hosts that have none; providers take a `slirp4netns` path and a `service_stop_grace_s`. See
+  [`fetch-tools`](docs/cli.md#fetch-tools).
+- **A fuse-overlay layout for Singularity sandboxes**: `rootfs_layout="fuse-overlay"` (or
+  `HPC_SANDBOX_ROOTFS_LAYOUT` for a whole job) mounts each sandbox's root filesystem as a
+  `fuse-overlayfs` of the node's template of the image and a per-session upper layer, run by an
+  unprivileged instance. Starts and stops no longer depend on the image's size, and a snapshot holds
+  only what the sandbox wrote. It needs `fuse-overlayfs`, `fusermount3` (or `fusermount`),
+  `/dev/fuse` and unprivileged user namespaces. GPUs, cgroup limits and `--fakeroot` need the copy
+  layout: with an explicit `rootfs_layout="fuse-overlay"` they raise `ValueError`, and
+  `HPC_SANDBOX_ROOTFS_LAYOUT` leaves such a provider on the copy layout. Pod services always get the
+  copy layout. Janitors unmount the overlays of abandoned sessions, and the dead overlays that
+  killed `fuse-overlayfs` processes left anywhere on the node; see
+  [The fuse-overlay layout](docs/singularity.md#the-fuse-overlay-layout).
+- **Templates** (`rootfs_templates`): each image extracted once per node, the fuse-overlay layout's
+  lower layer; with the copy layout, sandboxes copy it. A template that lost its marker is
+  extracted again, and extractions cut short are deleted by janitors. `EnrootProvider` accepts
+  `rootfs_templates` and `rootfs_layout="copy"` too. See [Templates](docs/singularity.md#templates).
+- **`provider.wait_for_deletions()`** on both providers, which waits for the background deletions
+  of the sessions that the process stopped; see
+  [Stopping and deleting](docs/python-api.md#stopping-and-deleting).
+- **`MemoryKill.pids`, `MemoryKill.processes` and `MemoryKill.tmpfs_bytes`** (in
+  `sandbox.memory_kills`): the processes of the killed branch, how many they were, and how much the
+  sandbox's own tmpfs mounts held (memory no kill frees); see
+  [Memory limits](docs/python-api.md#memory-limits).
+- **`hpc-sandbox --version`**, `hpc_sandbox.__version__` and a `py.typed` marker; see
+  [Public API and versioning](docs/python-api.md#public-api-and-versioning).
+- **Documentation**: the README is a landing page, and [`docs/`](docs/README.md) holds the guides
+  and the reference; `CONTRIBUTING.md` and `SECURITY.md` are new. The JSON keys of `pull` and
+  `janitor` are documented as stable ([Command line](docs/cli.md)).
 
 ### Fixed
 
-- **Cancelling a command while it starts no longer hangs.** On Python 3.11,
-  asyncio waits forever when the creation of a subprocess is cancelled while
-  what it started keeps its output open (as commands behind `nsenter` do);
-  cancelled `exec` calls and teardowns could hang that way.
-- **A janitor sweep no longer stalls a process starting or stopping many
-  sandboxes.** Session directories were created and removed in worker threads
-  that waited for the janitor's lock, while the sweep holding it needed a
-  worker thread too.
-- **A start cancelled while its session directory is created leaves nothing**:
-  the directory and its lease were kept until the process exited.
+- **Cancelling a command while it starts no longer hangs.** On Python 3.11, asyncio waits forever
+  when the creation of a subprocess is cancelled while what it started keeps its output open (as
+  commands behind `nsenter` do); cancelled `exec` calls and teardowns could hang that way. See
+  [Running commands](docs/python-api.md#running-commands).
+- **A janitor sweep no longer stalls a process starting or stopping many sandboxes.** Session
+  directories were created and removed in worker threads that waited for the janitor's lock, while
+  the sweep holding it needed a worker thread too. See [Sessions](docs/architecture.md#sessions).
+- **A start cancelled while its session directory is created leaves nothing**: the directory and
+  its lease were kept until the process exited. See [Providers](docs/python-api.md#providers).
+- **The memory watchdog measures processes on kernels before 4.14**, which have no `smaps_rollup`:
+  it reads `smaps` there. 0.2.0 measured every process as zero on them, and never killed. See
+  [What it measures](docs/architecture.md#what-it-measures).
+- **An `HPC_SANDBOX_RUNTIME` other than `auto`, `singularity` or `enroot` is an error**: `doctor`,
+  `run`, `pull` and `janitor` exit with status 2 unless `--runtime` is given. 0.2.0 took such a
+  value for Singularity, so that a typo made `hpc-sandbox janitor` skip enroot's sessions. See
+  [Environment variables](docs/configuration.md#environment-variables).
+- **`hpc-sandbox doctor` creates the scratch root as a start does**, with mode 0700, and reports a
+  scratch root or image cache that it cannot create or write as a `[FAIL]` line. With enroot, 0.2.0
+  could leave a scratch root it created readable by other users, and ended with a traceback where
+  it could not write. `allow setuid = no` is now shown as `info`: sandboxes run in user-namespace
+  mode too. See [`doctor`](docs/cli.md#doctor).
+
+### Upgrading
+
+- **Stops return before their sessions are deleted.** Code that removes a scratch root, or ends its
+  process or Slurm step, right after stopping sandboxes should first
+  `await provider.wait_for_deletions()`; otherwise the removal races the deletions, and what the end
+  of a step kills is left for a janitor. See
+  [Stopping and deleting](docs/python-api.md#stopping-and-deleting).
+- **Run `hpc-sandbox janitor` from the batch script, not from an epilogue.** Epilogues, which the
+  README of 0.2.0 suggested, usually run as root, whose janitor sweeps root's sessions, not yours;
+  see [Getting started](docs/getting-started.md#run-the-janitor-at-the-end-of-the-script).
+- **`hpc_sandbox.sessions.remove_session` is gone**: it blocked a worker thread on the janitor lock.
+  Stopping a sandbox deletes its session; see
+  [Stopping and deleting](docs/python-api.md#stopping-and-deleting).
+- **`MemoryKill.pid` and `MemoryKill.pss_bytes` describe the killed branch**: its root and what the
+  whole branch held, where 0.2.0 recorded the single process it killed. See
+  [Memory limits](docs/python-api.md#memory-limits).
+- **A relative `scratch_root` is made absolute.** Sessions and snapshots that 0.2.0 recorded under a
+  relative scratch root are not recognised as bound to it: stop such sandboxes with 0.2.0, or
+  delete their files by hand. See
+  [Options of both providers](docs/configuration.md#options-of-both-providers).
+- **The `test` extra is gone**: development tools are in the `dev` dependency group
+  (`uv sync --group dev`; see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## 0.2.0
 
@@ -141,13 +225,12 @@ Changes since 0.1.0.
 - **Image caches written by 0.1.0 are reused without pulling.** An image
   stored as `uri-<hash>.<ext>` or `oci-<digest>.<ext>` is linked (or copied)
   under its digest name the first time 0.2.0 resolves it.
-- **Older versions sharing a cache with 0.2.0 keep working.** 0.2.0 never
-  removes or rewrites their `uri-…`/`oci-…` image files or their `.json`
-  records, and keeps its own pointers in differently named files. An older
-  version keeps using the images it pulled, and pulls a reference itself
-  when only 0.2.0 has pulled it; for a tag that has moved, the two versions
-  can then run different images. Pin images by digest while versions are
-  mixed.
+- **0.1.0 keeps working on a cache it shares with 0.2.0.** 0.2.0 never
+  removes or rewrites 0.1.0's `uri-…`/`oci-…` image files or their `.json`
+  records, and keeps its own pointers in differently named files. 0.1.0
+  keeps using the images it pulled, and pulls a reference itself when only
+  0.2.0 has pulled it; for a tag that has moved, the two versions can then
+  run different images. Pin images by digest while versions are mixed.
 - **Earlier image files are never deleted automatically**: remove
   `sha256-*` files no pointer names once no job uses them. With enroot every
   refresh adds one, since squashfs images are not byte-reproducible.

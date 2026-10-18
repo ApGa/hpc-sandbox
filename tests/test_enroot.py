@@ -14,9 +14,8 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import make_enroot_provider
-from test_safefs import make_deep_tree
 
+from conftest import make_enroot_provider
 from hpc_sandbox import (
     CWD_ERROR_EXIT_CODE,
     CWD_ERROR_PREFIX,
@@ -37,6 +36,7 @@ from hpc_sandbox.enroot import AUFS2OVLFS_WRAPPER, KEEPALIVE, import_uri
 from hpc_sandbox.process import run_process
 from hpc_sandbox.procfs import cmdline, namespace_pid, owned_live_start_time
 from hpc_sandbox.sessions import Session, open_session
+from test_safefs import make_deep_tree
 
 PYTHON = "/usr/bin/python3"
 SRC = str(Path(__file__).resolve().parents[1] / "src")
@@ -109,7 +109,8 @@ async def test_exec_runs_as_root_with_verbatim_env_cwd_and_stdin(
     value = "two words; $(echo injected) 'quoted' \"double\""
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), env={"GREETING": value}))
     result = await sandbox.exec(
-        'id -u; printf "%s\\n" "$GREETING"; cat hello.txt; pwd; echo "$HOME"; echo "${HOST_ONLY-unset}"'
+        'id -u; printf "%s\\n" "$GREETING"; cat hello.txt; pwd; echo "$HOME"; '
+        'echo "${HOST_ONLY-unset}"'
     )
     assert result.exit_code == 0, result.stderr
     assert result.stdout.splitlines() == ["0", value, "hello", "/app", "/root", "unset"]
@@ -1057,7 +1058,7 @@ async def test_restores_of_snapshots_from_earlier_versions_get_the_hosts_time_zo
     sandbox = await enroot_provider.start(spec)
     assert (await sandbox.exec("echo old > /etc/localtime")).exit_code == 0
     snapshot = await sandbox.snapshot()
-    Path(snapshot.path, "environment.json").unlink()  # as earlier versions wrote them
+    Path(snapshot.path, "environment.json").unlink()  # as hpc-sandbox 0.1.0 wrote them
     restored = await enroot_provider.restore(snapshot, spec)
     localtime = restored.session_dir / "rootfs" / "etc" / "localtime"
     assert localtime.read_bytes() == host.read_bytes()
@@ -1207,7 +1208,8 @@ async def test_downloads_keep_only_symlinks_inside_what_they_copy(
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh)))
     made = await sandbox.exec(
         "mkdir -p out && echo data > out/f && chmod 4755 out/f && ln -s f out/inside"
-        " && ln -s /etc/passwd out/absolute && ln -s ../../x out/escape && ln -s /app/out/f out/abs-in"
+        " && ln -s /etc/passwd out/absolute && ln -s ../../x out/escape"
+        " && ln -s /app/out/f out/abs-in"
     )
     assert made.exit_code == 0, made.stderr
     with caplog.at_level("WARNING"):
@@ -1290,7 +1292,7 @@ async def test_memory_watchdog_explains_a_command_killed_with_its_children(enroo
     from test_integration import POOL_AS_THE_COMMAND
 
     sandbox = await enroot_provider.start(SandboxSpec(image=str(sqsh), memory_mb=100))
-    for _ in range(3):  # the note used to come too late now and then
+    for _ in range(3):  # a note that comes too late shows only now and then
         result = await sandbox.exec(POOL_AS_THE_COMMAND, timeout_s=60)
         assert result.exit_code == 137, (result.stdout, result.stderr)
         assert "memory limit exceeded" in result.stderr and "descendant" in result.stderr

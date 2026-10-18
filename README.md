@@ -1,659 +1,173 @@
-# hpc-sandbox
+<img src="assets/hpc_sandbox_icon.png" alt="hpc-sandbox" width="320">
 
-Rootless sandboxes for HPC clusters, built on the container runtime the site
-already provides: Singularity CE / Apptainer instances or enroot containers.
-A sandbox is a persistent container with its own writable root filesystem on
-node-local disk; you run commands in it, copy files in and out, snapshot it
-and restore copies of it.
+Rootless sandboxes for HPC clusters, on Singularity/Apptainer or enroot.
 
-It is meant for workloads that run many short-lived tasks inside a batch
-job — agent rollouts, code evaluation, benchmark harnesses — on clusters where
-Docker is not available and users have no root. It needs no daemon and no
-privileges beyond what the site's runtime grants, and it cleans up after
-itself even when the process that started the sandboxes is killed.
-Python 3.11+, standard library only.
+hpc-sandbox runs disposable, isolated environments from container images on compute nodes that have
+no Docker and give you no root, with the container runtime the site already provides: Singularity CE
+or Apptainer instances, or enroot containers. A sandbox has its own writable root filesystem on
+node-local disk; you run commands in it, copy files in and out, snapshot it and restore copies of
+it. It is built for batch jobs that run many short tasks at once, such as agent rollouts, code
+evaluation and benchmark harnesses, and it is a Python library with a command-line interface.
 
-## Quick start
+What it gives you:
+
+- **One API for two runtimes.** `SingularityProvider` and `EnrootProvider` start sandboxes from the
+  same `SandboxSpec`, and every sandbox has the same `exec`, `upload`, `download`, `snapshot` and
+  `stop`.
+- **No daemon and no root.** Sandboxes run as your user, or as root mapped to it, with no privileges
+  beyond what the site's runtime grants. The library needs nothing outside Python's standard
+  library.
+- **Commands you can rely on.** Every command has a timeout, output is bounded, exit codes keep
+  their meaning, and failures of the infrastructure raise exceptions instead of passing for failed
+  commands.
+- **Memory limits without cgroups.** A sampling watchdog kills the branch of processes that holds
+  the memory, so a command that runs away dies and the harness that started it survives.
+- **Pods.** Services that share one network, like a docker-compose project: a sandbox reaches the
+  databases, tool servers or graders it works with by name.
+- **Clean nodes.** Teardown proves each process's identity before signalling it, and janitors
+  recover what a crashed process or job left behind, from running containers to files and mounts.
+- **Built for busy nodes.** Images are cached and staged once per node, sessions are deleted in the
+  background, and an optional overlay layout makes a Singularity sandbox's start and stop cost the
+  same whatever the size of its image.
+
+Sandboxes keep their commands apart from other sandboxes and from the host's files and environment,
+but they are not a security boundary: they run as your user, share the host's kernel and, unless you
+choose otherwise, its network. [Security model](docs/security.md) explains what the isolation
+covers.
+
+## Requirements
+
+hpc-sandbox runs on Linux with Python 3.11 or later, on compute nodes that have one of these
+runtimes:
+
+| Runtime | What it needs |
+|---|---|
+| Singularity CE or Apptainer | the runtime, in setuid or user-namespace mode |
+| enroot 3.x | unprivileged user namespaces, util-linux `nsenter`, and enroot's `+caps` package to import images |
+
+Pods need unprivileged user namespaces and util-linux `nsenter` with either runtime.
+[Getting started](docs/getting-started.md#requirements) lists every tool and what needs it.
+
+## Install
 
 ```bash
-pip install -e .              # or: uv pip install -e .
-python -m hpc_sandbox doctor  # is this node usable?
-python -m hpc_sandbox run docker://alpine:3.20 -- sh -c 'id; uname -a'
+pip install hpc-sandbox
 ```
+
+This installs the `hpc_sandbox` package and the `hpc-sandbox` command (`python -m hpc_sandbox` runs
+the same). Below 1.0, a minor release may change the API, so pin one (`hpc-sandbox>=0.3,<0.4`);
+[CHANGELOG.md](CHANGELOG.md) has the release notes.
+
+## Quickstart
+
+Run these on a compute node, inside a batch job: hpc-sandbox starts containers, which login nodes
+are not for. Check what the node supports, then run a command in a fresh sandbox:
+
+```bash
+hpc-sandbox doctor --image docker://python:3.12-slim    # the runtime, scratch and a test sandbox
+hpc-sandbox run docker://python:3.12-slim -- python -c 'print(6 * 7)'
+```
+
+From Python:
 
 ```python
-from hpc_sandbox import EnrootProvider, Mount, SandboxSpec, SingularityProvider
+import asyncio
+from pathlib import Path
 
-provider = EnrootProvider()  # or SingularityProvider(); defaults suit a PBS or Slurm job
-spec = SandboxSpec(
-    image="docker://python:3.12-slim",          # or a local .sqsh / .sif path
-    workdir="/app",
-    env={"PYTHONUNBUFFERED": "1"},
-    mounts=[Mount("/shared/data", "/data")],    # read-only by default
-    memory_mb=4096,                             # PSS watchdog
-    labels={"run": "exp1", "rollout_id": "r42"},
-)
-async with await provider.start(spec) as sandbox:  # stopped when the block exits
-    result = await sandbox.exec("python -c 'print(6 * 7)'", timeout_s=60)
-    print(result.exit_code, result.stdout, result.stderr, result.timed_out)
-    await sandbox.upload("solution.py", "/app/solution.py")
-    await sandbox.download("/app/out", "./out")  # files and directories
-    snapshot = await sandbox.snapshot()           # files, not processes
-    clone = await provider.restore(snapshot, spec)
-    await clone.stop()                            # idempotent
-    await provider.delete_snapshot(snapshot)
+from hpc_sandbox import SandboxSpec, SingularityProvider
 
-await provider.reap({"rollout_id": "r42"})        # stop leftovers by label
+
+async def main() -> None:
+    provider = SingularityProvider()  # or EnrootProvider(): the same API on enroot
+    spec = SandboxSpec(image="docker://python:3.12-slim", memory_mb=4096)
+    Path("hello.py").write_text("print('hello from a sandbox')\n")
+    async with await provider.start(spec) as sandbox:  # stopped when the block exits
+        await sandbox.upload("hello.py", "/app/hello.py")
+        result = await sandbox.exec("python /app/hello.py", timeout_s=60)
+        print(result.exit_code, result.stdout)
+    await provider.wait_for_deletions()  # its files are deleted in the background
+
+
+asyncio.run(main())
 ```
 
-`exec` takes a shell string (run with `/bin/sh -c`) or an argv list, plus
-per-call `timeout_s`, `env`, `cwd` and `stdin` bytes. Every call has a timeout
-(`default_timeout_s`, 600 s, when none is given); on expiry the command's
-process tree is killed and the result has `timed_out=True` and exit code 124.
-Infrastructure failures raise `SandboxError` (`SandboxStartError` when a
-sandbox cannot start, `SandboxLostError` when its container died) instead of
-masquerading as command failures; a runtime that cannot enter the container
-and a command that never started are such failures. A working directory that
-is missing or cannot be entered is the sandbox's state, not a failure of the
-infrastructure: the command returns exit code 126 (`CWD_ERROR_EXIT_CODE`),
-empty stdout and, on stderr, only `CWD_ERROR_PREFIX + "<dir>: <reason>"`, with
-the reason one of `CWD_ERROR_REASONS`. `download` raises `FileNotFoundError`
-for a missing source and returns a `DownloadReport` of the symlinks it left
-out (see Transfers). These are stable parts of the interface.
+[The Python API](docs/python-api.md) covers commands, transfers, snapshots, labels and janitors,
+memory limits and errors; [pods](docs/pods.md) start services next to a sandbox.
 
-Both providers satisfy the `SandboxProvider` and `Sandbox` protocols in
-`hpc_sandbox.types`, so code written against the protocols does not depend on
-the runtime underneath.
+## Choosing a runtime
 
 | | `SingularityProvider` | `EnrootProvider` |
 |---|---|---|
-| Runtime | Singularity CE / Apptainer, setuid or user-namespace mode | enroot 3.x, unprivileged |
-| Images | SIF (pulled with `singularity pull`) | squashfs (imported with `enroot import`) |
-| Inside the sandbox | your uid | root mapped to your uid (or your uid) |
-| Per-command overhead | one `singularity exec` | about 2 ms (`nsenter`) |
-| `network="none"` | where the site allows network namespaces | always, unless `allow_network_none=False` |
-| After the owner process dies | instances keep running until a janitor stops them | everything is killed at once; a janitor removes the files |
+| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x, unprivileged |
+| Images | SIF (`singularity pull`) | squashfs (`enroot import`) |
+| Inside the sandbox | your user | root mapped to your user (or your user) |
+| Per command | one `singularity exec`, which starts the runtime | `nsenter` into the running container |
+| `network="none"` | with `allow_network_none=True`, where the site lets users create network namespaces | always, unless `allow_network_none=False` |
+| When the owning process dies | instances run until a janitor stops them | everything dies with it; a janitor removes the files |
 
-## Command line
+[Singularity CE and Apptainer](docs/singularity.md) and [enroot](docs/enroot.md) describe each
+provider and what to check on a new cluster.
+
+## Commands
 
 | Command | What it does |
 |---|---|
-| `python -m hpc_sandbox doctor [--image IMAGE]` | Reports the runtime and version, the scratch and cache filesystems, free space, staging and reflink support, and what matters for the runtime: for Singularity/Apptainer the site settings (`allow setuid`, `allow user ns`, `sessiondir max size`, loop devices); for enroot whether namespaces can be created, whether imports can convert layer whiteouts, whether this process runs inside a container, and the site's `enroot.conf` and hooks. With `--image`, starts a sandbox and exercises exec and transfers. Exits non-zero on failure. |
-| `python -m hpc_sandbox run IMAGE [--env K=V] [--bind SRC:DST[:ro\|rw]] [--label K=V] [--network host\|none] [--memory-mb N] [--timeout S] -- CMD...` | Runs one command in a fresh sandbox, prints its output and exits with its status. |
-| `python -m hpc_sandbox pull [--refresh] IMAGE...` | Pulls images into the image cache unless cached, and checks local image files, printing on stdout only one JSON line per image, with the stable keys `reference`, `path`, `sha256` (of the image file) and `manifest_digest` (from a digest-pinned remote reference, else null); logs go to stderr. `--refresh` pulls tags again; sandboxes started afterwards get the new image, and starts never wait for a refresh. |
-| `python -m hpc_sandbox fetch-tools [--arch ARCH]` | Downloads the pinned static slirp4netns that pods use for egress when the host has none (`$HPC_SANDBOX_TOOLS`, else `hpc-sandbox/tools` in `$XDG_CACHE_HOME` or `~/.cache`), checks its SHA-256 and prints its path as a JSON line. Run it once where there is internet access; compute nodes need none. |
-| `python -m hpc_sandbox janitor [--label K=V]...` | Stops and removes sandboxes and pods abandoned by dead processes on this node (optionally only those with the labels) and prints a JSON report. Unless a runtime is chosen (`--runtime`, `$HPC_SANDBOX_RUNTIME` or `--binary`), it sweeps Singularity sessions when Singularity or Apptainer is installed and enroot sessions always (sweeping them needs no enroot binary). Use it in job epilogues. |
+| `hpc-sandbox doctor [--image IMAGE]` | reports what the node supports for the runtime; with an image, starts a sandbox and exercises it |
+| `hpc-sandbox run [OPTIONS] IMAGE -- CMD [ARG...]` | runs one command in a fresh sandbox and exits with its status |
+| `hpc-sandbox pull [--refresh] IMAGE [IMAGE...]` | pulls images into the cache and prints one JSON line per image |
+| `hpc-sandbox janitor [--label KEY=VALUE]...` | stops and removes what dead processes left on this node and prints a JSON report |
+| `hpc-sandbox fetch-tools [--arch ARCH]` | downloads the pinned slirp4netns that pods use for egress where the host has none |
 
-All commands but `fetch-tools` take `--runtime auto|singularity|enroot`
-(default `$HPC_SANDBOX_RUNTIME`, else the first of `singularity`, `apptainer`
-and `enroot` found on `PATH`), `--binary`, `--scratch-root` and
-`--image-cache`.
+Run `hpc-sandbox janitor` at the end of batch scripts that use hpc-sandbox.
+[docs/cli.md](docs/cli.md) has every option, the JSON outputs and the exit codes.
 
-## How a sandbox is built
+## Documentation
 
-What both providers share:
+- [docs/README.md](docs/README.md): the table of contents.
+- [Getting started](docs/getting-started.md): requirements, install, the first sandbox, Slurm and
+  PBS batch scripts, and what to do when something fails.
+- [Python API](docs/python-api.md), [command line](docs/cli.md) and
+  [configuration](docs/configuration.md): the reference.
+- [Pods](docs/pods.md): services that share one network.
+- [Singularity CE and Apptainer](docs/singularity.md) and [enroot](docs/enroot.md): each provider,
+  its layouts and site notes.
+- [Architecture](docs/architecture.md): how a sandbox is built, watched and torn down.
+- [Security](docs/security.md): what the isolation covers, and what it does not.
 
-1. **Image.** A reference the provider can never run (a SIF image for enroot,
-   a squashfs image for Singularity, a scheme the runtime cannot pull) raises
-   `ValueError` before anything is created. A remote reference is pulled once
-   into the image cache under a file lock, validated and published read-only.
-   Image files are cached under their own SHA-256 and never change; a
-   reference resolves through a small pointer file. A tag that moves keeps the
-   image it named when first pulled until it is refreshed with
-   `python -m hpc_sandbox pull --refresh IMAGE` (or
-   `await provider.images.pull(image, refresh=True)`), run once before the
-   sandboxes that should get the new image; running sandboxes keep theirs,
-   and earlier image files stay in the cache until deleted (enroot's squashfs
-   images are not byte-reproducible, so every refresh adds one). Pin images by
-   digest (`docker://repo@sha256:<hex>`, with either runtime) or by file
-   content for runs that must not change. A local image path may carry an
-   `@sha256:<hex>` suffix to pin the file's content. Inside a batch job whose
-   image cache is on another filesystem (for example Lustre or NFS), the image
-   is staged to node-local scratch as `sha256-<digest>.<ext>`, verified while
-   copying.
-2. **Session.** A private directory `sessions/hpcsb-<uuid>` (mode 0700) on
-   node-local scratch (`sessions-enroot/hpcsb-<uuid>` for enroot), leased
-   with `flock` and holding an owner record: the provider, owner PID and
-   start time, the container's process identities, who commands run as
-   (`remap_root`, `container_uid`), hostname and labels. The writable root
-   filesystem is a directory in it owned by the calling uid, extracted from
-   the image or copied from a template (or, with Singularity's fuse-overlay
-   layout, a FUSE overlay over a template): no loop devices or size-capped
-   tmpfs.
-3. **Commands.** The host environment never reaches the sandbox. The
-   container's own environment (the image's `ENV`), `HOME=/root`,
-   `SandboxSpec.env` and per-call `env` are sent, POSIX-quoted, as one line
-   ahead of the command's stdin, which a short `sh` prologue inside the
-   container reads and evaluates before the command gets the rest (or
-   `/dev/null` when there is no `stdin`). Values pass verbatim, appear neither
-   on command lines (which every user of a node can read) nor in the host-side
-   processes that enter the container, and need nothing from the sandbox's
-   filesystem. Names the image's `/bin/sh` reserves cannot be set: with bash,
-   `UID`, `EUID`, `PPID`, `BASHPID`, `GROUPS`, `FUNCNAME` and the like; with
-   dash, an `OPTIND` that is not a number. The prologue then enters the
-   working directory and announces the start on stderr (the announcement is
-   removed from the result). A working directory that is missing or cannot be
-   entered fails the command with exit status 126 and a message on stderr, as
-   with `docker exec`, without falling back to another directory: it is the
-   sandbox's state, not an infrastructure failure. A command that never
-   started for other reasons — a runtime that could not enter the container —
-   raises `SandboxError` instead of returning an exit status.
-   Output is bounded (head and tail of each stream, 16 MiB); a command that
-   leaves a background process holding stdout still returns. Startup probes
-   that the rootfs and `workdir` are writable.
-4. **Transfers.** Through a fresh directory in the session's private `/tmp`,
-   so they work for binary files of any size and see the container's view of
-   paths (including its mounts). Code in the sandbox can change that directory
-   at any time, so the host side works in it only through file descriptors,
-   never follows a symlink it finds there and never blocks on a FIFO.
-   Transfers run from `/`, so they work once the workdir is gone; relative
-   paths still resolve from it, as does a relative `cwd` for `exec`. Downloads
-   keep timestamps and modes, but not owners (inside a user namespace, files
-   on host mounts belong to owners the namespace does not map) and not what
-   the sandbox must not hand you: setuid, setgid and sticky bits are dropped,
-   your umask applies, and the copy is always readable by you. A symlink given
-   as the source is followed, as `cp -H` does. Symlinks inside are copied only
-   if they stay inside the downloaded tree on their own: relative, climbing
-   with leading `..` no higher than the tree, and never after a name (`a/..`
-   leads wherever `a` does, which a later download into the same directory
-   could change). Others, absolute ones included, are left out, logged, and
-   returned in the `DownloadReport` with each link's path, text and reason.
-   Kept links can still reach what the destination already held, so download
-   into a new or empty directory to keep the sandbox's links away from your
-   own files; special files and directories nested more than 256 levels deep
-   raise `SandboxError`. Uploads refuse special files on the host with
-   `SpecialFileError`, except a character device given as the source itself
-   (`/dev/null` gives an empty file). The destination is yours: a symlink
-   there is followed, a directory receives a directory's contents, and only a
-   file replaces an existing file.
-5. **Memory.** With `memory_mb`, a watchdog samples the proportional set size
-   of the container's processes and of every running command once a second. On
-   a breach it kills one branch of processes, never the sandbox's own. It
-   starts from the heaviest of the running commands and the processes left
-   running in the background, and descends into the child branch that holds the
-   most while that child alone holds the excess over the limit. So the command
-   that ran away dies and a harness survives a tool command it started,
-   whatever their sizes; when the memory is spread over several children, their
-   parent's branch dies whole. What a branch holds is what killing it frees: a
-   fork copy of its parent (a `multiprocessing` fork worker) counts its private
-   memory only, since the pages it still shares with its parent stay, so a pool
-   owner that grows dies with its workers. As with the kernel's OOM killer, a
-   pool's worker that holds the excess alone dies alone: a harness that runs
-   code in children it joins (`multiprocessing.Process`, with a `Manager` or
-   several at once, as code-eval graders do) learns that one was killed, and so
-   do a `ProcessPoolExecutor` and joblib, but a `multiprocessing.Pool`, which
-   never notices a lost worker, waits for its task until the command times out.
-   The process tree cannot tell a pool from such a harness. It may also kill a
-   larger idle process before a smaller one that is growing. A process with a
-   higher `oom_score_adj` than its parent (`choom -n 1000 -- cmd`) goes first
-   when what it holds, plus a thousandth of the limit per point, outweighs the
-   heaviest of the running commands and background processes, or its parent on
-   the way down; as the kernel scores each process alone, marks never add up (a
-   browser's renderers mark themselves), and a value every process inherited
-   changes nothing. The branch dies whole, with what it forks meanwhile (but
-   for a process its root moves into a new session in the instant before the
-   kill, which stays watched); its root is killed, never stopped, so its parent
-   sees a kill. A command the watchdog killed returns 137; one whose
-   descendants it killed keeps its own exit status (or times out). Either way
-   the explanation is appended to stderr and recorded in
-   `Sandbox.memory_kills`, with the processes the branch held (`pids`) and how
-   much the sandbox's own tmpfs mounts (`/dev/shm`, `/run`...) hold, which no
-   kill frees. This is a sampled guard, not a cgroup: usage can overshoot
-   between samples.
-6. **Snapshots** copy the rootfs and the private tmp directories with
-   `cp -a --reflink=auto` (near free on reflink filesystems), after a `sync`.
-   Processes and memory are not captured; take snapshots while the sandbox is
-   quiescent. Snapshots live on the node that took them; their metadata
-   records `remap_root` and `container_uid` like the owner record. A snapshot
-   of a fuse-overlay sandbox (see Singularity) holds only what the sandbox
-   wrote, its upper layer, and names the template it lies over; it restores
-   over that template, with the fuse-overlay layout.
-7. **Teardown and janitors.** `stop()` kills running commands, stops the
-   container, re-proving process identities before signalling anything, and
-   moves the session into the session root's `.trash` under the janitor lock. A
-   detached `rm` deletes it once the stop returned: one deletion at a time per
-   session root, at the lowest CPU priority, holding an flock on its trash
-   entry (while 16 of a process's deletions are pending, its stops delete their
-   sessions themselves). `await provider.wait_for_deletions()` waits for the
-   deletions the process started; call it before a process or a Slurm step
-   ends, which kills them (`hpc-sandbox run` and `doctor` do), and before
-   removing a scratch root yourself, whose files they still delete. On a
-   scratch too full even to move a session, the stop deletes it in place.
-   Teardown is shielded from cancellation, and a stop that failed is retried by
-   the next. A janitor considers only `hpcsb-<uuid>` sessions under its root
-   whose lease is free and whose owner process is dead, optionally filtered by
-   labels, and leaves sessions that belong to another provider; it fails closed
-   (reports and leaves the session) whenever identities disagree, and never
-   deletes through a mount point. It takes over the trash entries no deletion
-   holds once the process that moved them died (a minute later if it lives).
-   Each provider sweeps abandoned sessions at its first start that finds the
-   janitor lock free: a start never waits to sweep (janitors and `reap()` do),
-   though creating and removing sessions take that lock briefly, so they wait
-   while a sweep stops abandoned sandboxes, or while a session that a full
-   scratch left no room to move is deleted in place.
+## Contributing and development
 
-### Singularity CE / Apptainer
-
-- **Images.** `docker://repo:tag`, `docker://repo@sha256:...`, `oras://`,
-  `library://` or a bare `repo:tag`, pulled as SIF and validated with
-  `sif list`; cached as `<cache>/sha256-<hex>.sif`, named by the pointer
-  `uri-<hash>.sif.json`, or `oci-<digest>.sif.json` for a digest-pinned
-  reference (pin images by digest for reproducible runs).
-- **Root filesystem.** `build --sandbox --fix-perms` into the session. Bind
-  targets are created inside it (refusing symlinks that would lead out of it)
-  and a keep-alive `%startscript` is written into it: OCI-derived images ship
-  an empty one, and an instance whose startscript exits is removed at once.
-  With `rootfs_templates=True` each image is extracted once per node, into
-  `templates/` on scratch, and each sandbox gets a copy of it
-  (`cp -a --reflink=auto`); a copy creates as many inodes as an extraction,
-  and on XFS 64-128 copies at once took longer than as many extractions.
-- **fuse-overlay layout.** With `rootfs_layout="fuse-overlay"` (or
-  `HPC_SANDBOX_ROOTFS_LAYOUT=fuse-overlay` for a whole job) the rootfs is a
-  `fuse-overlayfs` mount made by your uid: the node's template of the image is
-  the read-only lower layer, and the session's `overlay/upper` holds what the
-  sandbox writes, with Docker's semantics (whiteouts, opaque and renamed
-  directories). The instance runs it unprivileged (`--userns --writable`), so
-  a start and a stop cost the same whatever the image's size (64 sandboxes of
-  an 870 MB image started in 0.6 s and stopped in 2 s on ABCI), and deleting a
-  session deletes only what its sandbox wrote. File operations go through
-  FUSE: metadata-heavy ones (`find`, many small files) are slower than on a
-  copy; Python imports are not. GPUs, `cgroup_limits` and `--fakeroot` need
-  the copy layout, and pod services always get one. A stop unmounts the
-  overlay once the instance is gone; janitors unmount those of abandoned
-  sessions, and those a killed job left dead on the node wherever they lie.
-- **Instance.** `instance start --cleanenv --containall --no-home --no-eval
-  --no-mount home,cwd,bind-paths --writable --pid-file ...` with
-  session-private `/tmp` and `/var/tmp` binds, `/etc/resolv.conf` read-only
-  (host networking), the spec's mounts and an exact name `hpcsb-<uuid>`. No
-  `--fakeroot`: the sandbox runs as your uid. Startup checks that the
-  runtime's PID, the PID file and the process start time agree.
-- **Commands.** `exec --cleanenv --cwd ... instance://hpcsb-<uuid>` running
-  the prologue, which also enters the working directory itself: Singularity CE
-  silently falls back to another directory when `--cwd` is missing. The
-  runtime's own `--env` is not used: it splits on commas, and `--env-file` is
-  shell-evaluated.
-- **Teardown.** `instance stop --timeout` on the exact instance, then a
-  direct signal if it survived. Nothing uses wildcards or
-  `instance stop --all`.
-
-### enroot
-
-Enroot has no daemon and no running instances: `enroot start` runs one
-command and the container ends with it. A sandbox is therefore one
-long-lived `enroot start` whose command is a keep-alive loop.
-
-- **Images.** `docker://repo:tag` (Docker's `registry/path` or enroot's
-  `registry#path` spelling), a bare `repo:tag`, `dockerd://` and `podman://`,
-  imported with `enroot import` into `<cache>/sha256-<hex>.sqsh`, named by the
-  pointer `uri-<hash>.sqsh.json` (or `oci-<digest>.sqsh.json`). Imports get
-  the variables pulling needs and no others: `PATH`, home and locale, XDG
-  directories, proxies, CA bundles, `SOURCE_DATE_EPOCH`, `ENROOT_*`, the
-  Docker and Podman variables (`DOCKER_*`, `CONTAINER_HOST`, `CONTAINERS_*`,
-  `REGISTRY_AUTH_FILE`), every variable the registry credentials file names
-  (enroot evaluates `$NGC_API_KEY` or `$(command)` password fields), and the
-  names or `PREFIX*` patterns in `import_env` (for example `AWS_*` when a
-  password field runs the AWS CLI). Imports run with
-  `TAR_OPTIONS=--delay-directory-restore` and use a wrapper around
-  `enroot-aufs2ovlfs` that resolves whiteouts enroot 3.5 aborts on, so images
-  that revisit read-only directories or shadow their own entries import.
-- **Digest pins.** `docker://repo[:tag]@sha256:<hex>` references work:
-  enroot 3.x reads `@` as a user name, so the provider imports them as
-  `repo:sha256:<hex>`, which enroot passes to the registry where a tag would
-  go. A local file can be pinned by content too, checked before every use:
-
-  ```bash
-  enroot import --output /shared/images/task.sqsh docker://registry#org/task:tag
-  sha256sum /shared/images/task.sqsh   # -> <hex>
-  ```
-
-  ```python
-  SandboxSpec(image="/shared/images/task.sqsh@sha256:<hex>")
-  ```
-- **Root filesystem.** `enroot create` into the session directory.
-- **Namespaces.** A small launcher creates new user, mount, PID and IPC
-  namespaces — plus a network namespace with only an up loopback interface
-  for `network="none"` — and runs `enroot start --rw --root` in them as the
-  PID namespace's init. The container's command is the keep-alive loop, so
-  the init is that loop: tasks cannot signal it, it reaps orphans, and
-  killing it from the host kills every process in the sandbox. The launcher
-  and the init are SIGKILLed when the process that started them dies.
-- **What enroot is allowed to add.** Sites extend their enroot configuration
-  for interactive jobs — home directories, cgroups, Slurm and PMIx variables,
-  entrypoints, terminal settings — and none of that belongs in a sandbox.
-  `enroot start` therefore uses a system configuration the provider writes
-  (`ENROOT_SYSCONF_PATH`): enroot's standard system mounts (`/proc`, `/sys`
-  read-only, `/var/run`, `/var/lock`), a minimal `/dev` (a tmpfs with `null`,
-  `zero`, `full`, `random`, `urandom`, `tty`, a private `pts` and the usual
-  symlinks; never the host's), the host's `/etc/hosts`, no environment files,
-  and the standard enroot hooks sandboxes need, copied from the installation
-  when it has them enabled: `10-shadow` (passwd and group entries),
-  `10-aptfix` (apt works as remapped root) and `98-nvidia` (only acts when
-  `gpus` is set, which requires it). The installation's configuration
-  directory is found as enroot finds it, by running the configuration section
-  of the installed `enroot` script: the environment, `enroot.conf`, its
-  drop-ins and enroot's defaults combine exactly as they do for enroot. A new
-  sandbox gets the host's time zone as a regular `/etc/localtime` file,
-  replacing the image's symlink into its own zoneinfo (a restore keeps the
-  snapshot's, unless an earlier version took it). It runs with a minimal
-  environment besides: no home directory mount (`ENROOT_MOUNT_HOME=no`; an
-  empty value would fall back to the site default, which often mounts it), no
-  login shell, no user-level enroot configuration, and no batch-job variables.
-  `/tmp` and `/var/tmp` are session-private directories, `/dev/shm` a private
-  tmpfs, and `/etc/resolv.conf` the host's, read-only, with host networking
-  and `bind_resolv_conf`. The image's entrypoint and `/etc/rc.local` are
-  skipped.
-- **Commands** enter the init's namespaces and root directory with
-  `nsenter` — twice, because the PID and IPC namespaces belong to the
-  launcher's user namespace and the mounts to enroot's nested one — and run
-  as root (your uid outside) in a couple of milliseconds. The init's
-  identity is re-proved before each command.
-- **Restores** start from a rootfs that code in the sandbox wrote, and enroot
-  works on the rootfs from the host side while it starts. So a restore sets
-  the rootfs's `/etc/fstab` and `/etc/environment` aside until the container
-  runs (they would otherwise be mounted and loaded with your host
-  privileges), skips the hooks that write into the rootfs with host-side
-  shell code (their results are in the snapshot; the NVIDIA hook still runs,
-  because `nvidia-container-cli` is built to configure untrusted root
-  filesystems), refuses a rootfs whose `/etc` or `/dev` is not a directory,
-  and gives commands the environment recorded when the snapshot was taken.
-  Images are trusted the way enroot trusts them.
-- **Teardown.** SIGKILL the init after re-proving its identity; its parent,
-  the launcher, reaps it and exits. A janitor finds the processes of an
-  abandoned session already gone, kills any survivor whose start time and
-  command line still match, and removes the files.
-
-## Pods
-
-A pod runs several services that share one network, like a docker-compose
-project: an agent's container plus the databases, MCP servers or judges it
-reaches by name on fixed ports. Both providers run pods (capability `pods`).
-
-```python
-from hpc_sandbox import EnrootProvider, HealthCheck, PodSpec, SandboxSpec, ServiceSpec
-
-provider = EnrootProvider()
-pod = await provider.start_pod(PodSpec(
-    network="none",                                       # or "egress"
-    upstreams={"gateway": "unix:///path/to/gateway.sock"},  # in the pod: pod.routes["gateway"]
-    labels={"rollout_id": "r42"},
-))
-async with pod:                                           # stopped when the block exits
-    await pod.start_service(ServiceSpec(
-        "judge",
-        SandboxSpec(image="docker://ghcr.io/org/judge:1", env={"MODE": "strict"}),
-        command=["python", "-m", "judge", "--port", "8082"],
-        healthcheck=HealthCheck(["CMD-SHELL", "curl -fs localhost:8082/health"], start_period_s=60),
-    ), wait="healthy")
-    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image="docker://python:3.12-slim")))
-    result = await main.exec(["curl", "-s", "http://judge:8082/"])
-    print(await pod.health("judge"), await pod.logs("judge"))
-    await pod.set_network("egress")                       # for example for a verifier phase
-```
-
-- **Holder.** A small process owns the pod's user namespace (your uid and
-  gid mapped to root, `setgroups` denied) and its network namespace, which
-  has only an up loopback interface. It lets the pod's root bind ports below
-  1024 and send ICMP echo requests, as Docker does, and relays each upstream:
-  `127.0.0.1:<port>` in the pod (18080, 18081... in order, unless
-  `upstream_ports` says otherwise; `pod.routes` has the URLs) to the host's
-  Unix socket. The ports are bound on both loopback addresses before any
-  service starts, without `SO_REUSEPORT`, so no service can take one over;
-  half-closed connections and long streams pass through, and nothing outside
-  the pod can reach the ports.
-- **Services.** Each service is a sandbox: its `SandboxSpec` gives the image,
-  workdir, environment, mounts and `memory_mb` (its `network` is the pod's).
-  Its container joins the pod's namespaces with mount, PID, IPC and UTS
-  namespaces of its own. PID 1 is a small init that sets the hostname (the
-  service's name), `ulimits` (within the hard limits of the host process;
-  `nproc` and `locks` are accepted but not applied: `nproc` would count every
-  process of the pod, and under Docker it does not bind root either) and a
-  `/dev/shm` of `shm_mb` (64 MiB unless given, as with Docker), runs the
-  runtime as its child, passes SIGTERM, SIGINT and SIGHUP on, and exits with
-  the command's status. The runtime puts root in a nested user namespace,
-  which holds no capability over the pod's network: services can neither
-  reconfigure it nor open raw sockets to watch each other's traffic. The
-  command (`command`, or an idle loop for a service such as `main` that only
-  runs `exec`) gets the image's environment, `HOME=/root`, then the spec's
-  `env`, none of it on a command line; its working directory is created when
-  missing, its stdin is `/dev/null`, and its output goes through a pipe into a
-  log file, whose tail `logs()` returns.
-- **Names.** Each service's own `/etc/hosts` maps `localhost`, its name and
-  the names of the other services to 127.0.0.1, and gains the names of
-  services that start later; `/etc/resolv.conf` names slirp4netns's resolver,
-  `10.0.2.3`. On Debian-based images apt runs as root
-  (`APT::Sandbox::User "root"`): with one mapped id it cannot switch to
-  `_apt`.
-- **Commands** (`exec`, transfers, healthchecks) enter a service in two steps,
-  the pod's user and network namespaces and then the container's own, so they
-  too run as root of the nested user namespace, in a few milliseconds, with
-  the service's `ulimits`.
-- **Health.** `HealthCheck` reads like docker-compose's: `test` is
-  `["CMD", ...]`, `["CMD-SHELL", "..."]`, a shell string or `["NONE"]`, and
-  `interval_s`, `timeout_s`, `retries`, `start_period_s` and
-  `start_interval_s` work as there. `health(name)` is `starting`, `healthy`,
-  `unhealthy`, or `exited` once the service's command exited, whatever else
-  answers the check (`service.exit_status` holds its status); a service
-  without a healthcheck is healthy while it runs. `wait="healthy"` waits up to
-  `start_timeout_s` and stops the service and raises `SandboxStartError` if it
-  turns unhealthy or exits first.
-- **Egress.** `network="egress"` (or `set_network("egress")`) adds
-  slirp4netns with `--disable-host-loopback --enable-sandbox
-  --enable-seccomp`: services reach other hosts through the gateway
-  `10.0.2.2`, resolve names through `10.0.2.3`, and never reach the host's
-  loopback. Only the holder keeps slirp4netns's exit pipe open, so it ends with
-  the pod; `set_network("none")` removes it. slirp4netns is the one given as
-  the `slirp4netns` option, else the one on `PATH` if it has these options,
-  else the pinned static release that `python -m hpc_sandbox fetch-tools`
-  downloads once and checks against its SHA-256.
-- **Lifetime.** `pod.stop()` is idempotent and shielded from cancellation like
-  `Sandbox.stop()`: it cancels service starts in progress (those services are
-  killed at once), gives the others `service_stop_grace_s` (default 0) after
-  SIGTERM, then kills them, slirp4netns and the holder, and deletes the pod's
-  session directory, which holds the services' sessions. Failed and cancelled
-  starts leave nothing.
-  Once the holder is gone, calls raise `SandboxLostError`. When the owning
-  process dies, everything of its pods dies with it; `reap(labels)` stops
-  matching live pods, and the janitor removes the files.
-
-On enroot a pod starts in about 0.1 s and a service in about 0.3 s; 64 pods
-of two services each, started together on 8 cores, took about 6 s apiece.
-
-## Configuration
-
-Options both providers take:
-
-| Option | Default | Meaning |
-|---|---|---|
-| `binary` | `singularity`, else `apptainer` / `enroot` | Runtime executable (name or path). |
-| `scratch_root` | see below | Node-local directory for sessions, snapshots, staged images and runtime temp/cache. |
-| `image_cache` | `$HPC_SANDBOX_IMAGE_CACHE`, else `hpc-sandbox/images` in `$XDG_CACHE_HOME` or `~/.cache` | Image cache; may be shared storage with `flock`. |
-| `stage_images` | auto | Stage images to scratch; auto = inside a batch job when the cache is on another filesystem. |
-| `default_timeout_s` | 600 | Timeout of `exec` and transfers without an explicit one. |
-| `start_timeout_s` | 1800 | Pull, extraction, container start and snapshot copy timeout. |
-| `stop_timeout_s` | 60 | Bound on the whole stop. |
-| `bind_resolv_conf` | True | Bind the host's `/etc/resolv.conf` with host networking. |
-| `extra_start_args` | () | Extra `instance start` / `enroot start` flags. |
-| `output_limit_bytes` | 16 MiB | Captured bytes per stream and command. |
-| `memory_poll_s` | 1.0 | Watchdog sampling interval. |
-| `slirp4netns` | see Pods | The slirp4netns executable for pods with egress. |
-| `service_stop_grace_s` | 0 | How long pod services get between SIGTERM and SIGKILL when their pod stops. |
-
-`SingularityProvider` only:
-
-| Option | Default | Meaning |
-|---|---|---|
-| `stop_grace_s` | 10 | `instance stop --timeout`. |
-| `allow_network_none` | False | Permit `network="none"` (`--net --network none`); only where users may create network namespaces. Adds the `network_none` capability. |
-| `gpu` | None | `"nv"` or `"rocm"` (`--nv` / `--rocm`); adds the `gpu` capability. |
-| `cgroup_limits` | False | Pass `cpus` and `memory_mb` as `--cpus` / `--memory` where rootless cgroups work. Otherwise `cpus` is advisory. |
-| `rootfs_layout` | `$HPC_SANDBOX_ROOTFS_LAYOUT`, else `"copy"` | `"copy"` or `"fuse-overlay"` (see Singularity). `"fuse-overlay"` given with `gpu`, `cgroup_limits`, `--fakeroot` or `rootfs_templates=False` raises `ValueError`; the variable leaves such a provider on `"copy"`. |
-| `rootfs_templates` | True with fuse-overlay, else False | Extract each image once per node into a template; the copy layout then copies it into each sandbox. |
-
-`EnrootProvider` only:
-
-| Option | Default | Meaning |
-|---|---|---|
-| `remap_root` | True | Run as root inside the sandbox (`enroot start --root`); False runs as your uid. |
-| `import_env` | () | Extra variables for `enroot import`: names, or prefixes such as `"AWS_*"`. |
-| `gpus` | None | Handed to enroot's NVIDIA hook as `NVIDIA_VISIBLE_DEVICES`: `"all"` for every GPU the process may use (inside a Slurm allocation, the allocated ones), or a list such as `"0,1"` numbered as the job sees its GPUs (like `CUDA_VISIBLE_DEVICES`, not the host indices in `SLURM_STEP_GPUS`). Adds the `gpu` capability. |
-
-`EnrootProvider` also accepts the `SingularityProvider` names, so one set of
-options works for both runtimes: `gpu="nv"` means `gpus="all"`;
-`allow_network_none=False` refuses `network="none"`, which is otherwise
-always available because every enroot sandbox has its own network namespace;
-`stop_grace_s` is ignored because enroot sandboxes are stopped with SIGKILL,
-and `rootfs_templates` because `enroot create` extracts each sandbox's root
-filesystem from its image, which is the copy layout (`rootfs_layout="copy"`).
-`gpu="rocm"`, `cgroup_limits=True`, `rootfs_layout="fuse-overlay"` and a
-setting given under both names raise `ValueError`.
-
-Default scratch root: `$HPC_SANDBOX_SCRATCH`, else `$PBS_LOCALDIR/hpc-sandbox`,
-else `/local/$PBS_JOBID/hpc-sandbox` when it exists, else
-`$TMPDIR/hpc-sandbox-<uid>`. Unless already set, the runtime's temporary and
-cache directories (`SINGULARITY_TMPDIR`/`APPTAINER_TMPDIR` and `*_CACHEDIR`,
-or `ENROOT_TEMP_PATH` and `ENROOT_CACHE_PATH`) point into it, so pulls and
-builds never fill a small `/tmp` or a quota-limited home. Singularity bind
-variables (`SINGULARITY_BIND`, ...), `SINGULARITYENV_*`/`APPTAINERENV_*` and
-`*_CONFIGDIR` are removed from the runtime's environment.
-
-Capabilities: `{"snapshot", "isolation", "pods"}`, plus `network_none` and
-`gpu` as described above. Isolation means private PID/IPC namespaces, root filesystem,
-`/tmp` and environment; it is not a security boundary against code running
-as your uid with host networking.
-
-## Site notes
-
-Run `python -m hpc_sandbox doctor --image IMAGE` on a compute node of a new
-site first.
-
-Singularity CE / Apptainer:
-
-- **Setuid or user-namespace mode.** Both work. In setuid mode, network
-  namespaces (`--network none`) are usually reserved for root, so leave
-  `allow_network_none` off unless `doctor` or the integration tests show it
-  works; in unprivileged user-namespace mode (common with Apptainer) it
-  normally does (verify with `HPC_SANDBOX_TEST_NETWORK_NONE=1`).
-- **No `--fakeroot`, no `--writable-tmpfs`.** Some sites force squashfuse for
-  fakeroot overlays and the runtime then silently falls back to a read-only
-  rootfs; `sessiondir max size` often caps writable tmpfs at a few tens of
-  MiB. Writable rootfs directories on scratch avoid both, and startup probes
-  writability so a regression fails loudly.
-- **Instance metadata is per user, not per job.** Unprivileged instance
-  records live below the passwd home and ignore `SINGULARITY_CONFIGDIR`, so
-  every job of a user on a node sees the same instance list. Hence exact UUID
-  names, PID files and start-time identities, and never `instance stop --all`,
-  which would stop other jobs' instances.
-- **Cgroups.** Most sites give users none, hence the PSS watchdog. Where
-  Apptainer has rootless cgroups v2 (systemd user delegation),
-  `cgroup_limits=True` turns `cpus`/`memory_mb` into real limits. The setuid
-  starter is not dumpable; its RSS is charged instead of its PSS.
-- **GPUs.** `gpu="nv"` for NVIDIA (`--nv`), `gpu="rocm"` for AMD (`--rocm`).
-  Where `singularity.conf` sets `use nvidia-container-cli = yes`, `--nv` with
-  `--containall` exposes only the GPUs `NVIDIA_VISIBLE_DEVICES` names, so the
-  provider sets it to `all` (inside a Slurm allocation, the allocated GPUs)
-  unless it is already set.
-- **fuse-overlay** needs `fuse-overlayfs` and `fusermount3` (or `fusermount`)
-  on `PATH`, `/dev/fuse`, and unprivileged user namespaces, which its instances
-  run in (`--userns`); janitors need only `fusermount3`. Each overlay counts
-  towards fusermount's `mount_max` (`/etc/fuse.conf`, 1000 by default), which
-  caps the FUSE mounts of every user on the node. An overlay whose
-  fuse-overlayfs gets SIGKILL (as Slurm sends what outlives a step or a job)
-  stays mounted, dead, until a janitor or a provider's first start on the node
-  unmounts it.
-- **Templates are never evicted.** Every image version used on a node keeps
-  an extracted rootfs in `templates/` on scratch, next to its staged SIF. A
-  per-job scratch root goes with the job; on one that outlives jobs, keep
-  age-based cleaners such as systemd-tmpfiles out of `templates/`: a
-  template that lost its marker is extracted again, but one that lost other
-  files is not noticed.
-- **Variables passed despite `--cleanenv`.** The runtime passes `TERM` and the
-  proxy variables into containers regardless (proxy URLs may hold
-  credentials), so the provider removes them from its environment for
-  `instance start` and `exec`; pass them in `SandboxSpec.env` if a sandbox
-  needs them.
-
-enroot:
-
-- **Requirements.** enroot 3.x, util-linux `nsenter`, unprivileged user
-  namespaces (`/proc/sys/user/max_user_namespaces` above zero), and `/bin/sh`
-  and `sleep` in the image. Pulling images needs enroot's `+caps` package:
-  `enroot-aufs2ovlfs` converts layer whiteouts with file capabilities.
-- **Run on the host, not inside a container.** File capabilities are ignored
-  in nested user namespaces, so `enroot import` fails inside a pyxis or
-  enroot container (and `enroot` is usually not installed there). Run the
-  process that owns the sandboxes as a plain Slurm step, or import images
-  beforehand and pass `.sqsh` paths.
-- **Sandboxes die with their owner.** The launcher and the container's init
-  are killed when the owning process exits, even by SIGKILL; there are no
-  orphaned containers to stop, only files for the janitor to remove.
-- **Upgrading from an earlier version.** Enroot sessions used to live in
-  `sessions` next to the Singularity ones; enroot janitors also sweep the
-  enroot sessions they find there, and, where no Singularity or Apptainer is
-  installed, sessions there whose owner record is missing.
-- **Site configuration.** `enroot.conf` settings such as
-  `ENROOT_MOUNT_HOME yes`, `ENROOT_REMAP_ROOT` and the data and runtime paths
-  are overridden per sandbox, and the site's mounts, environment files and
-  hooks are replaced by the provider's own system configuration (see above).
-  `doctor` lists the site's hooks and which standard ones sandboxes get; a
-  standard hook the installation lacks or has disabled is skipped.
-
-Pods:
-
-- **Requirements.** Unprivileged user namespaces that nest (the pod's, then
-  each service's), util-linux `nsenter`, and `prlimit` for services with
-  `ulimits`. Egress needs `/dev/net/tun` usable by users (it usually is) and
-  slirp4netns, the site's or the pinned one (`fetch-tools`); the site's gets
-  its distribution's security fixes, the pinned one only when this package
-  moves its pin.
-- **Singularity CE / Apptainer** services run `singularity exec --cleanenv
-  --no-eval --writable --containall --no-home --no-mount home,cwd,bind-paths`
-  on a rootfs directory, in a user namespace the launcher creates, so the
-  runtime runs unprivileged (its non-setuid starter) even where it is
-  installed setuid; `/etc/hosts`, `/etc/resolv.conf` and `/dev/shm` are bound
-  into the container. Pods never use `--network none`.
-
-Both:
-
-- **Paths.** Keep the image cache on shared storage that supports `flock` and
-  let staging copy images to node-local disk. Point `HPC_SANDBOX_SCRATCH` at
-  job-local disk when `$TMPDIR` is small or shared (for example
-  `/local/$SLURM_JOB_ID`). Tasks launched with `pbsdsh` or `srun` may start
-  with a minimal environment: pass the variables the defaults rely on
-  (`PBS_JOBID`, `PBS_LOCALDIR`, `SLURM_JOB_ID`, `TMPDIR`) through, and run
-  `python -m hpc_sandbox janitor` in the job epilogue.
-
-## Tests
+[CONTRIBUTING.md](CONTRIBUTING.md) is the full guide: the development setup, the tests, the checks
+CI runs, commits and pull requests, and releases. In short:
 
 ```bash
-python -m pytest                       # unit tests, no container runtime needed
-HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_integration.py -v        # compute node
-HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_pods_integration.py -v   # compute node
+git clone https://github.com/ApGa/hpc-sandbox.git
+cd hpc-sandbox
+uv sync --group dev
+uv run pre-commit install    # lint each commit and check its message
+uv run pytest                # the unit tests, with fake runtimes
 ```
 
-Unit tests put a fake `singularity` (`tests/fake_singularity.py`) and a fake
-`enroot` (`tests/fake_enroot.py`) first on `PATH`. The fake Singularity
-simulates instances as real host processes with the real process title; the
-fake enroot builds containers from real user and mount namespaces, binds and
-`chroot`, so the enroot launcher and `nsenter` paths run for real (these tests
-are skipped where unprivileged user namespaces are unavailable). Identity
-checks, the janitor, the watchdog, timeouts and cancellation are exercised
-with real processes. The integration tests need a compute node (never run
-containers on a login node); `HPC_SANDBOX_TEST_RUNTIME` selects the runtime
-(`singularity`, `enroot`, or `auto` as on the command line) and
-`HPC_SANDBOX_TEST_IMAGE` the image (default `docker://alpine:3.20`). The pod
-tests run `HPC_SANDBOX_TEST_POD_IMAGE` (default `docker://alpine:3.20`) and
-`HPC_SANDBOX_TEST_APT_IMAGE` (default `docker://python:3.12-slim`), start
-`HPC_SANDBOX_TEST_PODS` pods at once (default 16) and check egress where
-slirp4netns is found.
+The unit tests run wherever unprivileged user namespaces work; the integration tests need a compute
+node with a runtime. Commit messages and pull request titles follow Conventional Commits, such as
+`fix: Keep a session whose overlay cannot be unmounted`.
 
-## Not yet
-
-- evicting templates, and an overlay layout for enroot;
-- an ext3 overlay mode as an alternative to rootfs directories;
-- memory snapshots, and per-node PID namespaces inside one shared sandbox;
-- for pods: snapshots, GPUs, services that switch to other users (that needs
-  subordinate id ranges), host networking and egress allowlists.
+Report bugs and ask questions in [GitHub issues](https://github.com/ApGa/hpc-sandbox/issues), with
+the output of `hpc-sandbox doctor --image IMAGE` from the node where the problem happens. Report
+security issues privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+hpc-sandbox is released under the MIT License; see [LICENSE](LICENSE).
+
+## Citation
+
+If hpc-sandbox is useful in your work, please cite it:
+
+```bibtex
+@misc{gandhi2026hpcsandbox,
+  author       = {Gandhi, Apurva},
+  title        = {{hpc-sandbox}: Rootless Sandboxes for {HPC} Clusters},
+  howpublished = {\url{https://github.com/ApGa/hpc-sandbox}},
+  year         = {2026}
+}
+```

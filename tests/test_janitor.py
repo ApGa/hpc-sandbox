@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 
 from conftest import FakeRuntime, make_provider
-
 from hpc_sandbox import SandboxSpec
 from hpc_sandbox.locks import open_lock_file
 from hpc_sandbox.process import run_process

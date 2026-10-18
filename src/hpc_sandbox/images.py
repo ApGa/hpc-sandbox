@@ -262,7 +262,8 @@ class ImageStore:
         return ResolvedImage(reference, path, sha256)
 
     async def digest(self, path: Path, *, remember: bool = False) -> str:
-        """The SHA-256 of ``path``; with ``remember``, kept on node-local scratch for later processes."""
+        """The SHA-256 of ``path``; with ``remember``, kept on node-local scratch for later
+        processes."""
         key = _stat_key(path)
         if key is None:
             raise SandboxError(f"image {path} disappeared")
@@ -332,7 +333,7 @@ class ImageStore:
             while not _try_lock(descriptor):
                 # Another process pulls or refreshes this reference. A start never
                 # waits for that while an image for it is cached, even one cached
-                # by an earlier version.
+                # by hpc-sandbox 0.1.0.
                 if not refresh and (cached := await self._cached_or_legacy(key, uri)):
                     return cached
                 await asyncio.sleep(0.05)
@@ -348,7 +349,7 @@ class ImageStore:
             os.close(descriptor)
 
     async def _cached_or_legacy(self, key: str, uri: str) -> tuple[Path, str] | None:
-        """The image the pointer names, else one an earlier version cached (used as is)."""
+        """The image the pointer names, else one hpc-sandbox 0.1.0 cached (used as is)."""
         if (cached := await self._cached(key, uri)) is not None:
             return cached
         legacy = self.cache_dir / f"{key}{self.format.suffix}"
@@ -361,7 +362,7 @@ class ImageStore:
     ) -> tuple[Path, str] | None:
         """The valid image file ``key``'s pointer names, if any.
 
-        With ``migrate`` (under the key's lock), an image an earlier version
+        With ``migrate`` (under the key's lock), an image hpc-sandbox 0.1.0
         cached under the key itself is adopted instead.
         """
         pointer = self._pointer(key)
@@ -370,7 +371,7 @@ class ImageStore:
             path = self._content_path(sha256)
             if await self._is_valid(path):
                 return path, sha256
-        # Once a pointer exists, an earlier version's file is superseded.
+        # Once a pointer exists, a file of hpc-sandbox 0.1.0 is superseded.
         return await self._migrate(key, uri) if migrate and pointer is None else None
 
     async def _migrate(self, key: str, uri: str) -> tuple[Path, str] | None:

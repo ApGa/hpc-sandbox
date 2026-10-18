@@ -39,6 +39,7 @@ _ISOLATED_ENV = (
     "FAKE_SINGULARITY_EXIT_DELAY",
     "FAKE_FUSE_MOUNT_FAILS",
     "HPC_SANDBOX_ROOTFS_LAYOUT",
+    "HPC_SANDBOX_RUNTIME",
     "ENROOT_CACHE_PATH",
     "ENROOT_TEMP_PATH",
     "ENROOT_DATA_PATH",
@@ -129,7 +130,8 @@ async def provider(tmp_path: Path, fake_runtime: FakeRuntime) -> AsyncIterator[S
 
 @pytest.fixture(autouse=True)
 def _background_deletions_finish() -> Iterator[None]:
-    """Stopped sandboxes are deleted in the background: let those deletions end within their test."""
+    """Stopped sandboxes are deleted in the background: let those deletions end within their
+    test."""
     yield
     deadline = time.monotonic() + 60
     while _DELETIONS and time.monotonic() < deadline:
