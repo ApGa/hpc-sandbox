@@ -8,30 +8,32 @@ This is a best-effort guard, not a hard limit; usage can overshoot between
 samples.
 
 On a breach the watchdog kills one branch of the process forest, never the
-sandbox's own processes (recorded when it starts). It starts from the
-heaviest of the sandbox's top-level branches (each ``exec``'s tree, and each
-tree below the sandbox's own processes: commands left running in the
-background by earlier ones) and descends into the child branch that holds
-the most while that child alone holds the excess over the limit. So the
-command that ran away dies and a harness survives a tool command it started,
-whatever their sizes; when the memory is spread over several children, their
-parent's branch dies whole. As with the kernel's OOM killer, a pool's worker
-that holds the excess alone dies alone, so a harness that runs code in
-children it joins (with a ``multiprocessing.Manager``, or several at once)
-learns that one was killed, while a ``multiprocessing.Pool``, which never
-notices a lost worker, waits for its task until the command times out
-(``concurrent.futures`` and joblib raise an error instead): the process tree
-cannot tell the two apart. It may also kill a larger idle process before a
-smaller one that is growing.
+sandbox's own processes (recorded when it starts). It starts from the heaviest
+of the sandbox's top-level branches (each ``exec``'s tree, and each tree below
+the sandbox's own processes: commands left running in the background by earlier
+ones) and descends into the child branch that holds the most while that child
+alone holds the excess over the limit. So the command that ran away dies and a
+harness survives a tool command it started, whatever their sizes; when the
+memory is spread over several children, their parent's branch dies whole. What
+a branch holds is what killing it frees: a fork copy of its parent (a
+``multiprocessing`` fork worker) counts its private memory only, since the
+pages it still shares with its parent stay, so a pool owner that grows dies
+with its workers. As with the kernel's OOM killer, a pool's worker that holds
+the excess alone dies alone, so a harness that runs code in children it joins
+(with a ``multiprocessing.Manager``, or several at once) learns that one was
+killed, while a ``multiprocessing.Pool``, which never notices a lost worker,
+waits for its task until the command times out (``concurrent.futures`` and
+joblib raise an error instead): the process tree cannot tell the two apart. It
+may also kill a larger idle process before a smaller one that is growing.
 
 ``oom_score_adj`` counts the way the kernel's OOM killer counts it, relative to
 the parent's value, so that what every process inherited changes nothing:
 where a process raised it, that process weighs ``oom_score_adj / 1000`` of the
 limit more, for itself alone, as the kernel scores each process alone (the
 renderers of a browser, which mark themselves, do not add up). It goes first,
-wherever it is, when what its branch holds plus its mark outweighs the branch
-the memory leads to, and before its siblings when it outweighs its parent or
-holds the excess. A harness that starts its tool commands with
+wherever it is, when what its branch holds plus its mark outweighs the heaviest
+top-level branch, and before its siblings when it outweighs its parent or holds
+the excess. A harness that starts its tool commands with
 ``choom -n 1000 -- cmd`` (or writes ``/proc/self/oom_score_adj``) makes them
 preferred victims here and under the kernel alike. A process that lowered it
 only weighs less itself. One at ``-1000`` below what the sandbox inherited,
@@ -105,6 +107,7 @@ class _Process:
     adj: int  # oom_score_adj
     command: str = ""  # the command line; "" if unknown
     session: int = 0  # the session ID, which orphans keep when another process adopts them
+    private_bytes: int | None = None  # memory no other process shares: what its death frees
 
     @property
     def identity(self) -> Identity:
@@ -147,16 +150,18 @@ def sample(
             adj = procfs.oom_score_adj(pid)
             if adj is None:  # gone meanwhile: count it as what it inherited
                 adj = parent.adj if parent else 0
+            pss, private = procfs.memory_bytes(pid)
             process = _Process(
                 pid,
                 parent.pid if parent else None,
                 started,
-                procfs.resident_bytes(pid),
+                pss,
                 exec_root,
                 (exec_root is None and pid == root) or own.get(pid) == started,
                 adj,
                 procfs.cmdline(pid) or "",
                 session,
+                private,
             )
             processes.append(process)
             pending.extend((child, process) for child in procfs.children(pid))
@@ -214,6 +219,15 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
         own = process.pss_bytes if killable(process) else 0
         freed[process.pid] = own + sum(freed[kid.pid] for kid in below)
 
+    def frees(process: _Process) -> int:
+        """What killing ``process``'s branch frees. A fork copy of its parent (a pool's fork
+        worker) shares its pages with the parent, which keeps them: only its own count."""
+        parent = by_pid.get(process.parent) if process.parent is not None else None
+        copy = parent is not None and process.command and process.command == parent.command
+        if not copy or process.private_bytes is None or not killable(process):
+            return freed[process.pid]
+        return freed[process.pid] - process.pss_bytes + process.private_bytes
+
     def candidates(pid: int | None) -> list[_Process]:
         """The killable branches right below ``pid``, looking through processes that are not."""
         found, pending = [], list(children[pid])
@@ -241,12 +255,12 @@ def choose_branch(processes: list[_Process], limit_bytes: int) -> list[_Process]
             kid
             for kid in kids
             if node.adj < kid.adj
-            and (weight(node) < branch[kid.pid] + mark(kid) or freed[kid.pid] >= excess)
+            and (weight(node) < branch[kid.pid] + mark(kid) or frees(kid) >= excess)
         ]
-        heaviest = max(kids, key=lambda kid: freed[kid.pid])
+        heaviest = max(kids, key=frees)
         if marked:
             node = max(marked, key=lambda kid: branch[kid.pid] + mark(kid))  # a preferred victim
-        elif freed[heaviest.pid] >= excess:
+        elif frees(heaviest) >= excess:
             node = heaviest  # it holds the breach on its own
         else:
             break

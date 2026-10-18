@@ -148,45 +148,55 @@ def descendants(roots: Iterable[int]) -> list[int]:
 
 
 def resident_bytes(pid: int) -> int:
-    """Proportional set size of ``pid``, falling back to RSS when PSS is unreadable.
+    """Proportional set size of ``pid``; see :func:`memory_bytes`."""
+    return memory_bytes(pid)[0]
 
-    The setuid Singularity starter is not dumpable, so its ``smaps_rollup``
-    raises ``PermissionError``; charging its RSS is conservative. A vanished or
-    zombie process counts as zero.
+
+def memory_bytes(pid: int) -> tuple[int, int]:
+    """Proportional set size and private memory (what its death alone frees) of ``pid``.
+
+    Both fall back to the RSS when ``smaps_rollup`` is unreadable: the setuid
+    Singularity starter is not dumpable, and charging its RSS is conservative.
+    A vanished or zombie process counts as zero.
     """
     proc = Path(f"/proc/{pid}")
     try:
-        pss = _pss(proc / "smaps_rollup")
-        if pss is None:  # its main thread exited: ask one of the others
+        rollup = _rollup(proc / "smaps_rollup")
+        if rollup is None:  # its main thread exited: ask one of the others
             for thread in (proc / "task").iterdir():
-                if thread.name != str(pid) and (pss := _pss(thread / "smaps_rollup")):
+                if thread.name != str(pid) and (rollup := _rollup(thread / "smaps_rollup")):
                     break
-        return pss or 0
+        return rollup or (0, 0)
     except PermissionError:
         pass
     except OSError:
-        return 0
+        return 0, 0
     try:
         for line in (proc / "status").read_text().splitlines():
             if line.startswith("VmRSS:"):
-                return int(line.split()[1]) * 1024
+                rss = int(line.split()[1]) * 1024
+                return rss, rss
     except OSError:
         pass
-    return 0
+    return 0, 0
 
 
-def _pss(path: Path) -> int | None:
+def _rollup(path: Path) -> tuple[int, int] | None:
     try:
-        for line in path.read_text().splitlines():
-            if line.startswith("Pss:"):
-                return int(line.split()[1]) * 1024
+        fields = dict(line.split(":", 1) for line in path.read_text().splitlines() if ":" in line)
     except FileNotFoundError:
-        pass
+        return None
     except PermissionError:
         raise
     except OSError:
-        pass
-    return None
+        return None
+    if "Pss" not in fields:
+        return None
+    kib = {name: int(value.split()[0]) for name, value in fields.items() if value.split()}
+    private = sum(
+        kib.get(name, 0) for name in ("Private_Clean", "Private_Dirty", "Private_Hugetlb")
+    )
+    return kib["Pss"] * 1024, private * 1024
 
 
 def oom_score_adj(pid: int) -> int | None:

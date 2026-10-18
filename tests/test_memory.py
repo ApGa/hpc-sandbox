@@ -18,8 +18,9 @@ MB = 1024 * 1024
 LIMIT = 1000 * MB
 
 
-def proc(pid, parent, mb, *, adj=0, protected=False, exec_root=None, command=""):
-    return _Process(pid, parent, "0", mb * MB, exec_root, protected, adj, command)
+def proc(pid, parent, mb, *, adj=0, protected=False, exec_root=None, command="", private=None):
+    private_bytes = None if private is None else private * MB
+    return _Process(pid, parent, "0", mb * MB, exec_root, protected, adj, command, 0, private_bytes)
 
 
 def sandbox(*processes):
@@ -145,6 +146,19 @@ def test_a_pool_worker_that_holds_the_excess_dies_alone_as_with_the_kernel():
     # Spread over the pool, the memory takes the owner with every worker.
     spread = pool(20, 100, 3, 400, command=POOL)
     assert killed(sandbox(proc(10, 2, 257), owner, *spread)) == [20, 100, 101, 102]
+
+
+def test_a_fork_workers_share_of_its_owners_pages_is_not_what_its_death_frees():
+    # The owner grows; its fork workers' PSS holds their share of the pages they still
+    # share with it, which killing them would not free: the owner goes, with them.
+    harness = proc(10, 2, 100, command=HARNESS)
+    owner = proc(20, 10, 475, command=TRAIN, private=300)
+    workers = [proc(30 + i, 20, 175, command=TRAIN, private=1) for i in range(3)]
+    total = 2 + 100 + 475 + 3 * 175
+    assert killed(sandbox(harness, owner, *workers), (total - 20) * MB) == [20, 30, 31, 32]
+    # A worker whose own memory holds the excess still dies alone.
+    workers[1] = proc(31, 20, 575, command=TRAIN, private=400)
+    assert killed(sandbox(harness, owner, *workers), (total + 400 - 20) * MB) == [31]
 
 
 def test_a_harness_running_code_in_children_with_a_manager_survives_a_leak():
@@ -378,6 +392,41 @@ async def test_a_harness_learns_that_the_child_it_joins_was_killed(tmp_path, fak
             assert result.exit_code == 0, (how, result.stdout, result.stderr)
             assert "harness alive, child exit -9" in result.stdout, how
             assert sandbox.memory_kills[-1].processes == 1
+    finally:
+        await sandbox.stop()
+
+
+HARNESS_RUNS_A_COMMAND = """
+import subprocess, sys
+command = subprocess.run([sys.executable, "-c", sys.argv[1]])
+print("harness alive, command exit", command.returncode, flush=True)
+"""
+POOL_OWNER_GROWS = """
+import multiprocessing, time
+def touched(mb):
+    data = bytearray(mb * 1024 * 1024)
+    data[::4096] = b"\\1" * (len(data) // 4096)
+    return data
+def idle(_):
+    time.sleep(60)
+shared = touched(600)  # its fork workers share it with it, copy-on-write
+pool = multiprocessing.get_context("fork").Pool(3)
+pool.map_async(idle, range(3))
+time.sleep(2)
+grown = touched(100)
+time.sleep(60)
+"""
+
+
+@pytest.mark.skipif(not Path(PYTHON).exists(), reason=f"needs {PYTHON}")
+async def test_a_growing_pool_owner_dies_with_its_fork_workers(tmp_path, fake_runtime, sif):
+    provider = make_provider(tmp_path, memory_poll_s=0.5)
+    sandbox = await provider.start(SandboxSpec(image=str(sif), memory_mb=700))
+    try:
+        command = [PYTHON, "-c", HARNESS_RUNS_A_COMMAND, POOL_OWNER_GROWS]
+        result = await sandbox.exec(command, timeout_s=60)
+        assert "harness alive, command exit -9" in result.stdout, (result.stdout, result.stderr)
+        assert len(sandbox.memory_kills) == 1 and sandbox.memory_kills[0].processes >= 4
     finally:
         await sandbox.stop()
 
