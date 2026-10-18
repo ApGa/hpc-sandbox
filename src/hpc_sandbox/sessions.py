@@ -167,14 +167,20 @@ def _lease(root: Path, name: str) -> Session:
 
 def leased(path: Path) -> bool:
     """Whether a live process holds the lease of the session directory ``path``."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK  # a FIFO there never blocks
     try:
-        descriptor = os.open(path / LEASE_FILE, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(path / LEASE_FILE, flags)
     except OSError:
         return False
     try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return False
         fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except BlockingIOError:
         return True
+    except OSError:
+        return False
     finally:
         os.close(descriptor)
     return False

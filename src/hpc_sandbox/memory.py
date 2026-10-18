@@ -343,7 +343,11 @@ async def _check(
     if not branch or procfs.start_time(branch[0].pid) != branch[0].start_time:
         return
     viewer = container_pid() if container_pid is not None else root
-    tmpfs = await asyncio.to_thread(procfs.tmpfs_bytes, viewer) if viewer else None
+    try:  # a measure for the report: it must never keep the kill from happening
+        tmpfs = await asyncio.to_thread(procfs.tmpfs_bytes, viewer) if viewer else None
+    except Exception:
+        log.exception("hpc-sandbox: could not measure the sandbox's tmpfs mounts")
+        tmpfs = None
     if procfs.start_time(branch[0].pid) != branch[0].start_time:
         return  # it ended meanwhile
     # Charge the kill before the first signal: an exec whose command dies must

@@ -431,3 +431,8 @@ async def test_a_janitor_clears_a_session_whose_instance_never_started_on_a_full
     report = await provider.reap()
     assert (report.removed, report.errors) == ([session.name], [])
     assert await provider.wait_for_deletions(30) and not session.path.exists()
+
+
+def test_a_lease_that_is_no_regular_file_holds_nothing_and_never_blocks(tmp_path):
+    os.mkfifo(tmp_path / ".lease")  # opening a FIFO to read waits for a writer
+    assert sessions.leased(tmp_path) is False

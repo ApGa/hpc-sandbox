@@ -623,26 +623,7 @@ def _mounted(path: Path) -> bool:
     looked up, since a mount whose daemon died answers nothing.
     """
     target = os.path.join(os.path.realpath(path.parent), path.name)
-    return any(mountpoint == target for mountpoint, _, _ in _mounts(_mountinfo()))
-
-
-def _mountinfo() -> str:
-    """This mount namespace's mount table, whatever bytes its paths hold."""
-    return os.fsdecode(Path("/proc/self/mountinfo").read_bytes())
-
-
-def _mounts(mountinfo: str) -> list[tuple[str, str, list[str]]]:
-    """Each mount's point (unescaped), device (major:minor) and type, source and options."""
-    mounts = []
-    for line in mountinfo.splitlines():
-        fields = line.split()
-        if len(fields) > 4 and "-" in fields:
-            mounts.append((_unescape(fields[4]), fields[2], fields[fields.index("-") + 1 :]))
-    return mounts
-
-
-def _unescape(field: str) -> str:
-    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), field)
+    return any(mount.point == target for mount in procfs.mount_table())
 
 
 async def unmount_overlay(session_path: Path) -> bool:
@@ -675,7 +656,7 @@ async def unmount_dead_overlays() -> list[str]:
     attribute cache, valid for decades. Probes run in a child process with a
     time limit, since one of a stopped daemon's mount would wait for it.
     """
-    mountinfo = await asyncio.to_thread(_mountinfo)
+    mountinfo = await asyncio.to_thread(Path("/proc/self/mountinfo").read_bytes)
     candidates = await asyncio.to_thread(_unserved_overlays, mountinfo)
     dead = [mountpoint for mountpoint in candidates if await _disconnected(mountpoint)]
     if not dead:
@@ -692,22 +673,31 @@ async def unmount_dead_overlays() -> list[str]:
     return errors
 
 
-def _unserved_overlays(mountinfo: str) -> list[str]:
+def _unserved_overlays(mountinfo: str | bytes) -> list[str]:
     """This user's session overlays that nobody's lease holds and no fuse-overlayfs of this user serves."""
-    mounts = _mounts(mountinfo)
+    mounts = procfs.mounts(mountinfo)
     owner = f"user_id={os.getuid()}"
     served_paths = _served_overlays()
-    served = {device for mountpoint, device, _ in mounts if mountpoint in served_paths}
+    served = {mount.device for mount in mounts if mount.point in served_paths}
     return [
-        mountpoint
-        for mountpoint, device, kind in mounts
-        if len(kind) == 3
-        and kind[0] == OVERLAY_FSTYPE
-        and owner in kind[2].split(",")
-        and _SESSION_ROOTFS.fullmatch(mountpoint)
-        and device not in served  # a mount shows up at every place it propagated to
-        and not leased(Path(mountpoint).parent)
+        mount.point
+        for mount in mounts
+        if mount.fstype == OVERLAY_FSTYPE
+        and owner in mount.options.split(",")
+        and _SESSION_ROOTFS.fullmatch(mount.point)
+        and mount.device not in served  # a mount shows up at every place it propagated to
+        and _private_directory(Path(mount.point).parent)
+        and not leased(Path(mount.point).parent)
     ]
+
+
+def _private_directory(path: Path) -> bool:
+    """Whether ``path`` is a directory of this uid's that only it may enter: a session's."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
 
 
 async def _disconnected(mountpoint: str) -> bool:

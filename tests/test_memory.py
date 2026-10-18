@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 from conftest import make_provider
 
-from hpc_sandbox import SandboxSpec, procfs
+from hpc_sandbox import SandboxSpec, memory, procfs
 from hpc_sandbox.memory import _Process, choose_branch, choose_victim, sample
 
 MB = 1024 * 1024
@@ -511,6 +512,53 @@ def test_signals_the_kernel_refuses_are_skipped():
     from hpc_sandbox.memory import _signal
 
     assert not _signal(1, procfs.start_time(1), signal.SIGCONT)  # init is root's
+
+
+def test_mount_tables_are_read_as_the_kernel_writes_them():
+    # The kernel escapes space, tab, newline and backslash, and nothing else: no other
+    # character (a no-break space, U+2028) separates fields or lines.
+    raw = (
+        b"36 35 0:20 / /a\\040b\\011c\\134d rw - tmpfs tmpfs rw\n"
+        b"37 35 0:21 / /x\xc2\xa0y\xe2\x80\xa8z rw shared:1 - tmpfs none rw,size=1k\n"
+        b"39 35 0:23 / /x\xe2\x80\xa8-\xe2\x80\xa8 rw - tmpfs tmpfs rw\n"
+        b"garbage - x\n"
+        b"38 35 0:22 /sub /mnt rw - ext4 /dev/sda rw\n"
+    )
+    found = [(m.point, m.fstype, m.root) for m in procfs.mounts(raw)]
+    assert found == [
+        ("/a b\tc\\d", "tmpfs", "/"),
+        ("/x\xa0y\u2028z", "tmpfs", "/"),
+        ("/x\u2028-\u2028", "tmpfs", "/"),
+        ("/mnt", "ext4", "/sub"),
+    ]
+    assert procfs.sandbox_tmpfs(raw) == []  # it read these as lines of their own and failed
+
+
+async def test_a_failing_tmpfs_measure_never_keeps_a_kill_from_happening(monkeypatch):
+    def broken(pid: int) -> int:
+        raise IndexError("a mount table nobody expected")
+
+    monkeypatch.setattr(procfs, "tmpfs_bytes", broken)
+    hog = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "data = bytearray(200 * 2**20); data[::4096] = b'1' * (len(data) // 4096); "
+        "print(1, flush=True); import time; time.sleep(60)",
+        stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert hog.stdout is not None and await hog.stdout.readline() == b"1\n"
+        root = (hog.pid, procfs.start_time(hog.pid))
+        kills: list = []
+        await memory._check(
+            50 * MB, lambda: None, lambda: [root], kills.append, lambda: hog.pid, None
+        )
+        assert len(kills) == 1 and kills[0].tmpfs_bytes is None
+        assert await asyncio.wait_for(hog.wait(), 10) == -signal.SIGKILL
+    finally:
+        if hog.returncode is None:
+            hog.kill()
+            await hog.wait()
 
 
 def test_tmpfs_counts_whole_file_systems_only():

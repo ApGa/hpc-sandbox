@@ -184,6 +184,8 @@ async def test_janitors_unmount_dead_overlays_wherever_they_lie(tmp_path, sshfs,
     live = sessions / f"hpcsb-{'c' * 32}" / "rootfs"
     leased = sessions / f"hpcsb-{'d' * 32}" / "rootfs"  # its owner unmounts it
     other = tmp_path / "not-a-session" / "rootfs"
+    for session in (dead, trashed, live, leased):
+        session.parent.mkdir(mode=0o700, parents=True)  # as sessions are
     daemons = {path: sshfs(path) for path in (dead, trashed, live, leased, other)}
     for path in daemons:
         os.stat(path)  # as every sandbox's start does: the root's attributes are cached
@@ -208,9 +210,11 @@ async def test_janitors_unmount_dead_overlays_wherever_they_lie(tmp_path, sshfs,
         os.close(lease)
 
 
-def test_a_served_overlay_is_live_wherever_it_shows_up(monkeypatch):
+def test_a_served_overlay_is_live_wherever_it_shows_up(tmp_path, monkeypatch):
     # A mount listed again where a bind of its parent propagated it.
-    served, other = (f"/scratch/sessions/hpcsb-{c * 32}/rootfs" for c in "ab")
+    served, other = (tmp_path / f"sessions/hpcsb-{c * 32}/rootfs" for c in "ab")
+    for rootfs in (served, other):
+        rootfs.parent.mkdir(mode=0o700, parents=True)
     kind = f"- fuse.fuse-overlayfs fuse-overlayfs rw,user_id={os.getuid()},group_id=0"
     mountinfo = "\n".join(
         [
@@ -219,9 +223,11 @@ def test_a_served_overlay_is_live_wherever_it_shows_up(monkeypatch):
             f"102 50 0:78 / {other} rw {kind}",
         ]
     )
-    monkeypatch.setattr(singularity_module, "_served_overlays", lambda: {served})
+    monkeypatch.setattr(singularity_module, "_served_overlays", lambda: {str(served)})
     monkeypatch.setattr(singularity_module, "leased", lambda path: False)
-    assert singularity_module._unserved_overlays(mountinfo) == [other]
+    assert singularity_module._unserved_overlays(mountinfo) == [str(other)]
+    other.parent.chmod(0o755)  # not a session of this uid's: none of its business
+    assert singularity_module._unserved_overlays(mountinfo) == []
 
 
 def test_mount_points_that_are_not_utf_8_break_nothing(tmp_path):
@@ -229,11 +235,15 @@ def test_mount_points_that_are_not_utf_8_break_nothing(tmp_path):
 import asyncio, os, subprocess, sys
 from pathlib import Path
 from hpc_sandbox import procfs, singularity
-odd = os.path.join(os.fsencode(sys.argv[1]), b"caf\\xe9")
-os.mkdir(odd)
-subprocess.run([b"mount", b"-t", b"tmpfs", b"tmpfs", odd], check=True)
-mounted = singularity._mounted(Path(os.fsdecode(odd)))
-print(mounted, asyncio.run(singularity.unmount_dead_overlays()), procfs.tmpfs_bytes(os.getpid()) is not None)
+base = os.fsencode(sys.argv[1])
+names = [b"caf\\xe9", "x\\xa0y\\u2028z".encode(), "x\\u2028-\\u2028".encode()]
+mounted = []
+for name in names:
+    odd = os.path.join(base, name)
+    os.mkdir(odd)
+    subprocess.run([b"mount", b"-t", b"tmpfs", b"tmpfs", odd], check=True)
+    mounted.append(singularity._mounted(Path(os.fsdecode(odd))))
+print(all(mounted), asyncio.run(singularity.unmount_dead_overlays()), procfs.tmpfs_bytes(os.getpid()) is not None)
 """
     assert in_mount_namespace(script, str(tmp_path)).split() == ["True", "[]", "True"]
 

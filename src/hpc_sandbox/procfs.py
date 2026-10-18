@@ -8,7 +8,9 @@ the identity ``(pid, start time)`` from ``/proc/<pid>/stat``.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 _INSTANCE_TITLES = ("Singularity instance:", "Apptainer instance:")
@@ -227,8 +229,8 @@ def tmpfs_bytes(pid: int) -> int | None:
     readable (a setuid runtime's own processes are not); None if none is.
     """
     for candidate in (pid, *descendants([pid])):
-        try:  # whatever bytes its paths hold
-            mountinfo = os.fsdecode(Path(f"/proc/{candidate}/mountinfo").read_bytes())
+        try:
+            mountinfo = Path(f"/proc/{candidate}/mountinfo").read_bytes()
         except OSError:
             continue
         used = 0
@@ -242,7 +244,7 @@ def tmpfs_bytes(pid: int) -> int | None:
     return None
 
 
-def sandbox_tmpfs(mountinfo: str) -> list[str]:
+def sandbox_tmpfs(mountinfo: str | bytes) -> list[str]:
     """Mount points of the tmpfs file systems at :data:`SANDBOX_TMPFS`, one per file system.
 
     Only whole file systems count: a directory of a host tmpfs bound there
@@ -251,15 +253,57 @@ def sandbox_tmpfs(mountinfo: str) -> list[str]:
     """
     found: list[str] = []
     devices = set()
-    for line in mountinfo.splitlines():
-        fields = line.split()
-        if "-" not in fields:
+    for mount in mounts(mountinfo):
+        if mount.fstype != "tmpfs" or mount.root != "/" or mount.point not in SANDBOX_TMPFS:
             continue
-        fstype = fields[fields.index("-") + 1]
-        device, root, mount_point = fields[2], fields[3], fields[4]
-        if fstype != "tmpfs" or root != "/" or mount_point not in SANDBOX_TMPFS:
-            continue
-        if device not in devices and mount_point not in found:  # statvfs sees the top mount
-            devices.add(device)
-            found.append(mount_point)
+        if mount.device not in devices and mount.point not in found:  # statvfs sees the top mount
+            devices.add(mount.device)
+            found.append(mount.point)
     return found
+
+
+@dataclass(frozen=True)
+class Mount:
+    """One mount of a mount table (``/proc/<pid>/mountinfo``)."""
+
+    device: str  # major:minor
+    root: str  # what of its file system is mounted
+    point: str
+    fstype: str
+    source: str
+    options: str  # the file system's
+
+
+def mounts(mountinfo: str | bytes) -> list[Mount]:
+    """The mounts of a mount table, read as the kernel writes it: a line per mount, fields
+    separated by single spaces, and paths with spaces, tabs, newlines and backslashes octal-
+    escaped (and nothing else). Paths are decoded as file names; malformed lines are skipped."""
+    raw = os.fsencode(mountinfo) if isinstance(mountinfo, str) else mountinfo
+    found = []
+    for line in raw.split(b"\n"):
+        fields = line.split(b" ")
+        try:  # optional fields from the seventh, then "-", the type, the source, the options
+            separator = fields.index(b"-", 6)
+            fstype, source, options = fields[separator + 1 : separator + 4]
+        except ValueError:
+            continue
+        found.append(
+            Mount(
+                os.fsdecode(fields[2]),
+                _path(fields[3]),
+                _path(fields[4]),
+                os.fsdecode(fstype),
+                os.fsdecode(source),
+                os.fsdecode(options),
+            )
+        )
+    return found
+
+
+def mount_table(pid: int | str = "self") -> list[Mount]:
+    """The mounts ``pid`` sees."""
+    return mounts(Path(f"/proc/{pid}/mountinfo").read_bytes())
+
+
+def _path(field: bytes) -> str:
+    return os.fsdecode(re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), field))

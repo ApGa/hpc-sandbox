@@ -109,6 +109,7 @@ _DELETIONS: set[Path] = set()
 _DELETION_BACKLOG = 16
 _DETACH_TIMEOUT_S = 30.0
 _HOLD_WAIT_S = 2.0
+_NODE_SWEEP_TIMEOUT_S = 60.0  # a start waits for its provider's first sweep: never for long
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROBE_SCRIPT = """\
 set -e
@@ -421,7 +422,10 @@ class SessionProvider(Generic[S]):
 
     async def _node_errors(self) -> list[str]:
         try:
-            return await self._sweep_node()
+            async with asyncio.timeout(_NODE_SWEEP_TIMEOUT_S):
+                return await self._sweep_node()
+        except TimeoutError:
+            return [f"the node's sweep took more than {_NODE_SWEEP_TIMEOUT_S:g} s; left for now"]
         except Exception as error:  # noqa: BLE001 - never fatal to a start or a reap
             return [f"could not sweep the node: {error!r}"]
 
