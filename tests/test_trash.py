@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -18,8 +19,10 @@ from test_janitor import crashed_sandboxes
 
 from hpc_sandbox import SandboxSpec, sessions
 from hpc_sandbox import sandbox as sandbox_module
+from hpc_sandbox import singularity as singularity_module
 from hpc_sandbox.sandbox import _DELETIONS
 from hpc_sandbox.sessions import JANITOR_LOCK, TRASH_DIR, remove_tree
+from hpc_sandbox.singularity import CONTROL_LOCK
 
 
 def janitor_lock_held(root: Path) -> bool:
@@ -344,3 +347,87 @@ def test_trees_deeper_than_python_recurses_are_removed(tmp_path):
     os.close(parent)
     remove_tree(tree)
     assert not tree.exists()
+
+
+def dead_trash(provider, *letters: str) -> list[Path]:
+    """Trash entries left by a process that died."""
+    trash = provider.session_root / TRASH_DIR
+    entries = [trash / f"hpcsb-{letter * 32}.999999999-1.abcdef12" for letter in letters]
+    for entry in entries:
+        (entry / "rootfs").mkdir(parents=True)
+    return entries
+
+
+async def test_a_cancelled_reap_lets_go_of_what_it_claimed(tmp_path, fake_runtime, monkeypatch):
+    provider = make_provider(tmp_path)
+    dead_trash(provider, "a", "b", "c")
+    started, original = asyncio.Event(), sessions.delete_tree
+
+    async def stuck(path: Path) -> None:
+        started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(sessions, "delete_tree", stuck)
+    reaping = asyncio.ensure_future(provider.reap())
+    await started.wait()
+    reaping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reaping
+    monkeypatch.setattr(sessions, "delete_tree", original)
+    monkeypatch.setattr(sessions, "TRASH_GRACE_S", 0.0)  # this process moved them, and lives on
+    report = await provider.reap()
+    assert report.errors == []
+    assert list((provider.session_root / TRASH_DIR).glob("hpcsb-*")) == []
+
+
+async def test_a_sweep_takes_so_many_dead_trash_entries_at_a_time(
+    tmp_path, fake_runtime, monkeypatch
+):
+    monkeypatch.setattr(sessions, "_CLAIMS_PER_SWEEP", 2)
+    provider = make_provider(tmp_path)
+    dead_trash(provider, "a", "b", "c", "d", "e")
+    left = []
+    for _ in range(3):
+        assert (await provider.reap()).errors == []
+        left.append(len(list((provider.session_root / TRASH_DIR).glob("hpcsb-*"))))
+    assert left == [3, 1, 0]
+
+
+async def test_a_stop_takes_its_trash_entry_from_a_janitor_probing_it(
+    tmp_path, sif, fake_runtime, monkeypatch
+):
+    provider = make_provider(tmp_path)
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    original, calls = sandbox_module.hold_trash_entry, []
+
+    def probed(entry: Path) -> int | None:
+        calls.append(entry)
+        return None if len(calls) == 1 else original(entry)  # a janitor holds it, for an instant
+
+    monkeypatch.setattr(sandbox_module, "hold_trash_entry", probed)
+    await sandbox.stop()
+    assert await provider.wait_for_deletions(30)
+    assert list((provider.session_root / TRASH_DIR).glob("hpcsb-*")) == [] and len(calls) > 1
+
+
+async def test_a_janitor_clears_a_session_whose_instance_never_started_on_a_full_scratch(
+    tmp_path, fake_runtime, monkeypatch
+):
+    provider = make_provider(tmp_path)
+    session = sessions.open_session(provider.session_root, sessions.new_instance_name())
+    session.write_owner_record(provider="singularity", labels={})
+    record = json.loads((session.path / "owner.json").read_text())
+    record["owner_start_time"] = "0"  # its owner died while extracting
+    (session.path / "owner.json").write_text(json.dumps(record))
+    session.release()
+    original = singularity_module.locked
+
+    def full(path: Path, **options):  # no room for a new file, such as its control lock
+        if path.name == CONTROL_LOCK and not path.exists():
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(path))
+        return original(path, **options)
+
+    monkeypatch.setattr(singularity_module, "locked", full)
+    report = await provider.reap()
+    assert (report.removed, report.errors) == ([session.name], [])
+    assert await provider.wait_for_deletions(30) and not session.path.exists()

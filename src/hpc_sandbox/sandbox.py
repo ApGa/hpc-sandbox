@@ -108,6 +108,7 @@ _DELETIONS: set[Path] = set()
 # lowest priority one at a time fall behind the starts, and the trash would grow without bound.
 _DELETION_BACKLOG = 16
 _DETACH_TIMEOUT_S = 30.0
+_HOLD_WAIT_S = 2.0
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROBE_SCRIPT = """\
 set -e
@@ -193,6 +194,18 @@ async def _detach_deletion(path: Path, held: int) -> None:
     except TimeoutError:
         log.warning("hpc-sandbox: deleting %s did not start within %s s", path, _DETACH_TIMEOUT_S)
     _DELETIONS.add(path)
+
+
+async def _hold_moved(path: Path) -> int | None:
+    """The lock of a trash entry this process just moved: a janitor's probe may hold it for an
+    instant, and only a janitor that claimed the entry moves it on."""
+    deadline = time.monotonic() + _HOLD_WAIT_S
+    while (held := hold_trash_entry(path)) is None and os.path.lexists(path):
+        if time.monotonic() > deadline:
+            log.warning("hpc-sandbox: could not take %s; another process holds it", path)
+            return None
+        await asyncio.sleep(0.02)
+    return held
 
 
 async def _delete_here(path: Path, held: int) -> None:
@@ -431,9 +444,11 @@ class SessionProvider(Generic[S]):
         many of this process's deletions are pending, the caller waits for an ``rm`` of its own, at its own
         priority."""
         _DELETIONS.difference_update([done for done in list(_DELETIONS) if _deleted(done)])
-        held = hold_trash_entry(path)
+        held = await _hold_moved(path)
         if held is None:
-            return  # gone, or another deletion has it
+            if os.path.lexists(path):
+                _DELETIONS.add(path)  # another deletion has it: wait_for_deletions waits for it too
+            return
         if len(_DELETIONS) >= _DELETION_BACKLOG:
             await asyncio.shield(_delete_here(path, held))
         else:

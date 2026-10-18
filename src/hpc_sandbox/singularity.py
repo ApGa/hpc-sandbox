@@ -351,7 +351,10 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
         if record is not None and record.get("instance_pid_file") != str(path / PID_FILE):
             record = None
-        async with locked(path / CONTROL_LOCK):
+        # Starts take the control lock before an instance; without one (nothing started, and a
+        # full scratch has no room to create it), nothing can be starting one now either.
+        control = (path / CONTROL_LOCK).exists()
+        async with locked(path / CONTROL_LOCK) if control else contextlib.nullcontext():
             if record is None and await self.runtime.instance_record(path.name) is not None:
                 raise SandboxError("instance is running but its owner record is not bound to it")
             expected_pid = record.get("instance_pid") if record else None
