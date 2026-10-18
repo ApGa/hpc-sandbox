@@ -28,9 +28,10 @@ therefore built around one long-lived ``enroot start``:
   and only the standard hooks sandboxes need. The home directory is not
   mounted (``ENROOT_MOUNT_HOME=no``; an empty value would fall back to the
   site default), the login shell and user-level enroot configuration are
-  skipped, the NVIDIA and Mellanox hooks stay off unless GPUs are requested,
-  and batch-job variables do not reach hooks. ``/tmp`` and ``/var/tmp`` are
-  session-private directories and ``/dev/shm`` is a private tmpfs.
+  skipped, the NVIDIA hook acts only when ``gpus`` is set, the Mellanox hook
+  never runs, and batch-job variables do not reach hooks. ``/tmp`` and
+  ``/var/tmp`` are session-private directories and ``/dev/shm`` is a private
+  tmpfs.
 - **Restores** start from files that code in the sandbox wrote, so enroot
   must not act on them from the host: its ``/etc/fstab`` and
   ``/etc/environment`` are set aside while the container starts, hooks that
@@ -152,7 +153,7 @@ devpts       /dev/pts     devpts  x-create=dir,rw,nosuid,noexec,newinstance,ptmx
 tmpfs        /var/run     tmpfs   x-create=dir,rw,nosuid,nodev,mode=755,slave       0 -1
 tmpfs        /var/lock    tmpfs   x-create=dir,rw,nosuid,nodev,mode=755,slave       0 -1
 /etc/hosts   /etc/hosts   none    x-create=file,bind,ro,nosuid,nodev,noexec,private 0 -1
-"""
+"""  # noqa: E501 - an fstab line cannot be wrapped
 # The symlinks of the minimal /dev, created after the mounts above.
 DEV_LINKS_HOOK = """\
 #!/bin/sh
@@ -725,7 +726,7 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         self._sysconf: asyncio.Future[None] | None = None
 
     def _session_roots(self) -> list[tuple[Path, bool]]:
-        # Earlier versions kept enroot sessions in the Singularity provider's
+        # hpc-sandbox 0.1.0 kept enroot sessions in the Singularity provider's
         # directory: sweep the ones recognizably ours there too, and those
         # nobody can tell apart when no Singularity janitor could take them.
         singularity = any(shutil.which(binary) for binary in RUNTIME_CANDIDATES)

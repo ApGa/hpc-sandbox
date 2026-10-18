@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import make_provider
 
+from conftest import make_provider
 from hpc_sandbox import SandboxSpec, procfs
 from hpc_sandbox.singularity import TEMPLATE_DIR, TEMPLATE_MARKER
 
@@ -33,7 +33,8 @@ async def test_sandboxes_of_one_image_share_one_extraction(tmp_path, sif, fake_r
             assert (await other.exec("test -e new.txt")).exit_code != 0
         assert (templates[0] / "rootfs" / "app" / "hello.txt").read_text() == "hello\n"
         assert not (templates[0] / "rootfs" / "app" / "new.txt").exists()
-        # The image's root-private build cache became owner-writable once, in the template, and stays so.
+        # The image's root-private build cache became owner-writable once, in the template, and
+        # stays so.
         assert os.access(first.session_dir / "rootfs" / "private-cache", os.W_OK)
     finally:
         await asyncio.gather(*(sandbox.stop() for sandbox in [first, *others]))
@@ -99,7 +100,8 @@ def dead_pid() -> int:
 
 
 def rewrite_in_place(path: Path, old: bytes, new: bytes) -> None:
-    """Rewrite ``path`` keeping its inode, size and mtime, as ``cp -p`` or ``rsync -t`` over it may."""
+    """Rewrite ``path`` keeping its inode, size and mtime, as ``cp -p`` or ``rsync -t`` over it
+    may."""
     before = path.stat()
     with open(path, "r+b") as stream:
         content = stream.read()
@@ -126,7 +128,10 @@ async def test_janitors_delete_extractions_of_dead_processes_that_no_overlay_use
     for path in (abandoned, used, mine):
         (path / "rootfs" / "etc").mkdir(parents=True)
     # A fuse-overlayfs holding the directory open, as one keeps its lower layer.
-    holder = "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print(1, flush=True); time.sleep(60)"
+    holder = (
+        "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print(1, flush=True); "
+        "time.sleep(60)"
+    )
     overlay = await asyncio.create_subprocess_exec(
         "bash",
         "-c",
@@ -166,7 +171,10 @@ async def test_a_damaged_template_goes_once_no_overlay_uses_it(tmp_path, sif, fa
     (template,) = [path for path in root.iterdir() if path.is_dir()]
     (template / TEMPLATE_MARKER).unlink()
     # A fuse-overlayfs still has it as its lower layer when it is moved aside.
-    holder = "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print(1, flush=True); time.sleep(60)"
+    holder = (
+        "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print(1, flush=True); "
+        "time.sleep(60)"
+    )
     overlay = await asyncio.create_subprocess_exec(
         "bash",
         "-c",

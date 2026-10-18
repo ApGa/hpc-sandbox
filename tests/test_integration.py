@@ -126,15 +126,16 @@ async def test_snapshot_and_restore(provider):
     await provider.delete_snapshot(snapshot)
 
 
-# Every path of the root filesystem (but the kernel's and the private tmp dirs) with its mode and type, the size
-# and link target of what is not a directory (a directory's size depends on how it was built), and the contents of
-# the files the change below writes: busybox's find, stat and xargs suffice.
+# Every path of the root filesystem (but the kernel's and the private tmp dirs) with its mode and
+# type, the size and link target of what is not a directory (a directory's size depends on how it
+# was built), and the contents of the files the change below writes: busybox's find, stat and xargs
+# suffice.
 FINGERPRINT = r"""
 skip='( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /run )'
 find / -xdev $skip -prune -o -type d -print | sort | tr '\n' '\0' | xargs -0 stat -c '%n %a %F'
 find / -xdev $skip -prune -o ! -type d -print | sort | tr '\n' '\0' | xargs -0 stat -c '%n %a %F %s %N'
 cat /etc/hpc-probe /app/delta/f1 /app/delta/f2 2>&1
-"""
+"""  # noqa: E501 - a shell script, kept on one line per command
 CHANGE = r"""
 set -e
 mkdir -p /app/delta
@@ -149,8 +150,9 @@ rm -rf "$3" && mkdir "$3" && echo only > "$3/only"   # one replaced by a new one
 
 
 async def test_a_restore_shows_what_the_sandbox_deleted_renamed_and_replaced(provider):
-    """Whatever the layout keeps of a sandbox (a copy of its rootfs, or what it wrote over the image), a restore
-    shows exactly its files: image directories deleted, renamed and replaced, links, a FIFO and modes."""
+    """Whatever the layout keeps of a sandbox (a copy of its rootfs, or what it wrote over the
+    image), a restore shows exactly its files: image directories deleted, renamed and replaced,
+    links, a FIFO and modes."""
     spec = SandboxSpec(image=IMAGE)
     sandbox = await provider.start(spec)
     changed = await sandbox.exec(CHANGE)
@@ -414,7 +416,7 @@ echo "pool exit $?"
 for p in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < "$p" 2>/dev/null; echo; done |
     grep -c "tail -c 50000000 $" | sed 's/^/harness tails: /'
 kill "$harness"
-"""
+"""  # noqa: E501 - a shell script, kept on one line per command
 
 
 # A pool that is the command itself: it dies whole, with the command.

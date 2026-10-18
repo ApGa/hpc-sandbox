@@ -92,12 +92,13 @@ TRANSFER_DIR = ".hpc-sandbox-transfer"
 # How long removing a transfer's files may take: code in the sandbox can keep
 # refilling them, and the session's removal takes care of what is left.
 _TRANSFER_CLEANUP_S = 60.0
-# sh -c _DETACH DELETE_SCRIPT TREE LOG QUEUE: start TREE's deletion in the background and return at once; the
-# deletion is reparented to init. It inherits two open descriptors: TREE's, whose lock the caller took (janitors leave
-# a held entry alone) and which it keeps until it ends, and, if one could be opened, the descriptor QUEUE of the
-# session root's deletion lock. Deletions of one root run one at a time behind that lock and at the lowest CPU
-# priority: in parallel they slowed starts, whose extractions or copies create the metadata the deletions remove.
-# Errors go to the caller's stderr: LOG, which the deletion removes when it succeeds, or nowhere. Each path stays
+# sh -c _DETACH DELETE_SCRIPT TREE LOG QUEUE: start TREE's deletion in the background and return
+# at once; the deletion is reparented to init. It inherits two open descriptors: TREE's, whose lock
+# the caller took (janitors leave a held entry alone) and which it keeps until it ends, and, if one
+# could be opened, the descriptor QUEUE of the session root's deletion lock. Deletions of one root
+# run one at a time behind that lock and at the lowest CPU priority: in parallel they slowed
+# starts, whose extractions or copies create the metadata the deletions remove. Errors go to the
+# caller's stderr: LOG, which the deletion removes when it succeeds, or nowhere. Each path stays
 # one argument, whatever characters it holds.
 _DETACH = (
     '( if [ -n "$3" ] && command -v flock >/dev/null 2>&1; then flock "$3"; fi; '
@@ -105,8 +106,9 @@ _DETACH = (
 )
 # Trash entries this process started deleting (wait_for_deletions).
 _DELETIONS: set[Path] = set()
-# With this many of its deletions pending, a process deletes what it stops itself: under CPU load, deletions at the
-# lowest priority one at a time fall behind the starts, and the trash would grow without bound.
+# With this many of its deletions pending, a process deletes what it stops itself: under CPU load,
+# deletions at the lowest priority one at a time fall behind the starts, and the trash would grow
+# without bound.
 _DELETION_BACKLOG = 16
 _DETACH_TIMEOUT_S = 30.0
 _HOLD_WAIT_S = 2.0
@@ -155,7 +157,8 @@ def _deleted(path: Path) -> bool:
 
 
 async def _detach_deletion(path: Path, held: int) -> None:
-    """Hand the trash entry ``path``, and ``held``, its locked descriptor, to a detached deletion."""
+    """Hand the trash entry ``path``, and ``held``, its locked descriptor, to a detached
+    deletion."""
     log_path: Path | None = _deletion_log(path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
@@ -435,7 +438,8 @@ class SessionProvider(Generic[S]):
             return [f"could not sweep the node: {error!r}"]
 
     async def wait_for_deletions(self, timeout_s: float = 300.0) -> bool:
-        """Wait until the session files of the sandboxes this process stopped are deleted; False on timeout."""
+        """Wait until the session files of the sandboxes this process stopped are deleted; False on
+        timeout."""
         deadline = time.monotonic() + timeout_s
         while _DELETIONS:
             _DELETIONS.difference_update([path for path in list(_DELETIONS) if _deleted(path)])
@@ -447,11 +451,11 @@ class SessionProvider(Generic[S]):
         return True
 
     async def _delete_in_background(self, path: Path) -> None:
-        """Delete a trash entry with ``rm`` in a detached process, so that a stop returns once its session left the
-        session root, and the deletion holds no lock, worker thread or GIL here. The process outlives this one if
-        need be; if it is killed, a janitor finishes the deletion. A cancelled caller still starts it. While too
-        many of this process's deletions are pending, the caller waits for an ``rm`` of its own, at its own
-        priority."""
+        """Delete a trash entry with ``rm`` in a detached process, so that a stop returns once its
+        session left the session root, and the deletion holds no lock, worker thread or GIL here.
+        The process outlives this one if need be; if it is killed, a janitor finishes the deletion.
+        A cancelled caller still starts it. While too many of this process's deletions are pending,
+        the caller waits for an ``rm`` of its own, at its own priority."""
         _DELETIONS.difference_update([done for done in list(_DELETIONS) if _deleted(done)])
         held = await _hold_moved(path)
         if held is None:
@@ -555,9 +559,9 @@ class SessionProvider(Generic[S]):
 
         It sweeps at the provider's first start that finds no other process
         holding the janitor lock of its session roots: a start never waits for
-        that lock. With a provider per rollout and hundreds of rollouts starting
-        on one node, each start's sweep queued behind the other sweeps and
-        behind every session opened and stopped meanwhile.
+        that lock. When many providers start sandboxes on one node at once,
+        waiting for it would queue each start's sweep behind the other sweeps
+        and behind every session opened and stopped meanwhile.
         """
         swept = True
         for root, claim_unknown, stop in self._swept_roots():
@@ -838,8 +842,8 @@ class SessionSandbox:
         """Make the rootfs copyable before a snapshot; runs in a worker thread."""
 
     async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
-        """Copy the root filesystem into the snapshot directory ``target``; returns the snapshot's format and the
-        metadata a restore needs.  The whole rootfs, by default."""
+        """Copy the root filesystem into the snapshot directory ``target``; returns the snapshot's
+        format and the metadata a restore needs.  The whole rootfs, by default."""
         assert self._session is not None
         await self._provider.copy_tree(self._session.rootfs, target / "rootfs")
         return SNAPSHOT_FORMAT, {}
@@ -1081,7 +1085,8 @@ class SessionSandbox:
         self._session = None  # only now: a stop() after a failed one retries
 
     async def _discard(self, session: Session) -> None:
-        """Take a stopped session out of the session root at once; its files go in the background."""
+        """Take a stopped session out of the session root at once; its files go in the
+        background."""
         doomed = await trash_session_awaiting(session)
         if doomed is not None:
             await self._provider._delete_in_background(doomed)

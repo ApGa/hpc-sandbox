@@ -9,8 +9,8 @@ import stat
 from pathlib import Path
 
 import pytest
-from conftest import make_provider
 
+from conftest import make_provider
 from hpc_sandbox import (
     Mount,
     Sandbox,

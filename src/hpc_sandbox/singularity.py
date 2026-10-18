@@ -102,10 +102,11 @@ OVERLAY_DIR = (
 OVERLAY_RECORD = (
     "fuse-overlay.json"  # <session>/fuse-overlay.json: the mount, for teardown and janitors
 )
-#: A snapshot of a fuse-overlay sandbox: its upper layer (``upper/``), and the template it lies over (``lower``).
+#: A snapshot of a fuse-overlay sandbox: its upper layer (``upper/``), and the template it lies over
+#: (``lower``).
 OVERLAY_SNAPSHOT_FORMAT = "hpc-sandbox/fuse-overlay-v1"
-# The type a fuse-overlayfs mount has in the mount table, the name of its daemon, and where a session's (or its
-# trash entry's) rootfs lies.
+# The type a fuse-overlayfs mount has in the mount table, the name of its daemon, and where a
+# session's (or its trash entry's) rootfs lies.
 OVERLAY_FSTYPE = "fuse.fuse-overlayfs"
 OVERLAY_DAEMON = "fuse-overlayfs"
 _SESSION_ROOTFS = re.compile(r".*/hpcsb-[0-9a-f]{32}(\.[0-9]+-[0-9]+\.[0-9a-f]{8})?/rootfs")
@@ -219,9 +220,10 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             if conflict:  # a site-wide default this provider cannot take
                 layout = "copy"
         self.rootfs_layout = layout
-        # A copy of a template creates as many inodes as an extraction: on XFS, 64-128 copies at once took longer
-        # than 64-128 extractions (reflinks update refcounts too), so the copy layout extracts per sandbox unless
-        # asked; the fuse-overlay layout needs the template as its lower layer.
+        # A copy of a template creates as many inodes as an extraction: on XFS, 64-128 copies at
+        # once took longer than 64-128 extractions (reflinks update refcounts too), so the copy
+        # layout extracts per sandbox unless asked; the fuse-overlay layout needs the template as
+        # its lower layer.
         self.rootfs_templates = (
             layout == "fuse-overlay" if rootfs_templates is None else rootfs_templates
         )
@@ -246,8 +248,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         await self.copy_tree(await self._rootfs_template(image), session.rootfs)
 
     async def restore(self, snapshot: SandboxSnapshot, spec: Any) -> SingularitySandbox:
-        """Start a sandbox for ``spec`` whose files come from ``snapshot``; a fuse-overlay sandbox's snapshot
-        (its upper layer) is mounted over the template it was taken over, with a copy of that upper layer."""
+        """Start a sandbox for ``spec`` whose files come from ``snapshot``; a fuse-overlay sandbox's
+        snapshot (its upper layer) is mounted over the template it was taken over, with a copy of
+        that upper layer."""
         if snapshot.metadata.get("format") != OVERLAY_SNAPSHOT_FORMAT:
             return await super().restore(snapshot, spec)
         self._check(spec)
@@ -256,7 +259,8 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             raise ValueError(f"snapshot {snapshot.id} is of {snapshot.image!r}, not {spec.image!r}")
         if self.rootfs_layout != "fuse-overlay":
             raise ValueError(
-                f"snapshot {snapshot.id} is of a fuse-overlay sandbox; restore it with rootfs_layout='fuse-overlay'"
+                f"snapshot {snapshot.id} is of a fuse-overlay sandbox; "
+                "restore it with rootfs_layout='fuse-overlay'"
             )
         lower = self._snapshot_lower(snapshot)
         await self._prepare()
@@ -265,7 +269,8 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         )
 
     def _snapshot_lower(self, snapshot: SandboxSnapshot) -> Path:
-        """The template a fuse-overlay snapshot lies over: one of this node's complete templates, or ValueError."""
+        """The template a fuse-overlay snapshot lies over: one of this node's complete templates, or
+        ValueError."""
         lower = Path(str(snapshot.metadata.get("lower", "")))
         templates = self.scratch_root / TEMPLATE_DIR
         if (
@@ -274,8 +279,8 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             or not _template_ready(lower.parent)
         ):
             raise ValueError(
-                f"snapshot {snapshot.id} lies over {str(lower)!r}, which is not a template of this node "
-                f"(in {templates})"
+                f"snapshot {snapshot.id} lies over {str(lower)!r}, which is not a template of this "
+                f"node (in {templates})"
             )
         return lower
 
@@ -403,8 +408,8 @@ class SingularitySandbox(SessionSandbox):
         return self._instance_pid
 
     async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
-        """A fuse-overlay sandbox's snapshot is its upper layer, what it wrote over the node's template (which
-        never changes); a copy-layout sandbox's is its whole rootfs."""
+        """A fuse-overlay sandbox's snapshot is its upper layer, what it wrote over the node's
+        template (which never changes); a copy-layout sandbox's is its whole rootfs."""
         assert self._session is not None
         record_path = self._session.path / OVERLAY_RECORD
         if not record_path.exists():
@@ -593,9 +598,9 @@ def _fusermount() -> str:
 async def mount_overlay(
     template: Path, session: Session, *, timeout_s: float, upper_exists: bool = False
 ) -> None:
-    """Mount ``session.rootfs`` as a fuse-overlayfs of ``template`` (read-only lower layer) and the session's own
-    ``overlay/upper``, new or (``upper_exists``, a restore) already filled.  The record is written first, so a
-    teardown or a janitor unmounts whatever may be mounted."""
+    """Mount ``session.rootfs`` as a fuse-overlayfs of ``template`` (read-only lower layer) and the
+    session's own ``overlay/upper``, new or (``upper_exists``, a restore) already filled.  The
+    record is written first, so a teardown or a janitor unmounts whatever may be mounted."""
     mount, _ = _fuse_tools()
     overlay = session.path / OVERLAY_DIR
     upper, work = overlay / "upper", overlay / "work"
@@ -629,7 +634,8 @@ def _mounted(path: Path) -> bool:
 async def unmount_overlay(session_path: Path) -> bool:
     """Unmount a session's fuse-overlay rootfs, if it has one that is mounted; whether one was.
 
-    Raises :class:`SandboxError` if it stays mounted, so the session is kept rather than deleted through it."""
+    Raises :class:`SandboxError` if it stays mounted, so the session is kept rather than deleted
+    through it."""
     if not (session_path / OVERLAY_RECORD).exists():
         return False
     mountpoint = session_path / "rootfs"  # where mount_overlay mounts, whatever the record says
@@ -644,7 +650,8 @@ async def unmount_overlay(session_path: Path) -> bool:
 
 
 async def unmount_dead_overlays() -> list[str]:
-    """Unmount this user's session overlays whose fuse-overlayfs died, wherever they lie; returns errors.
+    """Unmount this user's session overlays whose fuse-overlayfs died, wherever they lie; returns
+    errors.
 
     A fuse-overlayfs killed with SIGKILL (a job or step whose processes Slurm
     kills, a crash) leaves its mount in the node's mount table, where it
@@ -674,7 +681,8 @@ async def unmount_dead_overlays() -> list[str]:
 
 
 def _unserved_overlays(mountinfo: str | bytes) -> list[str]:
-    """This user's session overlays that nobody's lease holds and no fuse-overlayfs of this user serves."""
+    """This user's session overlays that nobody's lease holds and no fuse-overlayfs of this user
+    serves."""
     mounts = procfs.mounts(mountinfo)
     owner = f"user_id={os.getuid()}"
     served_paths = _served_overlays()
@@ -756,12 +764,14 @@ def _overlay_layers() -> list[Path]:
 
 
 def _extraction_name(key: str) -> str:
-    """A name for an extraction of template ``key`` by this process, or a damaged template it moved aside."""
+    """A name for an extraction of template ``key`` by this process, or a damaged template it moved
+    aside."""
     return f".{key}.{os.getpid()}-{procfs.start_time(os.getpid())}.{uuid.uuid4().hex[:8]}"
 
 
 def _remove_abandoned_extractions(root: Path) -> list[str]:
-    """Delete the extractions in ``root`` whose process died, and the damaged templates; returns errors."""
+    """Delete the extractions in ``root`` whose process died, and the damaged templates; returns
+    errors."""
     try:
         names = [entry.name for entry in os.scandir(root)]
     except OSError:

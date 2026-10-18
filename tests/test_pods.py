@@ -21,9 +21,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import make_enroot_provider, make_provider, namespaces_unavailable
-from test_trash import janitor_lock_held
 
+from conftest import make_enroot_provider, make_provider, namespaces_unavailable
 from hpc_sandbox import SandboxSpec, sessions
 from hpc_sandbox.pods import check_pod, health_argv, hosts_file
 from hpc_sandbox.procfs import owned_live_start_time
@@ -35,6 +34,7 @@ from hpc_sandbox.types import (
     SandboxStartError,
     ServiceSpec,
 )
+from test_trash import janitor_lock_held
 
 PYTHON = "/usr/bin/python3"
 SERVER = textwrap.dedent(
@@ -52,7 +52,10 @@ SERVER = textwrap.dedent(
     http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
     """
 )
-FETCH = "import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode().strip())"
+FETCH = (
+    "import sys, urllib.request; "
+    "print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode().strip())"
+)
 pytestmark = pytest.mark.skipif(not Path(PYTHON).exists(), reason=f"needs {PYTHON}")
 
 
@@ -78,7 +81,8 @@ async def runtime(
 
 @pytest.fixture
 def gateway(tmp_path: Path) -> Iterator[Path]:
-    """A Unix socket answering HTTP, standing in for platoon's gateway."""
+    """A Unix socket answering HTTP, standing in for an upstream service on the host, such as a
+    model gateway."""
     path = tmp_path / "gw.sock"
     server = socket.socket(socket.AF_UNIX)
     server.bind(str(path))
@@ -576,7 +580,8 @@ async def test_egress_without_slirp4netns_fails_before_starting(runtime, monkeyp
     )
 
 
-# What the reviews of pods found, kept fixed.
+# Regression tests for pod edge cases: the upstream relays, service names, output and exit
+# statuses, limits, cancelled starts, sweeps, and stops.
 
 HALF_CLOSE = (
     "import socket, sys; s = socket.create_connection(('127.0.0.1', int(sys.argv[1])));"
@@ -654,7 +659,8 @@ async def test_output_goes_through_a_pipe(runtime):
         command=[
             "sh",
             "-c",
-            "echo before; echo err > /dev/stderr; head -c 300000 /dev/zero | tr '\\0' x; echo; echo after; exec sleep 600",
+            "echo before; echo err > /dev/stderr; head -c 300000 /dev/zero | tr '\\0' x; "
+            "echo; echo after; exec sleep 600",
         ],
         ulimits={"fsize": (100000, 100000)},  # files only; output is no file
     )
@@ -772,7 +778,10 @@ async def test_a_sweep_and_many_stops_do_not_wait_for_each_other(runtime, tmp_pa
         await asyncio.gather(provider.reap(), *(pod.stop() for pod in pods))
 
 
-HOG = "import time; data = bytearray(150 << 20); data[::4096] = b'x' * len(data[::4096]); time.sleep(600)"
+HOG = (
+    "import time; data = bytearray(150 << 20); data[::4096] = b'x' * len(data[::4096]); "
+    "time.sleep(600)"
+)
 
 
 async def test_the_watchdog_spares_the_runtime_between_the_init_and_the_service(runtime):

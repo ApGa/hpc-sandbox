@@ -149,7 +149,7 @@ async def test_caches_of_earlier_versions_are_used_without_pulling(
     old = await store(tmp_path / "old").resolve(uri)
     cache = tmp_path / "cache"
     cache.mkdir()
-    legacy = cache / f"{uri_key(uri)}.sif"  # how earlier versions cached an image
+    legacy = cache / f"{uri_key(uri)}.sif"  # how hpc-sandbox 0.1.0 cached an image
     legacy.write_bytes(old.path.read_bytes())
     legacy.chmod(0o444)
     if not linkable:  # another user's file under fs.protected_hardlinks

@@ -129,7 +129,8 @@ async def provider(tmp_path: Path, fake_runtime: FakeRuntime) -> AsyncIterator[S
 
 @pytest.fixture(autouse=True)
 def _background_deletions_finish() -> Iterator[None]:
-    """Stopped sandboxes are deleted in the background: let those deletions end within their test."""
+    """Stopped sandboxes are deleted in the background: let those deletions end within their
+    test."""
     yield
     deadline = time.monotonic() + 60
     while _DELETIONS and time.monotonic() < deadline:

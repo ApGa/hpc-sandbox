@@ -28,10 +28,13 @@ class Mount:
 class SandboxSpec:
     """What to start: an image plus the per-sandbox runtime settings.
 
-    ``image`` is a ``docker://`` (or other OCI/ORAS) reference, which is pulled
-    once into the image cache, or a local ``.sif`` path. ``cpus`` is advisory
-    unless the provider enables cgroup limits; ``memory_mb`` arms the PSS
-    watchdog. ``labels`` (rollout id, run, ...) select sandboxes for janitors.
+    ``image`` is a remote reference (``docker://repo:tag``, or another one the
+    runtime can pull), which is pulled once into the image cache, or a local
+    image file: ``.sif`` for Singularity/Apptainer, ``.sqsh`` for enroot. An
+    ``@sha256:<hex>`` suffix pins it: to a remote image's digest, or to a local
+    file's SHA-256. ``cpus`` is advisory unless the provider enables cgroup
+    limits; ``memory_mb`` arms the PSS watchdog. ``labels`` (a run, a task,
+    ...) select sandboxes for janitors.
     """
 
     image: str
@@ -251,4 +254,4 @@ class SandboxStartError(SandboxError):
 
 
 class SandboxLostError(SandboxError):
-    """The instance behind a running sandbox died."""
+    """The container behind a running sandbox died."""

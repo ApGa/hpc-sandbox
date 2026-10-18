@@ -64,12 +64,13 @@ _DELETE_TIMEOUT_S = 3600.0
 # A sweep holds at most this many trash entries at once, each by a descriptor until it is
 # deleted (see sweep()).
 _HELD_AT_ONCE = 64
-# How long after a trash entry was moved a janitor may take over its deletion while the process that moved it
-# lives, if no deletion holds it: that process may be about to start one.
+# How long after a trash entry was moved a janitor may take over its deletion while the process
+# that moved it lives, if no deletion holds it: that process may be about to start one.
 TRASH_GRACE_S = 60.0
-# sh -c DELETE_SCRIPT hpc-sandbox-delete TREE [LOG]: delete a trash entry as remove_tree does (refusing
-# directories this uid does not own, restoring owner access to directories first), without following links or
-# crossing into other mounts; LOG, where the caller sends its errors, is removed when it succeeds.
+# sh -c DELETE_SCRIPT hpc-sandbox-delete TREE [LOG]: delete a trash entry as remove_tree does
+# (refusing directories this uid does not own, restoring owner access to directories first),
+# without following links or crossing into other mounts; LOG, where the caller sends its errors, is
+# removed when it succeeds.
 DELETE_SCRIPT = r"""
 tree=$1; log=${2:-}
 foreign=$(find "$tree" -xdev -type d ! -uid "$(id -u)" -print 2>/dev/null | head -n 1)
@@ -191,8 +192,8 @@ def _owner_tag() -> str:
 
 
 def move_to_trash(path: Path, trash: Path | None = None) -> Path | None:
-    """Rename the session directory ``path`` (or a trash entry) into ``trash`` (default: the trash of the
-    session root ``path`` is in) under this process's tag; call with the janitor lock held.
+    """Rename the session directory ``path`` (or a trash entry) into ``trash`` (default: the trash
+    of the session root ``path`` is in) under this process's tag; call with the janitor lock held.
 
     Returns the new path, or None if ``path`` is gone.
     """
@@ -237,7 +238,7 @@ def _claim_dead_trash(root: Path, claimed: list[tuple[Path, int | None]], taken:
         if info.st_uid != os.getuid() or stat.S_ISLNK(info.st_mode):
             continue
         if not stat.S_ISDIR(info.st_mode):
-            entry.unlink(missing_ok=True)  # no session's: left where one was by older versions
+            entry.unlink(missing_ok=True)  # no session's: 0.3.0's development builds left some
             continue
         held = hold_trash_entry(entry)
         if held is None:

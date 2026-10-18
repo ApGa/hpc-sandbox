@@ -1,4 +1,5 @@
-"""Each instance starts and stops under its own control lock, so instances start and stop in parallel."""
+"""Each instance starts and stops under its own control lock, so instances start and stop in
+parallel."""
 
 from __future__ import annotations
 
@@ -6,7 +7,6 @@ import asyncio
 import time
 
 from conftest import make_provider
-
 from hpc_sandbox import SandboxSpec
 from hpc_sandbox.singularity import CONTROL_LOCK
 

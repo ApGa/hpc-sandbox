@@ -1,9 +1,9 @@
 """Stand-ins for ``fuse-overlayfs`` and ``fusermount3``, used by the unit tests.
 
-``fuse-overlayfs -o lowerdir=L,upperdir=U,workdir=W MOUNTPOINT`` copies L, then what U holds, into MOUNTPOINT (the
-fake singularity then runs commands on it as on any rootfs; what they write stays there, not in U) and records the
-mount; ``fusermount3 -u [-z] MOUNTPOINT`` drops the
-record. Every invocation is appended to $FAKE_SINGULARITY_STATE/fuse-calls.jsonl, and the mounts are files in
+``fuse-overlayfs -o lowerdir=L,upperdir=U,workdir=W MOUNTPOINT`` copies L, then what U holds, into
+MOUNTPOINT (the fake singularity then runs commands on it as on any rootfs; what they write stays
+there, not in U) and records the mount; ``fusermount3 -u [-z] MOUNTPOINT`` drops the record. Every
+invocation is appended to $FAKE_SINGULARITY_STATE/fuse-calls.jsonl, and the mounts are files in
 $FAKE_SINGULARITY_STATE/mounts/. FAKE_FUSE_MOUNT_FAILS=1 makes mounts fail.
 """
 
