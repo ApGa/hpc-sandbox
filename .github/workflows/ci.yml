@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Run pre-commit hooks
+        run: uvx pre-commit run --all-files --show-diff-on-failure
+
+  # The unit tests, with the fake runtimes of tests/ (CONTRIBUTING.md, "Run the tests"). The
+  # integration tests need a container runtime on a compute node, and skip here.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor. The tests of the enroot
+      # provider and of pods, and those that mount file systems in a namespace, would skip.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Check that unprivileged user namespaces work
+        run: unshare --user --map-root-user --mount --pid --ipc --net --fork true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: uv run pytest -v -ra
