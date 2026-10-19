@@ -11,8 +11,9 @@ any image hpc-sandbox can start that has the usual command-line tools of
 BusyBox or a distribution's base system works, including a local .sif or
 .sqsh). Scratch defaults to the job-local directory, as in real runs; with
 Singularity, set ``HPC_SANDBOX_TEST_NETWORK_NONE=1`` where the site allows
-network namespaces. On a GPU node, ``HPC_SANDBOX_TEST_GPUS`` (``all`` with
-enroot, ``nv`` or ``rocm`` with Singularity) checks GPU passthrough with an
+network namespaces, and ``HPC_SANDBOX_TEST_FAKEROOT=1`` where ``--fakeroot``
+works (the user has subordinate ids). On a GPU node, ``HPC_SANDBOX_TEST_GPUS``
+(``all`` with enroot, ``nv`` or ``rocm`` with Singularity) checks GPU passthrough with an
 image that has ``nvidia-smi`` or ``rocm-smi`` available through the runtime.
 """
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import hashlib
+import logging
 import os
 import shutil
 import sys
@@ -49,8 +51,27 @@ pytestmark = [
 IMAGE = os.environ.get("HPC_SANDBOX_TEST_IMAGE", "docker://alpine:3.20")
 RUNTIME = resolve_runtime(os.environ.get("HPC_SANDBOX_TEST_RUNTIME", "auto"))
 NETWORK_NONE = RUNTIME == "enroot" or os.environ.get("HPC_SANDBOX_TEST_NETWORK_NONE") == "1"
+FAKEROOT = RUNTIME != "enroot" and os.environ.get("HPC_SANDBOX_TEST_FAKEROOT") == "1"
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 enroot_only = pytest.mark.skipif(RUNTIME != "enroot", reason="enroot provider behavior")
+fakeroot_only = pytest.mark.skipif(
+    not FAKEROOT,
+    reason="set HPC_SANDBOX_TEST_FAKEROOT=1 where Singularity's --fakeroot works (subordinate ids)",
+)
+# Run as root of a --fakeroot sandbox: switch to nobody, and leave directories and files of other
+# users in the root filesystem, /tmp and /var/tmp, some in directories the caller cannot enter.
+LEAVE_OTHER_USERS_FILES = """
+set -e
+id -u
+mkdir -p /srv/left/deep /tmp/left /var/tmp/left
+echo x > /srv/left/deep/file
+echo x > /tmp/left/file
+echo x > /var/tmp/left/file
+chown -R 65534:65534 /srv/left /tmp/left /var/tmp/left
+chown 1000:1000 /tmp/left/file
+chmod 700 /srv/left /srv/left/deep /tmp/left
+su -s /bin/sh nobody -c 'id -u; mkdir /var/tmp/left/own && echo y > /var/tmp/left/own/file'
+"""
 
 
 def make_provider(scratch: Path) -> SessionProvider[Any]:
@@ -184,6 +205,84 @@ async def test_memory_watchdog_kills_the_hog_and_keeps_the_sandbox(provider):
     assert result.exit_code == 137, (result.stdout, result.stderr)
     assert "memory limit exceeded" in result.stderr
     assert (await sandbox.exec("echo alive")).stdout == "alive\n"
+
+
+@fakeroot_only
+async def test_fakeroot_sandboxes_switch_users_and_leave_nothing_behind(scratch, caplog):
+    provider = SingularityProvider(scratch_root=scratch, fakeroot=True)
+    sandbox = await provider.start(SandboxSpec(image=IMAGE))
+    session = sandbox.session_dir
+    assert session is not None
+    try:
+        result = await sandbox.exec(LEAVE_OTHER_USERS_FILES, timeout_s=120)
+        assert result.exit_code == 0, (result.stdout, result.stderr)
+        assert result.stdout.split() == ["0", "65534"]
+        for left in ("rootfs/srv/left", "tmp/left", "var-tmp/left"):
+            assert (session / left).lstat().st_uid != os.getuid()  # a subordinate id's
+    finally:
+        with caplog.at_level(logging.WARNING, logger="hpc_sandbox.singularity"):
+            await sandbox.stop()
+    assert "could not give back" not in caplog.text  # the image's find and chown did it all
+    assert await provider.wait_for_deletions(120)
+    assert not session.exists()
+    assert not any((provider.session_root / ".trash").iterdir())
+
+
+@fakeroot_only
+async def test_a_fakeroot_sandboxs_start_makes_a_missing_workdir_as_docker_does(scratch):
+    """Under a umask that keeps other users out, the working directory that the start makes, and
+    its missing parents, still let nobody in (755, as Docker's -w makes them); one the image has
+    keeps its mode (alpine's /root, 700)."""
+    provider = SingularityProvider(scratch_root=scratch, fakeroot=True)
+    found = []
+    previous = os.umask(0o027)
+    try:
+        for workdir in ("/hpcsb-work/deep", "/root"):
+            sandbox = await provider.start(SandboxSpec(image=IMAGE, workdir=workdir))
+            try:
+                result = await sandbox.exec(f"stat -c %a /hpcsb-work {workdir}")
+                found.append(result.stdout.split())
+            finally:
+                await sandbox.stop()
+    finally:
+        os.umask(previous)
+    assert found == [["755", "755"], ["700"]]
+    assert await provider.wait_for_deletions(120)
+    assert not any((provider.session_root / ".trash").iterdir())
+
+
+CRASH_FAKEROOT = """\
+import asyncio, os, signal, sys
+from hpc_sandbox import SandboxSpec, SingularityProvider
+
+async def main():
+    scratch, image, script = sys.argv[1:]
+    provider = SingularityProvider(scratch_root=scratch, fakeroot=True)
+    sandbox = await provider.start(SandboxSpec(image=image))
+    result = await sandbox.exec(script, timeout_s=120)
+    assert result.exit_code == 0, result.stderr
+    print(sandbox.id, flush=True)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+asyncio.run(main())
+"""
+
+
+@fakeroot_only
+async def test_janitor_leaves_nothing_of_an_abandoned_fakeroot_sandbox(scratch):
+    result = await run_process(
+        [sys.executable, "-c", CRASH_FAKEROOT, str(scratch), IMAGE, LEAVE_OTHER_USERS_FILES],
+        timeout_s=600,
+        env={**os.environ, "PYTHONPATH": SRC},
+    )
+    assert result.returncode == 137, result.detail()
+    (name,) = result.stdout.decode().split()
+    provider = SingularityProvider(scratch_root=scratch)  # any provider's janitor gives them back
+    report = await provider.reap()
+    assert report.removed == [name] and not report.errors, report
+    assert await provider.wait_for_deletions(120)
+    assert not (provider.session_root / name).exists()
+    assert not any((provider.session_root / ".trash").iterdir())
 
 
 CRASH = """\

@@ -598,6 +598,12 @@ def test_every_singularity_option_name_is_an_enroot_option():
     assert singularity <= set(inspect.signature(EnrootProvider).parameters)
 
 
+def test_fakeroot_is_refused_since_enroot_maps_only_the_callers_uid(tmp_path, fake_enroot):
+    make_enroot_provider(tmp_path, fakeroot=False)
+    with pytest.raises(ValueError, match="cannot switch users"):
+        make_enroot_provider(tmp_path, fakeroot=True)
+
+
 def test_rootfs_options_mean_the_copy_layout(tmp_path, fake_enroot, monkeypatch):
     # Singularity's site-wide default does not reach enroot.
     monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")

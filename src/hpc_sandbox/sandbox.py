@@ -114,8 +114,11 @@ _DETACH_TIMEOUT_S = 30.0
 _HOLD_WAIT_S = 2.0
 _NODE_SWEEP_TIMEOUT_S = 60.0  # a start waits for its provider's first sweep: never for long
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# sh -c _PROBE_SCRIPT hpc-sandbox WORKDIR MARKER UMASK: UMASK, when not empty, is the umask that a
+# working directory the image lacks, and its missing parents, are made with.
 _PROBE_SCRIPT = """\
 set -e
+if [ -n "$3" ]; then umask "$3"; fi
 mkdir -p -- "$1"
 mkdir -- "$2"
 rmdir -- "$2"
@@ -838,6 +841,11 @@ class SessionSandbox:
         """
         return {"remap_root": False, "container_uid": os.getuid()}
 
+    def _workdir_umask(self) -> str:
+        """The umask a working directory the image lacks is made with at the start, with its
+        missing parents, such as ``"022"``; empty for the caller's own."""
+        return ""
+
     def _prepare_snapshot(self) -> None:
         """Make the rootfs copyable before a snapshot; runs in a worker thread."""
 
@@ -932,9 +940,11 @@ class SessionSandbox:
         )
 
     async def _probe(self) -> None:
-        """Fail fast unless the rootfs and the workdir are writable."""
+        """Fail fast unless the rootfs and the workdir are writable; make the workdir if the image
+        lacks it (with :meth:`_workdir_umask`)."""
         marker = f"/.hpc-sandbox-probe-{uuid.uuid4().hex}"
-        argv = ["/bin/sh", "-c", _PROBE_SCRIPT, "hpc-sandbox", self.spec.workdir, marker]
+        umask = self._workdir_umask()
+        argv = ["/bin/sh", "-c", _PROBE_SCRIPT, "hpc-sandbox", self.spec.workdir, marker, umask]
         result = await self._run(argv, cwd="/", env={}, stdin=None, timeout_s=_PROBE_TIMEOUT_S)
         if result.exit_code != 0:
             raise SandboxStartError(

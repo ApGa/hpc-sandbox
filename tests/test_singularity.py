@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import signal
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,7 @@ from hpc_sandbox import (
     SingularityProvider,
 )
 from hpc_sandbox.procfs import owned_live_start_time
+from hpc_sandbox.singularity import RESTORE_OWNER_SCRIPT
 
 PYTHON = "/usr/bin/python3"
 
@@ -390,9 +393,122 @@ def test_unknown_schemes_and_bare_squashfs_names_are_refused(tmp_path, fake_runt
 def test_records_say_when_fakeroot_makes_commands_run_as_root(tmp_path, fake_runtime):
     from hpc_sandbox.singularity import SingularitySandbox
 
-    provider = make_provider(tmp_path, extra_start_args=["--fakeroot"])
-    sandbox = SingularitySandbox(provider, SandboxSpec(image="x.sif"))
-    assert sandbox._user() == {"remap_root": True, "container_uid": 0}
+    for options in ({"extra_start_args": ["--fakeroot"]}, {"fakeroot": True}):
+        provider = make_provider(tmp_path, **options)
+        sandbox = SingularitySandbox(provider, SandboxSpec(image="x.sif"))
+        assert sandbox._user() == {"remap_root": True, "container_uid": 0}
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"fakeroot": True},
+        {"extra_start_args": ["--fakeroot"]},
+        {"fakeroot": True, "extra_start_args": ["-f"]},
+    ],
+)
+async def test_a_fakeroot_sandbox_gives_back_what_other_users_left_once_it_stopped(
+    tmp_path, sif, fake_runtime, options
+):
+    provider = make_provider(tmp_path, **options)
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    session = sandbox.session_dir
+    assert session is not None
+    (start,) = fake_runtime.calls("instance", "start")
+    assert sum(arg in ("--fakeroot", "-f") for arg in start) == 1
+    await sandbox.stop()
+    calls = fake_runtime.calls()
+    stop = next(index for index, call in enumerate(calls) if call[:2] == ["instance", "stop"])
+    (restore,) = [index for index, call in enumerate(calls) if call[:2] == ["exec", "--fakeroot"]]
+    assert restore > stop  # once nothing runs that could write more
+    call = calls[restore]
+    assert call[-4:] == [str(session / "rootfs"), "/bin/sh", "-c", RESTORE_OWNER_SCRIPT]
+    assert option_values(call, "--bind") == [
+        f"{session}/tmp:/tmp:rw",
+        f"{session}/var-tmp:/var/tmp:rw",
+    ]
+    for flag in ("--cleanenv", "--containall", "--no-home", "--no-eval", "--writable"):
+        assert flag in call
+    assert option_values(call, "--no-mount") == ["home,cwd,bind-paths"]
+    assert await provider.wait_for_deletions(30) and not session.exists()
+
+
+async def test_a_sandbox_without_fakeroot_has_nothing_to_give_back(provider, sif, fake_runtime):
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    await sandbox.stop()
+    assert not fake_runtime.calls("exec", "--fakeroot")
+
+
+async def test_a_failed_give_back_is_logged_and_the_sandbox_still_stops(
+    tmp_path, sif, fake_runtime, monkeypatch, caplog
+):
+    monkeypatch.setenv("FAKE_SINGULARITY_FAKEROOT_FAILS", "1")
+    provider = make_provider(tmp_path, fakeroot=True)
+    sandbox = await provider.start(SandboxSpec(image=str(sif)))
+    session = sandbox.session_dir
+    with caplog.at_level(logging.WARNING, logger="hpc_sandbox.singularity"):
+        await sandbox.stop()
+    assert "could not give back the files other users of the --fakeroot sandbox" in caplog.text
+    # Here everything is the caller's anyway, so the session goes all the same.
+    assert session is not None and not session.exists()
+    assert await provider.wait_for_deletions(30)
+
+
+@pytest.mark.parametrize(("options", "mode"), [({"fakeroot": True}, 0o755), ({}, 0o750)])
+async def test_a_fakeroot_sandbox_makes_a_missing_workdir_as_docker_does(
+    tmp_path, sif, fake_runtime, options, mode
+):
+    """The other users of a --fakeroot sandbox must be able to enter the working directory that
+    the start makes: it and its missing parents get mode 755 whatever the caller's umask, as
+    Docker's -w makes them. Other sandboxes make it with the caller's umask, and the start leaves
+    a directory the image has as it is."""
+    previous = os.umask(0o027)
+    try:
+        sandbox = await make_provider(tmp_path, **options).start(
+            SandboxSpec(image=str(sif), workdir="/srv/work/deep")
+        )
+    finally:
+        os.umask(previous)
+    try:
+        assert sandbox.session_dir is not None
+        rootfs = sandbox.session_dir / "rootfs"
+        made = [rootfs / "srv", rootfs / "srv" / "work", rootfs / "srv" / "work" / "deep"]
+        assert [stat.S_IMODE(path.stat().st_mode) for path in made] == [mode] * 3
+    finally:
+        await sandbox.stop()
+
+
+@pytest.mark.parametrize(("status", "expected"), [(0, 0), (1, 1)])
+def test_the_give_back_fails_when_find_does(tmp_path, status, expected):
+    """chown's failures on what the namespace does not map are expected and ignored, but find's
+    own (a find without -user, -group or -exec {} +) fail the give-back, which the stop then
+    logs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    find = bin_dir / "find"
+    find.write_text(
+        f'#!/bin/sh\necho "find $*" > "{tmp_path}/find.txt"\n'
+        f'[ {status} = 0 ] || echo "find: unrecognized: -user" >&2\nexit {status}\n'
+    )
+    find.chmod(0o755)
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    result = subprocess.run(
+        ["/bin/sh", "-c", RESTORE_OWNER_SCRIPT],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected, result.stderr
+    called = (tmp_path / "find.txt").read_text()
+    assert called.startswith("find / ") and "-xdev" in called and called.rstrip().endswith("{} +")
+
+
+def test_fakeroot_needs_the_copy_layout(tmp_path, fake_runtime, monkeypatch):
+    with pytest.raises(ValueError, match="--fakeroot need rootfs_layout='copy'"):
+        make_provider(tmp_path, rootfs_layout="fuse-overlay", fakeroot=True)
+    monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")
+    assert make_provider(tmp_path, fakeroot=True).rootfs_layout == "copy"
 
 
 async def test_commands_get_none_of_the_variables_singularity_passes_despite_cleanenv(

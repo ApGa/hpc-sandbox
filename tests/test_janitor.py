@@ -16,12 +16,14 @@ from hpc_sandbox.sessions import JANITOR_LOCK
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 CRASH = """\
-import asyncio, os, signal, sys
+import asyncio, json, os, signal, sys
 from hpc_sandbox import SandboxSpec, SingularityProvider
 
 async def main():
-    scratch, cache, image, *rollouts = sys.argv[1:]
-    provider = SingularityProvider(scratch_root=scratch, image_cache=cache, stage_images=False)
+    scratch, cache, image, options, *rollouts = sys.argv[1:]
+    provider = SingularityProvider(
+        scratch_root=scratch, image_cache=cache, stage_images=False, **json.loads(options)
+    )
     for rollout in rollouts:
         sandbox = await provider.start(SandboxSpec(image=image, labels={"rollout_id": rollout}))
         print(sandbox.id, flush=True)
@@ -31,8 +33,11 @@ asyncio.run(main())
 """
 
 
-async def crashed_sandboxes(tmp_path: Path, sif: Path, *rollouts: str) -> list[str]:
-    """Start sandboxes in a process that is then SIGKILLed, abandoning them."""
+async def crashed_sandboxes(
+    tmp_path: Path, sif: Path, *rollouts: str, **options: object
+) -> list[str]:
+    """Start sandboxes, of a provider with ``options``, in a process that is then SIGKILLed,
+    abandoning them."""
     result = await run_process(
         [
             sys.executable,
@@ -41,6 +46,7 @@ async def crashed_sandboxes(tmp_path: Path, sif: Path, *rollouts: str) -> list[s
             str(tmp_path / "scratch"),
             str(tmp_path / "cache"),
             str(sif),
+            json.dumps(options),
             *rollouts,
         ],
         timeout_s=60,
@@ -67,6 +73,24 @@ async def test_janitor_recovers_sessions_of_crashed_owners(tmp_path, sif, fake_r
     assert (report.stopped, report.removed, report.errors) == ([name], [name], [])
     assert owned_live_start_time(pid) is None
     assert not (provider.session_root / name).exists()
+    assert_scoped(fake_runtime)
+
+
+async def test_janitor_gives_back_what_an_abandoned_fakeroot_sandbox_left(
+    tmp_path, sif, fake_runtime
+):
+    """Its owner record says that the sandbox ran with --fakeroot, so once its instance is stopped
+    a --fakeroot container over its files gives back what other users left, as a stop does; an
+    abandoned sandbox that ran without --fakeroot has nothing to give back."""
+    (plain,) = await crashed_sandboxes(tmp_path, sif, "a")
+    report = await make_provider(tmp_path).reap()
+    assert report.removed == [plain] and not report.errors
+    assert not fake_runtime.calls("exec", "--fakeroot")
+    (fakeroot,) = await crashed_sandboxes(tmp_path, sif, "b", fakeroot=True)
+    report = await make_provider(tmp_path).reap()
+    assert report.removed == [fakeroot] and not report.errors
+    (call,) = fake_runtime.calls("exec", "--fakeroot")
+    assert any(arg.endswith(f"/{fakeroot}/rootfs") for arg in call)
     assert_scoped(fake_runtime)
 
 

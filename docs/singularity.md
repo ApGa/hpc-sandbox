@@ -3,7 +3,8 @@
 `SingularityProvider` runs each sandbox as one persistent Singularity CE or Apptainer instance,
 started from a writable root filesystem directory on node-local scratch. It works with the runtime
 installed setuid or in unprivileged user-namespace mode, and needs no `--fakeroot`,
-`--writable-tmpfs`, overlay image or loop device: commands run as your uid. Both runtimes share the
+`--writable-tmpfs`, overlay image or loop device: commands run as your uid, unless you ask for root
+with `fakeroot=True` ([Root in a sandbox](#root-in-a-sandbox)). Both runtimes share the
 command line used here, so this page writes `singularity` for either.
 [Architecture](architecture.md) describes what both providers share.
 
@@ -105,10 +106,41 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-GPUs (`gpu`), `cgroup_limits` and `--fakeroot` (in `extra_start_args`) need the copy layout, and the
-fuse-overlay layout needs templates. Giving `rootfs_layout="fuse-overlay"` together with one of
+GPUs (`gpu`), `cgroup_limits` and `fakeroot` need the copy layout, and the fuse-overlay layout needs
+templates. Giving `rootfs_layout="fuse-overlay"` together with one of
 them, or with `rootfs_templates=False`, raises `ValueError`; `HPC_SANDBOX_ROOTFS_LAYOUT` leaves such
 a provider on the copy layout. Pod services always get the copy layout.
+
+## Root in a sandbox
+
+Commands run as your uid. Some workloads need root and other users inside, as Docker gives them:
+a test harness that runs code it does not trust as `nobody`, so that the code cannot read the files
+it keeps for itself as root. `fakeroot=True` starts each instance with `--fakeroot`, on the copy
+layout: commands run as root of a user namespace that maps root to your uid and your subordinate
+ids, the ranges `/etc/subuid` and `/etc/subgid` give your user, to the uids and gids after it.
+Inside, root can switch to any of those users (`su`, `setpriv`, `chown`), and a process that did
+cannot become root again. Outside, root is your uid, and each other user is one of your subordinate
+ids: nothing gains a privilege on the host.
+
+| What | With `fakeroot=True` |
+|---|---|
+| Needs | the copy layout, and subordinate ids for your user, which `getsubids "$USER"` lists; the runtime maps them with its setuid starter or with `newuidmap` and `newgidmap` |
+| Owner record, snapshot metadata | `remap_root: true`, `container_uid: 0` |
+| Files that commands write as root | yours on the host, as without `fakeroot` |
+| Files that commands write as another user | your subordinate ids' on the host, which you cannot change or delete; given back to you when the sandbox stops (below) |
+| A working directory the image lacks | made at the start with its missing parents, mode 755 whatever your umask, as Docker's `-w` makes it, so that the other users can enter it; one the image has keeps its mode |
+| The memory watchdog, timeouts, `kill_tree` | as without it: the namespace is yours, so your processes may read and signal its other users' |
+
+Once such an instance has stopped, and before its session leaves the session root, a short
+`singularity exec --fakeroot --containall --writable` over the session's root filesystem, with its
+private `/tmp` and `/var/tmp` bound, makes root, your uid, the owner of everything another user of
+the namespace owns there (`find / /tmp /var/tmp -xdev ... -exec chown -h 0:0`). `chown` fails, and
+is meant to, on what the namespace does not map, such as the mount points of `/proc`, `/sys` and
+`/dev`. The session is then deleted as any other. A janitor does the same for an abandoned session
+whose owner record says it ran with `fakeroot`, once it has stopped its instance. If that `exec`
+fails (an image without `find` or `chown`, or a `find` without `-user`, `-group` or `-exec {} +`),
+the stop logs a warning and goes on, and the deletion refuses the directories it could not give
+back, which then stay in the trash.
 
 ## Instances
 
@@ -138,11 +170,12 @@ Then it runs `singularity instance start` under the session's instance-control l
 | `--bind /etc/resolv.conf:/etc/resolv.conf:ro` | the host's resolver configuration, with host networking and `bind_resolv_conf` |
 | `--bind SRC:DST:ro` or `--bind SRC:DST:rw` | the spec's `mounts` |
 | `--net --network none` | `network="none"`, which needs `allow_network_none=True` |
+| `--fakeroot` | the `fakeroot` option, unless `extra_start_args` holds it already |
 | `--nv` or `--rocm` | the `gpu` option |
 | `--cpus`, `--memory` | the spec's `cpus` and `memory_mb`, with `cgroup_limits=True` |
 
 `extra_start_args` come next, then the root filesystem and the instance's name, which is the
-sandbox's `id`. The provider never adds `--fakeroot`. With `gpu="nv"`, it sets
+sandbox's `id`. The provider adds `--fakeroot` only with `fakeroot=True`. With `gpu="nv"`, it sets
 `NVIDIA_VISIBLE_DEVICES=all` for the start unless your environment sets it
 ([Site notes](#site-notes)).
 
@@ -237,10 +270,11 @@ Apptainer, it also prints the site settings that matter here: `allow setuid`, `a
   compute node, or the integration tests with `HPC_SANDBOX_TEST_NETWORK_NONE=1`
   ([Contributing](../CONTRIBUTING.md)). In unprivileged user-namespace mode, common with Apptainer,
   it normally works.
-- **No `--fakeroot`, no `--writable-tmpfs`.** Some sites force squashfuse for fakeroot overlays, and
-  the runtime then silently falls back to a read-only root filesystem; `sessiondir max size` often
-  caps a writable tmpfs at a few tens of MiB. Writable root filesystem directories on scratch avoid
-  both, and the start probes that the root filesystem is writable, so a regression fails loudly.
+- **No `--fakeroot` unless asked, no `--writable-tmpfs`.** Some sites force squashfuse for fakeroot
+  overlays, and the runtime then silently falls back to a read-only root filesystem; `sessiondir max
+  size` often caps a writable tmpfs at a few tens of MiB. Writable root filesystem directories on
+  scratch avoid both, `fakeroot=True` included, which starts the instance from such a directory too,
+  and the start probes that the root filesystem is writable, so a regression fails loudly.
 - **Instance metadata is per user, not per job.** Unprivileged instance records live below your home
   directory as the password database names it, and ignore `SINGULARITY_CONFIGDIR`, so every job of a
   user on a node sees the same instance list. Hence exact instance names, PID files and start-time

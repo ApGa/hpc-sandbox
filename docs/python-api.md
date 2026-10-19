@@ -86,7 +86,7 @@ sandbox has a session directory of its own.
 | Field | Default | Meaning |
 |---|---|---|
 | `image` | required | The image to start from; see [Image references](#image-references). |
-| `workdir` | `"/app"` | The working directory of commands, an absolute path. A start creates it when the image lacks it. |
+| `workdir` | `"/app"` | The working directory of commands, an absolute path. A start creates it when the image lacks it, with your umask, or with mode 755 in a `--fakeroot` sandbox ([Root in a sandbox](singularity.md#root-in-a-sandbox)). |
 | `env` | `{}` | Variables every command gets; see [Environment](#environment). |
 | `mounts` | `[]` | Host paths bound into the sandbox, as `Mount` objects; see [Mounts](#mounts). |
 | `network` | `"host"` | `"host"` shares the host's network. `"none"` gives the sandbox only a loopback interface, and needs the `network_none` capability. |

@@ -4,6 +4,39 @@ What each release of hpc-sandbox changes. Its version is below 1.0: a minor rele
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
 one minor release, require a range such as `hpc-sandbox>=0.3,<0.4`.
 
+## 0.4.0 (unreleased)
+
+### Changed behaviour
+
+- **A `--fakeroot` sandbox's start makes a missing working directory as Docker does**: the
+  directory and its missing parents get mode 755 whatever your umask, so that the sandbox's other
+  users can enter them. One that the image has keeps its mode. Before, a umask such as 027 made them
+  750, and a command that switched to another user could not enter its working directory. Sandboxes
+  without `--fakeroot` make it with your umask, as before. See
+  [Root in a sandbox](docs/singularity.md#root-in-a-sandbox).
+
+### Added
+
+- **`fakeroot=True` runs a Singularity sandbox's commands as root that can switch users**: it
+  starts the instance with `--fakeroot`, on the copy layout, so that root maps to your uid and your
+  subordinate ids (`/etc/subuid`, `/etc/subgid`) to the users after it. What commands write as
+  those other users belongs to your subordinate ids on the host, which you cannot delete: once the
+  instance has stopped, a `singularity exec --fakeroot` over the session's root filesystem, `/tmp`
+  and `/var/tmp` gives it back to your uid before the session is deleted, and a janitor does the
+  same for an abandoned session that ran so. `--fakeroot` in `extra_start_args` means the same.
+  `EnrootProvider` takes the name, as it takes every Singularity option, and raises `ValueError`
+  for `fakeroot=True`: enroot maps only your uid into a sandbox. See
+  [Root in a sandbox](docs/singularity.md#root-in-a-sandbox).
+
+### Fixed
+
+- **A sandbox started with `--fakeroot` in `extra_start_args` is deleted after it stops, also when
+  its commands wrote files as other users.** Those files belong to your subordinate ids on the host,
+  and the deletion refused every directory of theirs, so the whole session, its root filesystem copy
+  included, stayed in the trash, and every later janitor's sweep failed on it. They are now given
+  back to your uid first, as with `fakeroot=True`. See
+  [Root in a sandbox](docs/singularity.md#root-in-a-sandbox).
+
 ## 0.3.0 (2026-10-18)
 
 The first release on PyPI. It adds pods, a fuse-overlay root filesystem layout and per-node image
