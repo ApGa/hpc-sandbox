@@ -36,9 +36,12 @@ def test_the_prologue_takes_the_environment_from_the_first_line_of_stdin():
         {"GREETING": "it's $(not) run", "PATH": "/nowhere", "IFS": "x", "EUID": "7"},
         {"hpc_sandbox_nl": "mine", "GREETING": "it's\n$(not)\n\nrun\n"},
         {"GREETING": "hi", "BASHPID": "1", "LC_CTYPE": "no-such-locale", "LC_ALL": "nope"},
-        {"GREETING": "hi", "OPTIND": "not a number"},  # dash refuses it
+        {"GREETING": "hi", "OPTIND": "not a number"},  # dash and bash refuse it, busybox takes it
     )
-    command = ["/bin/sh", "-c", 'printf "%s|" "$GREETING"; exec /bin/cat']
+    # Each shell runs the command as well as the prologue, as an image's /bin/sh does: busybox
+    # exports an OPTIND that is no number, and dash, the /bin/sh of Debian and Ubuntu, refuses to
+    # start with one in its environment.
+    command = ["-c", 'printf "%s|" "$GREETING"; exec /bin/cat']
     bash = shutil.which("bash")
     shells = [["/bin/sh"], *([[bash], [bash, "--posix"]] if bash else [])]
     shells += [[shell] for shell in (shutil.which("dash"), shutil.which("busybox")) if shell]
@@ -47,7 +50,7 @@ def test_the_prologue_takes_the_environment_from_the_first_line_of_stdin():
     def run(
         shell: list[str], stdin: bytes | None, env: dict[str, str]
     ) -> subprocess.CompletedProcess:
-        argv = [*shell, *prologue(command, "/", stdin=stdin is not None)[1:]]
+        argv = [*shell, *prologue([*shell, *command], "/", stdin=stdin is not None)[1:]]
         return subprocess.run(
             argv, input=environment_script(env) + (stdin or b""), capture_output=True, check=False
         )
@@ -63,7 +66,7 @@ def test_the_prologue_takes_the_environment_from_the_first_line_of_stdin():
         null = [*shell, *prologue(["sh", "-c", "[ -c /proc/self/fd/0 ]"], "/", stdin=False)[1:]]
         assert subprocess.run(null, input=b"\n", check=False).returncode == 0, shell
         # Without an environment line, the command never starts.
-        argv = [*shell, *prologue(command, "/", stdin=True)[1:]]
+        argv = [*shell, *prologue([*shell, *command], "/", stdin=True)[1:]]
         result = subprocess.run(argv, input=b"", capture_output=True, check=False)
         assert result.returncode != 0 and START_MARKER.encode() not in result.stderr
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import hide_from_path
 from hpc_sandbox import SandboxSpec
 from hpc_sandbox.cli import main, resolve_runtime
 
@@ -78,7 +79,8 @@ def test_run_uses_enroot_when_asked(tmp_path, sqsh, fake_enroot, capsys):
 def test_doctor_checks_enroot_and_smoke_tests_an_image(
     tmp_path, sqsh, fake_enroot, capsys, monkeypatch
 ):
-    monkeypatch.setenv("HPC_SANDBOX_TOOLS", str(tmp_path / "no-tools"))
+    hide_from_path(monkeypatch, "slirp4netns")  # the host's
+    monkeypatch.setenv("HPC_SANDBOX_TOOLS", str(tmp_path / "no-tools"))  # and the pinned one
     arguments = ["doctor", "--runtime", "enroot", *common(tmp_path), "--image", str(sqsh)]
     assert main(arguments) == 0  # pods without egress are no failure
     output = capsys.readouterr().out

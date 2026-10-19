@@ -180,6 +180,9 @@ they ran on.
   network.
 - When a test needs something a machine may lack, such as a tool or a kernel feature, skip it with
   a reason that names what is missing, as the tests above do.
+- When a test needs a tool to be missing, hide it with `hide_from_path` (in `tests/conftest.py`)
+  rather than by shortening `PATH`: a host may keep the tool in `/usr/bin` too, as GitHub's runners
+  keep slirp4netns.
 
 ## Lint and format
 
