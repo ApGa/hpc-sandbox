@@ -2,9 +2,9 @@
 
 What each release of hpc-sandbox changes. Its version is below 1.0: a minor release (0.4.0) may
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
-one minor release, require a range such as `hpc-sandbox>=0.3,<0.4`.
+one minor release, require a range such as `hpc-sandbox>=0.4,<0.5`.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-19)
 
 ### Changed behaviour
 

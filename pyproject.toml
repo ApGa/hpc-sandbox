@@ -3,7 +3,7 @@ name = "hpc-sandbox"
 # The release version, set here and nowhere else: hpc_sandbox.__version__ and `hpc-sandbox --version`
 # read it from this file in a checkout and from the installed metadata otherwise (CONTRIBUTING.md,
 # "Release a version").
-version = "0.3.0"
+version = "0.4.0"
 description = "Rootless sandboxes for HPC clusters, on Singularity/Apptainer or enroot."
 authors = [
     {name = "Apurva Gandhi", email = "apurvag@cs.cmu.edu"}
