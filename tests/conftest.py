@@ -177,6 +177,20 @@ def namespaces_unavailable() -> str | None:
     return None
 
 
+def hide_from_path(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+    """Have ``shutil.which``, which hpc-sandbox finds its tools with, find none of ``names``.
+
+    A test of what happens without a tool must not depend on the host lacking it: hosts keep tools
+    in directories that every PATH holds, as GitHub's Ubuntu runners keep slirp4netns in /usr/bin.
+    """
+    which = shutil.which
+
+    def hiding(cmd: str, mode: int = os.F_OK | os.X_OK, path: str | None = None) -> str | None:
+        return None if cmd in names else which(cmd, mode, path)
+
+    monkeypatch.setattr(shutil, "which", hiding)
+
+
 class FakeEnroot:
     """Handle on the fake ``enroot`` installed first on PATH."""
 

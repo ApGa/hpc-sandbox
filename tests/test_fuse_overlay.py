@@ -18,7 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeRuntime, in_mount_namespace, make_provider, namespaces_unavailable
+from conftest import (
+    FakeRuntime,
+    hide_from_path,
+    in_mount_namespace,
+    make_provider,
+    namespaces_unavailable,
+)
 from hpc_sandbox import (
     PodSpec,
     SandboxSnapshot,
@@ -260,6 +266,7 @@ async def test_janitors_unmount_overlays_without_fuse_overlayfs_on_path(
     monkeypatch.setenv("HPC_SANDBOX_ROOTFS_LAYOUT", "fuse-overlay")
     (name,) = await crashed_sandboxes(tmp_path, sif, "a")
     (tmp_path / "bin" / "fuse-overlayfs").unlink()  # the job had it from a module; not the janitor
+    hide_from_path(monkeypatch, "fuse-overlayfs")  # nor the host's
     session = make_provider(tmp_path).session_root / name
     report = await make_provider(tmp_path).reap()
     assert (report.removed, report.errors) == ([name], [])

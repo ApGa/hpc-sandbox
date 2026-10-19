@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from conftest import make_enroot_provider, make_provider, namespaces_unavailable
+from conftest import hide_from_path, make_enroot_provider, make_provider, namespaces_unavailable
 from hpc_sandbox import SandboxSpec, sessions
 from hpc_sandbox.pods import check_pod, health_argv, hosts_file
 from hpc_sandbox.procfs import owned_live_start_time
@@ -167,11 +167,19 @@ async def test_a_service_started_later_resolves_and_is_resolved(runtime):
     await pod.stop()
 
 
+# What `ifconfig lo down` asks of the kernel. In Python, since `ip` need not be on the PATH that the
+# fake runtimes give commands: RHEL keeps it in /usr/sbin.
+LOOPBACK_DOWN = (
+    "import fcntl, socket, struct; "
+    "fcntl.ioctl(socket.socket(), 0x8914, struct.pack('16sh22x', b'lo', 0))"  # SIOCSIFFLAGS
+)
+
+
 async def test_root_in_a_service_cannot_touch_the_pods_network(runtime):
     provider, image = runtime
     pod = await provider.start_pod(PodSpec())
     main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))
-    down = await main.exec("ip link set lo down")
+    down = await main.exec([PYTHON, "-c", LOOPBACK_DOWN])
     assert down.exit_code != 0 and "not permitted" in down.stderr.lower(), down
     raw = await main.exec(
         [PYTHON, "-c", "import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW)"]
@@ -570,8 +578,8 @@ async def test_egress_runs_slirp4netns_held_by_the_holder(runtime, fake_slirp):
 
 async def test_egress_without_slirp4netns_fails_before_starting(runtime, monkeypatch, tmp_path):
     provider, _ = runtime
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    monkeypatch.setenv("HPC_SANDBOX_TOOLS", str(tmp_path / "no-tools"))
+    hide_from_path(monkeypatch, "slirp4netns")  # the host's
+    monkeypatch.setenv("HPC_SANDBOX_TOOLS", str(tmp_path / "no-tools"))  # and the pinned one
     with pytest.raises(SandboxError, match="fetch-tools"):
         await provider.start_pod(PodSpec(network="egress"))
     assert not provider.pod_root.exists() or list(provider.pod_root.iterdir()) in (
