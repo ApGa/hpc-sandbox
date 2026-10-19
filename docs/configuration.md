@@ -39,10 +39,11 @@ so one set of options works for both runtimes; see
 | `cgroup_limits` | `False` | Pass `cpus` and `memory_mb` as `--cpus` and `--memory`, where rootless cgroups work (Apptainer with systemd's user delegation). Otherwise `cpus` is advisory. The memory watchdog runs either way. |
 | `rootfs_layout` | `$HPC_SANDBOX_ROOTFS_LAYOUT`, else `"copy"` | `"copy"` gives each sandbox a root filesystem of its own; `"fuse-overlay"` mounts a `fuse-overlayfs` of the node's template of the image and a layer of the sandbox's own; see [Singularity CE and Apptainer](singularity.md). Any other value raises `ValueError`. |
 | `rootfs_templates` | `True` with `"fuse-overlay"`, else `False` | Extract each image once per node into `templates` on the scratch root. The copy layout then gives each sandbox a copy of the template (`cp -a --reflink=auto`) instead of an extraction of its own. |
+| `fakeroot` | `False` | Start instances with `--fakeroot`: commands run as root of a user namespace that maps root to your uid and your subordinate ids to the users after it, so they can switch users. Needs the copy layout and subordinate ids for your user (`/etc/subuid`, `/etc/subgid`). A working directory the image lacks is made with mode 755, and what other users write is given back to your uid before a session is deleted; see [Root in a sandbox](singularity.md#root-in-a-sandbox). `--fakeroot` (or `-f`) in `extra_start_args` means the same. |
 
-`rootfs_layout="fuse-overlay"` given together with `gpu`, `cgroup_limits=True`, `--fakeroot` (or
-`-f`) in `extra_start_args`, or `rootfs_templates=False` raises `ValueError`: those need the copy
-layout. When the layout comes from `HPC_SANDBOX_ROOTFS_LAYOUT` instead, such a provider stays on the
+`rootfs_layout="fuse-overlay"` given together with `gpu`, `cgroup_limits=True`, `fakeroot=True` (or
+`--fakeroot` or `-f` in `extra_start_args`), or `rootfs_templates=False` raises `ValueError`: those
+need the copy layout. When the layout comes from `HPC_SANDBOX_ROOTFS_LAYOUT` instead, such a provider stays on the
 copy layout.
 
 ### `EnrootProvider` options
@@ -65,6 +66,7 @@ copy layout.
 | `cgroup_limits=True` | `ValueError`: the enroot provider applies no cgroup limits, and `memory_mb` arms the memory watchdog. |
 | `rootfs_layout="copy"` | Accepted: `enroot create` extracts each sandbox's root filesystem from its image, which is the copy layout. Any other layout raises `ValueError`, and `HPC_SANDBOX_ROOTFS_LAYOUT` is not read. |
 | `rootfs_templates` | Ignored, for the same reason. |
+| `fakeroot=True` | `ValueError`: enroot maps only your uid into a sandbox, so root there cannot switch users. `remap_root` runs commands as root without them. |
 
 ## Where files go
 
@@ -204,6 +206,7 @@ containers even with `--cleanenv`, and whose URLs may hold credentials. Give the
 | `HPC_SANDBOX_TEST_RUNTIME` | Tests only | The runtime of the integration tests: `singularity`, `enroot`, or `auto` (the default). |
 | `HPC_SANDBOX_TEST_IMAGE` | Tests only | The image of the integration tests; default `docker://alpine:3.20`. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | Tests only | `1` also tests `network="none"` with Singularity, where the site allows it. enroot always tests it. |
+| `HPC_SANDBOX_TEST_FAKEROOT` | Tests only | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user. |
 | `HPC_SANDBOX_TEST_GPUS` | Tests only | Tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | Tests only | The image of the pod integration tests' services; default `docker://alpine:3.20`. |
 | `HPC_SANDBOX_TEST_APT_IMAGE` | Tests only | The image of the pod integration test that runs apt; default `docker://python:3.12-slim`. |

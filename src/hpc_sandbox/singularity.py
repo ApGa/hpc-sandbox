@@ -40,6 +40,17 @@ that template, so neither copies the image. File operations in the sandbox go
 through FUSE: metadata-heavy ones (``find``, many small files) are slower than
 on a copy. GPUs, cgroup limits and ``--fakeroot`` need the copy layout, and pod
 services always get a copy.
+
+With ``fakeroot=True`` (copy layout only) an instance starts with ``--fakeroot``:
+commands run as root of a user namespace that maps root to the calling user
+and the user's subordinate ids (``/etc/subuid``, ``/etc/subgid``) to the users
+after it, so they can switch users as in Docker, and what they write as those
+users belongs to subordinate ids on the host, which the calling user cannot
+delete. So once such an instance has stopped, a short ``exec --fakeroot`` over
+the session's root filesystem and private ``/tmp`` and ``/var/tmp`` gives those
+files back to root of the namespace, the calling user, before the session is
+deleted (:func:`restore_owner`); janitors do the same for an abandoned session
+whose owner record says it ran so.
 """
 
 from __future__ import annotations
@@ -96,6 +107,8 @@ CONTROL_LOCK = ".instance-control.lock"
 TEMPLATE_DIR = "templates"
 TEMPLATE_MARKER = ".complete"
 ROOTFS_LAYOUTS = ("copy", "fuse-overlay")
+# How extra_start_args may ask for --fakeroot.
+_FAKEROOT_FLAGS = ("--fakeroot", "-f")
 OVERLAY_DIR = (
     "overlay"  # <session>/overlay/{upper,work}: the writable layer of a fuse-overlay rootfs
 )
@@ -116,6 +129,31 @@ _EXTRACTION = re.compile(
 )
 _PID_WAIT_S = 5.0
 _UNMOUNT_TIMEOUT_S = 30.0
+# How long giving back the files of a stopped --fakeroot sandbox may take: it walks the whole
+# root filesystem.
+_RESTORE_TIMEOUT_S = 600.0
+# sh -c RESTORE_OWNER_SCRIPT, run as root of a --fakeroot container over a stopped session's
+# root filesystem with its private /tmp and /var/tmp bound: give root, the calling user outside,
+# everything another id of the namespace owns there, never following a link or crossing into
+# another filesystem. What it cannot change is not the session's (the mount points of /proc, /sys
+# and /dev, and files the runtime binds in, show an unmapped owner): chown's failures on them are
+# ignored, and the session's deletion still refuses any directory of another user left in it. It
+# exits 127 when the image lacks the tools, and with find's status when find fails (one without
+# -user, -group or -exec {} +).
+RESTORE_OWNER_SCRIPT = r"""
+for tool in find chown; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "hpc-sandbox: the image has no $tool" >&2
+    exit 127
+  fi
+done
+set -- /
+for directory in /tmp /var/tmp; do
+  if [ -d "$directory" ]; then set -- "$@" "$directory"; fi
+done
+find "$@" -xdev \( ! -user 0 -o ! -group 0 \) \
+  -exec /bin/sh -c 'chown -h 0:0 -- "$@" 2>/dev/null; exit 0' hpc-sandbox-chown {} +
+"""
 _PROBE_TIMEOUT_S = 5.0  # a live daemon answers statfs at once; a stopped one never does
 
 
@@ -127,7 +165,11 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     ``allow_network_none`` only where the site lets users create network
     namespaces, ``gpu`` to ``"nv"`` or ``"rocm"`` to pass GPUs through, and
     ``cgroup_limits`` where rootless cgroups work (Apptainer with systemd), to
-    turn ``cpus``/``memory_mb`` into hard limits.
+    turn ``cpus``/``memory_mb`` into hard limits. ``fakeroot`` starts instances
+    with ``--fakeroot`` (copy layout only, where the site gives users
+    subordinate ids): commands run as root and can switch to other users, and
+    what those users write is given back to your uid before a session is
+    deleted. ``extra_start_args`` holding ``--fakeroot`` means the same.
 
     Pods (:meth:`start_pod`) find slirp4netns for egress at ``slirp4netns``,
     else on PATH, else as fetched by ``hpc-sandbox fetch-tools``; their
@@ -164,6 +206,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         service_stop_grace_s: float = 0.0,
         rootfs_templates: bool | None = None,
         rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
+        fakeroot: bool = False,
     ) -> None:
         super().__init__(
             scratch_root=scratch_root,
@@ -198,6 +241,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         self.cgroup_limits = cgroup_limits
         self.bind_resolv_conf = bind_resolv_conf
         self.extra_start_args = tuple(extra_start_args)
+        self.fakeroot = fakeroot or any(arg in _FAKEROOT_FLAGS for arg in self.extra_start_args)
         self.capabilities = frozenset(
             {"snapshot", "isolation", "pods"}
             | ({"network_none"} if allow_network_none else set())
@@ -207,10 +251,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         if layout not in ROOTFS_LAYOUTS:
             raise ValueError(f"rootfs_layout must be one of {ROOTFS_LAYOUTS}, not {layout!r}")
         if layout == "fuse-overlay":
-            fakeroot = any(arg in ("--fakeroot", "-f") for arg in extra_start_args)
             conflict = (
                 "GPUs, cgroup limits and --fakeroot need rootfs_layout='copy'"
-                if gpu or cgroup_limits or fakeroot
+                if gpu or cgroup_limits or self.fakeroot
                 else "it needs rootfs_templates"
                 if rootfs_templates is False
                 else None
@@ -364,7 +407,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
                 raise SandboxError("instance is running but its owner record is not bound to it")
             expected_pid = record.get("instance_pid") if record else None
             expected_start = record.get("instance_start_time") if record else None
-            return await stop_instance(
+            stopped = await stop_instance(
                 self.runtime,
                 path.name,
                 pid_file=path / PID_FILE,
@@ -373,6 +416,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
                 grace_s=self.stop_grace_s,
                 timeout_s=self.stop_timeout_s,
             ) | await unmount_overlay(path)
+        if record is not None and record.get("remap_root") is True:  # it ran with --fakeroot
+            await _restore_owner_or_warn(self.runtime, path)
+        return stopped
 
 
 class SingularitySandbox(SessionSandbox):
@@ -401,8 +447,13 @@ class SingularitySandbox(SessionSandbox):
         }
 
     def _user(self) -> dict[str, Any]:
-        fakeroot = any(arg in ("--fakeroot", "-f") for arg in self._provider.extra_start_args)
+        fakeroot = self._provider.fakeroot
         return {"remap_root": fakeroot, "container_uid": 0 if fakeroot else os.getuid()}
+
+    def _workdir_umask(self) -> str:
+        # The other users of a --fakeroot sandbox must be able to enter a working directory that
+        # the start makes: as Docker's -w makes one, mode 755 whatever the caller's umask.
+        return "022" if self._provider.fakeroot else ""
 
     def _watch_root(self) -> int | None:
         return self._instance_pid
@@ -478,6 +529,8 @@ class SingularitySandbox(SessionSandbox):
             args += ["--bind", f"{Path(mount.source).resolve()}:{mount.target}:{mode}"]
         if self.spec.network == "none":
             args += ["--net", "--network", "none"]
+        if provider.fakeroot and not set(_FAKEROOT_FLAGS) & set(provider.extra_start_args):
+            args.append("--fakeroot")
         if provider.gpu:
             args.append(f"--{provider.gpu}")
         if provider.cgroup_limits:
@@ -576,6 +629,58 @@ class SingularitySandbox(SessionSandbox):
             self._instance_may_exist = False
         # Only once nothing runs on it: a session whose instance could not be stopped stays mounted.
         await unmount_overlay(session.path)
+        if self._provider.fakeroot:  # and only once nothing runs that could write more
+            await _restore_owner_or_warn(self._runtime, session.path)
+
+
+async def restore_owner(runtime: ContainerRuntime, session_path: Path) -> None:
+    """Give the calling user back what other users of a stopped ``--fakeroot`` sandbox wrote.
+
+    Run as root of a new ``--fakeroot`` container over the session's root filesystem, with its
+    private ``/tmp`` and ``/var/tmp`` bound, :data:`RESTORE_OWNER_SCRIPT` makes root of the
+    namespace, the calling user outside, the owner of every file another id owns there. Those
+    files belong to the user's subordinate ids on the host, so without this nothing could delete
+    the session. Raises :class:`SandboxError` when the container could not run it.
+    """
+    rootfs = session_path / "rootfs"
+    if rootfs.is_symlink() or not rootfs.is_dir():
+        return  # never filled: nothing ran in it
+    binds = []
+    for name, target in (("tmp", "/tmp"), ("var-tmp", "/var/tmp")):
+        directory = session_path / name
+        if directory.is_dir() and not directory.is_symlink():
+            binds += ["--bind", f"{directory}:{target}:rw"]
+    result = await runtime.run(
+        "exec",
+        "--fakeroot",
+        "--cleanenv",
+        "--containall",
+        "--no-home",
+        "--no-eval",
+        "--no-mount",
+        "home,cwd,bind-paths",
+        "--writable",
+        *binds,
+        str(rootfs),
+        "/bin/sh",
+        "-c",
+        RESTORE_OWNER_SCRIPT,
+        timeout_s=_RESTORE_TIMEOUT_S,
+        container=True,
+    )
+    if result.returncode != 0 or result.timed_out:
+        raise SandboxError(
+            "could not give back the files other users of the --fakeroot sandbox left in "
+            f"{session_path}: {result.detail()}"
+        )
+
+
+async def _restore_owner_or_warn(runtime: ContainerRuntime, session_path: Path) -> None:
+    """:func:`restore_owner`, logging a failure: the session's deletion then names what it left."""
+    try:
+        await restore_owner(runtime, session_path)
+    except SandboxError as error:
+        log.warning("hpc-sandbox: %s", error)
 
 
 def _fuse_tools() -> tuple[str, str]:

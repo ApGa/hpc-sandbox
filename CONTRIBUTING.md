@@ -153,6 +153,7 @@ choose what they test:
 | `HPC_SANDBOX_TEST_RUNTIME` | `auto` | `singularity`, `enroot`, or `auto`: Singularity when `singularity` or `apptainer` is on `PATH`, else enroot. |
 | `HPC_SANDBOX_TEST_IMAGE` | `docker://alpine:3.20` | The image of `tests/test_integration.py`: any image that hpc-sandbox can start ([Image references](docs/python-api.md#image-references)) and that has the usual command-line tools, as BusyBox or a distribution's base system provides them: the tests use `tail`, `find`, `xargs`, `stat` and others. A local `.sif` or `.sqsh` file works too. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | unset | `1` also tests `network="none"` with Singularity, where the site lets users create network namespaces. With enroot it is always tested. |
+| `HPC_SANDBOX_TEST_FAKEROOT` | unset | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user (subordinate ids in `/etc/subuid` and `/etc/subgid`): commands that switch users, and that nothing they leave stays behind after a stop or a janitor's sweep. |
 | `HPC_SANDBOX_TEST_GPUS` | unset | On a GPU node, tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity, with an image in which the runtime makes `nvidia-smi` or `rocm-smi` available. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | `docker://alpine:3.20` | The image of the pod tests' services; its busybox serves and fetches HTTP. |
 | `HPC_SANDBOX_TEST_APT_IMAGE` | `docker://python:3.12-slim` | The image of the pod test that runs apt. |

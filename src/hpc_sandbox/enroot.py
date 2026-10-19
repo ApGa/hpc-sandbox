@@ -626,8 +626,9 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     network namespace; ``stop_grace_s`` is ignored because sandboxes are
     stopped with SIGKILL, and ``rootfs_templates`` because ``enroot create``
     extracts each sandbox's root filesystem from its image, which is the copy
-    layout (``rootfs_layout="copy"``). ``gpu="rocm"``, ``cgroup_limits=True``
-    and ``rootfs_layout="fuse-overlay"`` cannot be honored and raise
+    layout (``rootfs_layout="copy"``). ``gpu="rocm"``, ``cgroup_limits=True``,
+    ``rootfs_layout="fuse-overlay"`` and ``fakeroot=True`` (enroot maps only
+    your uid, so root cannot switch users) cannot be honored and raise
     ValueError, as does a setting given under both names.
 
     Pods (:meth:`start_pod`) find slirp4netns for egress at ``slirp4netns``,
@@ -665,6 +666,7 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         service_stop_grace_s: float = 0.0,
         rootfs_templates: bool | None = None,
         rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
+        fakeroot: bool = False,
     ) -> None:
         if gpu is not None:
             if gpus is not None:
@@ -680,6 +682,11 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
             raise ValueError(
                 "the enroot provider extracts each sandbox's root filesystem with enroot create "
                 f"(rootfs_layout='copy'), not rootfs_layout={rootfs_layout!r}"
+            )
+        if fakeroot:
+            raise ValueError(
+                "the enroot provider maps only your uid into a sandbox, so root there cannot "
+                "switch users as with Singularity's fakeroot; remap_root gives root without them"
             )
         del stop_grace_s  # SIGKILL needs no grace period
         del rootfs_templates  # enroot create extracts every sandbox's root filesystem

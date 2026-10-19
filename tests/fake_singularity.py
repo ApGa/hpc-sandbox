@@ -12,7 +12,10 @@ DIRECTORY`` (as pod services run) needs to run as root of a user namespace,
 as it does under hpc-sandbox's launcher: like ``--containall``, it gives the
 command new mount and PID namespaces, the host's system directories, a fresh
 /proc and the binds, then chroots into the directory; a shim init runs the
-command as its child, as SingularityCE's does.
+command as its child, as SingularityCE's does. ``exec --fakeroot DIRECTORY``
+(how a stopped --fakeroot sandbox's files are given back) checks its flags
+and binds and runs nothing: without subordinate ids, everything a sandbox of
+the fake wrote belongs to the caller already.
 
 State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_PULL_FAILURES   fail this many pulls first (default 0)
@@ -21,6 +24,7 @@ State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_INSTANCE_EXITS  "1": instances exit right after starting
   FAKE_SINGULARITY_START_DELAY     seconds each instance start takes (default 0)
   FAKE_SINGULARITY_EXIT_DELAY      seconds a shim waits to pass its command's status on (default 0)
+  FAKE_SINGULARITY_FAKEROOT_FAILS  "1": exec --fakeroot DIRECTORY fails
 """
 
 from __future__ import annotations
@@ -161,8 +165,8 @@ def build(args: list[str]) -> int:
 def instance_start(args: list[str]) -> int:
     options, (rootfs, name) = parse(args)
     time.sleep(float(os.environ.get("FAKE_SINGULARITY_START_DELAY", "0")))
-    if "--writable-tmpfs" in options or "--fakeroot" in options:
-        return fail("hpc-sandbox must not use --writable-tmpfs or --fakeroot", 98)
+    if "--writable-tmpfs" in options:
+        return fail("hpc-sandbox must not use --writable-tmpfs", 98)
     root = Path(rootfs)
     if "--writable" not in options or not root.is_dir():
         return fail("expected --writable with a sandbox directory")
@@ -330,9 +334,25 @@ def _forward(child: int, signum: int) -> None:
         pass
 
 
+def exec_fakeroot(options: dict[str, list[str]], root: Path) -> int:
+    if "--writable" not in options or "--containall" not in options:
+        return fail("expected --writable --containall with a sandbox directory")
+    for spec in options.get("--bind", []):
+        source, target, _ = spec.split(":")
+        if not Path(source).exists():
+            return fail(f"bind source {source} does not exist")
+        if not (root / target.lstrip("/")).exists():
+            return fail(f"destination {target} doesn't exist in container")
+    if os.environ.get("FAKE_SINGULARITY_FAKEROOT_FAILS") == "1":
+        return fail("simulated --fakeroot failure")
+    return 0
+
+
 def exec_(args: list[str]) -> int:
     options, rest = parse(args)
     target, command = rest[0], rest[1:]
+    if "--fakeroot" in options and Path(target).is_dir():
+        return exec_fakeroot(options, Path(target))
     if Path(target).is_dir():
         return exec_directory(options, Path(target), command)
     if not target.startswith("instance://"):
