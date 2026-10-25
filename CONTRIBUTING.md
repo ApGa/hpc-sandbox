@@ -160,7 +160,9 @@ choose what they test:
 | `HPC_SANDBOX_TEST_PODS` | `16` | How many pods the pod tests start at once. |
 
 The pod tests check egress where they find slirp4netns, the site's or the one that
-`hpc-sandbox fetch-tools` downloads, and then reach PyPI and Debian's mirrors.
+`hpc-sandbox fetch-tools` downloads, and then reach PyPI and Debian's mirrors. The test that other
+users cannot reach a pod's exposed ports runs where you have subordinate ids in `/etc/subuid` and
+`/etc/subgid` and where `newuidmap` and `newgidmap` are installed, and skips elsewhere.
 [Environment variables](docs/configuration.md#environment-variables) lists these variables with
 every other one that hpc-sandbox reads.
 

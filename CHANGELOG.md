@@ -4,6 +4,21 @@ What each release of hpc-sandbox changes. Its version is below 1.0: a minor rele
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
 one minor release, require a range such as `hpc-sandbox>=0.4,<0.5`.
 
+## 0.5.0 (unreleased)
+
+### Added
+
+- **Pods expose ports to the host**: for each port in `PodSpec.exposes`, or given to
+  `await pod.expose(port)` once the pod runs, the pod's holder listens on a Unix socket in the pod's
+  directory, `exposed/<port>.sock`, which only your uid can reach, and forwards each connection to
+  that port inside the pod. `pod.endpoints` maps the exposed ports to their sockets, and
+  `await pod.open_connection(port)` connects to one from the host, however long the socket's path.
+  They are members of `SessionPod`, not of the `Pod` protocol. See
+  [Exposed ports](docs/pods.md#exposed-ports).
+- **Host aliases for pods**: every service resolves the names in `PodSpec.hosts` to 127.0.0.1, as it
+  resolves the names of the services, so that the services reach an upstream as `name:port`. See
+  [Names](docs/pods.md#names).
+
 ## 0.4.0 (2026-10-19)
 
 ### Changed behaviour

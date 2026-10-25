@@ -202,13 +202,19 @@ class PodSpec:
     (``{"gateway": "unix:///path/gw.sock"}``) is reachable in every service at
     ``127.0.0.1:<port>``, by default 18080, 18081... in order
     (``upstream_ports`` overrides), relayed to the host's Unix socket.
-    ``labels`` select pods for :meth:`reap` and janitors.
+    ``labels`` select pods for :meth:`reap` and janitors. Each port in
+    ``exposes`` is reachable from the host through a Unix socket in the pod's
+    directory (:attr:`SessionPod.endpoints`), and every service resolves each
+    name in ``hosts`` to 127.0.0.1, as it resolves the services' names
+    (``"judge"`` for an upstream that a pod port relays).
     """
 
     network: PodNetwork = "none"
     upstreams: dict[str, str] = field(default_factory=dict)
     upstream_ports: dict[str, int] = field(default_factory=dict)
     labels: dict[str, str] = field(default_factory=dict)
+    exposes: list[int] = field(default_factory=list)
+    hosts: list[str] = field(default_factory=list)
 
 
 @runtime_checkable

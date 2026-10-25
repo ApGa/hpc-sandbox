@@ -102,7 +102,7 @@ records.
 |---|---|---|
 | `sessions/` | One directory per Singularity sandbox, `hpcsb-` and 32 hexadecimal digits, with its root filesystem, its `/tmp` and `/var/tmp`, and an owner record. | By `stop()` or a janitor. |
 | `sessions-enroot/` | The same, for enroot sandboxes. | By `stop()` or a janitor. |
-| `pods-singularity/`, `pods-enroot/` | One directory per pod, holding its services' sessions. | By `pod.stop()` or a janitor. |
+| `pods-singularity/`, `pods-enroot/` | One directory per pod, holding its services' sessions and the sockets of its exposed ports. | By `pod.stop()` or a janitor. |
 | `snapshots/` | One directory per snapshot, `snap-` and 32 hexadecimal digits. | By `delete_snapshot()`. |
 | `images/` | Staged image files; see [Image staging](#image-staging). | Never. |
 | `templates/` | Root filesystems extracted once per image, for Singularity's templates. | Never; janitors delete extractions cut short. |

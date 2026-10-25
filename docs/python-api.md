@@ -640,8 +640,9 @@ sandbox interfaces need only their names.
 | `Pod` | `id`, `routes`, `services`, `start_service(spec, wait)`, `health(name)`, `logs(name)`, `set_network(mode)`, `stop()` |
 
 They are runtime-checkable: `isinstance()` works with them, checking names only.
-`delete_snapshot()`, `reap()`, `wait_for_deletions()`, `images`, `memory_kills` and `async with`
-belong to the concrete classes, not to the protocols.
+`delete_snapshot()`, `reap()`, `wait_for_deletions()`, `images`, `memory_kills`, a pod's
+`endpoints`, `expose()` and `open_connection()`, and `async with` belong to the concrete classes,
+not to the protocols.
 
 ```python
 import asyncio

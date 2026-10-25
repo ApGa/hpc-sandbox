@@ -9,13 +9,19 @@ Services run ``HPC_SANDBOX_TEST_POD_IMAGE`` (default ``docker://alpine:3.20``,
 whose busybox serves and fetches HTTP); the apt check runs
 ``HPC_SANDBOX_TEST_APT_IMAGE`` (default ``docker://python:3.12-slim``). Egress
 checks run where slirp4netns is found (see ``hpc-sandbox fetch-tools``) and
-reach PyPI and Debian's mirrors.
+reach PyPI and Debian's mirrors. The check that other users cannot reach
+exposed ports runs where the user has subordinate ids (``/etc/subuid`` and
+``/etc/subgid``) and ``newuidmap`` and ``newgidmap`` are installed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
+import pwd
+import shutil
 import signal
 import socket
 import statistics
@@ -47,13 +53,7 @@ APT_IMAGE = os.environ.get("HPC_SANDBOX_TEST_APT_IMAGE", "docker://python:3.12-s
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 JUDGE = (
     'echo judge up; while true; do printf "HTTP/1.0 200 OK\\r\\n\\r\\njudge-ok $SECRET\\n" '
-    "| nc -l -p 8082 >/dev/null; done"
-)
-READY = HealthCheck(
-    ["CMD-SHELL", "wget -qO- -T 2 http://127.0.0.1:8082/"],
-    interval_s=1,
-    start_interval_s=0.2,
-    start_period_s=60,
+    '| nc -l -p "$PORT" >/dev/null; done'
 )
 
 
@@ -108,13 +108,40 @@ def gateway(tmp_path: Path) -> Iterator[Path]:
     server.close()
 
 
-def judge(secret: str = "s3cret") -> ServiceSpec:
-    return ServiceSpec(
-        "judge",
-        SandboxSpec(image=IMAGE, env={"SECRET": secret}),
-        command=["/bin/sh", "-c", JUDGE],
-        healthcheck=READY,
+def judge(secret: str = "s3cret", name: str = "judge", port: int = 8082) -> ServiceSpec:
+    ready = HealthCheck(
+        ["CMD-SHELL", f"wget -qO- -T 2 http://127.0.0.1:{port}/"],
+        interval_s=1,
+        start_interval_s=0.2,
+        start_period_s=60,
     )
+    return ServiceSpec(
+        name,
+        SandboxSpec(image=IMAGE, env={"SECRET": secret, "PORT": str(port)}),
+        command=["/bin/sh", "-c", JUDGE],
+        healthcheck=ready,
+    )
+
+
+async def ask(pod: Any, port: int) -> str:
+    """The body of the reply to an HTTP request sent from the host through an exposed port. The
+    judge's nc serves one connection at a time, and the holder closes a connection that finds
+    nothing listening, so a request between two connections is sent again."""
+    for _ in range(50):
+        reader, writer = await pod.open_connection(port)
+        try:
+            writer.write(b"GET / HTTP/1.0\r\n\r\n")
+            await writer.drain()
+            async with asyncio.timeout(10):
+                reply = await reader.read()
+        except ConnectionError:  # closed before the request went through
+            reply = b""
+        finally:
+            writer.close()
+        if reply:
+            return reply.decode().split("\r\n\r\n", 1)[-1]
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"port {port} of pod {pod.id} never answered")
 
 
 async def test_services_reach_each_other_and_the_upstream(provider, gateway):
@@ -226,7 +253,7 @@ async def main():
     kind, scratch, image = sys.argv[1:]
     providers = {{"enroot": EnrootProvider, "singularity": SingularityProvider}}
     provider = providers[kind](scratch_root=scratch)
-    pod = await provider.start_pod(PodSpec(labels={{"t": "crash"}}))
+    pod = await provider.start_pod(PodSpec(labels={{"t": "crash"}}, exposes=[8082]))
     for name in ("main", "judge"):
         service = await pod.start_service(ServiceSpec(name, SandboxSpec(image=image)))
         print(service._service_anchor.pid, service._service_init, service._container, flush=True)
@@ -258,6 +285,162 @@ async def test_a_dead_owners_pods_die_and_the_janitor_removes_them(provider, scr
     report = await provider.reap()
     assert pod_id in report.removed and not report.errors
     assert not (provider.pod_root / pod_id).exists()
+
+
+async def test_the_host_reaches_exposed_ports_through_their_sockets(provider):
+    pod = await provider.start_pod(PodSpec(exposes=[8082]))
+    await pod.start_service(judge("first"), wait="healthy")
+    assert await ask(pod, 8082) == "judge-ok first\n"
+    await pod.start_service(judge("second", name="other", port=8083), wait="healthy")
+    path = Path(await pod.expose(8083))
+    assert await ask(pod, 8083) == "judge-ok second\n"
+    assert pod.endpoints == {8082: str(path.parent / "8082.sock"), 8083: str(path)}
+    for each in (path, path.parent):
+        info = each.lstat()
+        assert info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, (each, oct(info.st_mode))
+    await pod.stop()
+    assert not path.exists()
+
+
+def subordinate_ids(path: str) -> tuple[int, int] | None:
+    """The first id and the count of the caller's subordinate range in ``path``."""
+    names = {str(os.getuid())}
+    with contextlib.suppress(KeyError):
+        names.add(pwd.getpwuid(os.getuid()).pw_name)
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.strip().split(":")
+        if len(fields) == 3 and fields[0] in names and fields[1].isdigit() and fields[2].isdigit():
+            return int(fields[1]), int(fields[2])
+    return None
+
+
+# Run as another user through a user namespace that maps the caller to root and uid 1 to one of the
+# caller's subordinate ids: connect to an exposed port's socket through descriptors the test opened
+# (of the socket itself, of its directory) and through its path, as the namespace's root (the
+# caller), then as its uid 1, another user on the host.
+OTHER_USER = """\
+import ctypes, errno, json, os, socket, sys
+
+path, socket_fd, directory_fd = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+if ctypes.CDLL(None, use_errno=True).unshare(0x10000000) != 0:  # CLONE_NEWUSER
+    sys.exit("unshare: " + os.strerror(ctypes.get_errno()))
+print("unshared", flush=True)
+if sys.stdin.readline() != "mapped\\n":
+    sys.exit("the namespace was not mapped")
+
+
+def attempt(address):
+    try:
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.connect(address)
+        return "connected"
+    except OSError as error:
+        return errno.errorcode.get(error.errno, str(error))
+
+
+def by_path():
+    try:
+        target = os.open(path, os.O_PATH)  # through every directory above the socket
+    except OSError as error:
+        return errno.errorcode.get(error.errno, str(error))
+    try:
+        return attempt(f"/proc/self/fd/{target}")
+    finally:
+        os.close(target)
+
+
+def attempts():
+    return {
+        "socket": attempt(f"/proc/self/fd/{socket_fd}"),
+        "directory": attempt(f"/proc/self/fd/{directory_fd}/{os.path.basename(path)}"),
+        "path": by_path(),
+    }
+
+
+report = {"caller": attempts()}
+os.setgroups([])
+os.setresgid(1, 1, 1)
+os.setresuid(1, 1, 1)
+report["other"] = attempts()
+print(json.dumps(report), flush=True)
+"""
+
+
+def connect_as_another_user(path: str, ids: list[tuple[str, int, int]]) -> dict:
+    socket_fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    directory_fd = os.open(os.path.dirname(path), os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        helper = subprocess.Popen(
+            [sys.executable, "-I", "-c", OTHER_USER, path, str(socket_fd), str(directory_fd)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            pass_fds=(socket_fd, directory_fd),
+        )
+        try:
+            assert helper.stdout is not None and helper.stdout.readline() == "unshared\n"
+            for tool, own, other in ids:
+                command = [tool, str(helper.pid), "0", str(own), "1", "1", str(other), "1"]
+                subprocess.run(command, check=True, capture_output=True, timeout=300)
+            out, err = helper.communicate("mapped\n", timeout=60)
+        finally:
+            if helper.poll() is None:
+                helper.kill()
+                helper.wait()
+        assert helper.returncode == 0, err
+        return json.loads(out)
+    finally:
+        os.close(socket_fd)
+        os.close(directory_fd)
+
+
+async def test_other_users_cannot_reach_exposed_ports(provider):
+    uids, gids = subordinate_ids("/etc/subuid"), subordinate_ids("/etc/subgid")
+    tools = [shutil.which("newuidmap"), shutil.which("newgidmap")]
+    if not (uids and gids and all(tools)):
+        pytest.skip("needs subordinate ids in /etc/subuid and /etc/subgid, newuidmap and newgidmap")
+    pod = await provider.start_pod(PodSpec(exposes=[8082]))
+    await pod.start_service(judge(), wait="healthy")
+    # The last id of each range: newuidmap and newgidmap look up the owner of every range in the
+    # file that holds an id they check, which takes long where the ranges of many users overlap.
+    ids = [(tools[0], os.getuid(), sum(uids) - 1), (tools[1], os.getgid(), sum(gids) - 1)]
+    report = await asyncio.to_thread(connect_as_another_user, pod.endpoints[8082], ids)
+    ways = ("socket", "directory", "path")
+    assert report["caller"] == dict.fromkeys(ways, "connected"), report
+    # The socket's mode, its directory's mode, and the modes of the directories above both
+    # keep other users out.
+    assert report["other"] == dict.fromkeys(ways, "EACCES"), report
+    await pod.stop()
+
+
+async def test_aliases_name_upstreams_and_another_pods_exposed_port(provider, gateway, tmp_path):
+    judging = await provider.start_pod(PodSpec(exposes=[8082]))
+    await judging.start_service(judge("shared"), wait="healthy")
+    link = tmp_path / "judge.sock"  # a short path: an upstream's must fit in a socket address
+    link.symlink_to(judging.endpoints[8082])
+    spec = PodSpec(
+        upstreams={"gateway": f"unix://{gateway}", "judge": f"unix://{link}"},
+        upstream_ports={"gateway": 8090, "judge": 8082},
+        hosts=["gateway", "judge"],
+    )
+    pod = await provider.start_pod(spec)
+    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=IMAGE)))
+    checks = {
+        "aliases": ("grep -cE '^127.0.0.1\t(gateway|judge)$' /etc/hosts", "2"),
+        "resolved": ("ping -c1 -W2 judge | head -1 | cut -d' ' -f3", "(127.0.0.1):"),
+        "an upstream": ("wget -qO- -T 5 http://gateway:8090/", "gateway-ok"),
+        "another pod": ("wget -qO- -T 5 http://judge:8082/", "judge-ok shared"),
+    }
+    for label, (command, expected) in checks.items():
+        result = await main.exec(command)
+        assert result.stdout.strip() == expected, (label, result)
+    await pod.stop()
+    await judging.stop()
 
 
 async def test_many_pods_start_and_stop_cleanly(provider, gateway):
