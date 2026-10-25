@@ -16,6 +16,7 @@ command line used here, so this page writes `singularity` for either.
 | `/bin/sh` and `sleep` in the image | the start script that keeps each instance running |
 | `fuse-overlayfs`, `fusermount3` or `fusermount`, `/dev/fuse`, and unprivileged user namespaces | the fuse-overlay layout only; janitors need only `fusermount3` or `fusermount` |
 | unprivileged user namespaces and util-linux `nsenter` | pods only ([Pods](pods.md)) |
+| util-linux `nsenter` | a `fakeroot` sandbox's file owners manifest and snapshots ([The image's file owners](#the-images-file-owners)) |
 
 [Getting started](getting-started.md) lists what every provider needs.
 
@@ -128,6 +129,8 @@ ids: nothing gains a privilege on the host.
 | Owner record, snapshot metadata | `remap_root: true`, `container_uid: 0` |
 | Files that commands write as root | yours on the host, as without `fakeroot` |
 | Files that commands write as another user | your subordinate ids' on the host, which you cannot change or delete; given back to you when the sandbox stops (below) |
+| The image's files | yours on the host, so root's inside, unless the spec's `file_owners` gives them their owners in the image ([The image's file owners](#the-images-file-owners)) |
+| Snapshots | copied as root of the instance's user namespace, with util-linux `nsenter`, which reads the files of every user there whatever their modes; each copy is yours, as without `fakeroot` |
 | A working directory the image lacks | made at the start with its missing parents, mode 755 whatever your umask, as Docker's `-w` makes it, so that the other users can enter it; one the image has keeps its mode |
 | The memory watchdog, timeouts, `kill_tree` | as without it: the namespace is yours, so your processes may read and signal its other users' |
 
@@ -141,6 +144,60 @@ whose owner record says it ran with `fakeroot`, once it has stopped its instance
 fails (an image without `find` or `chown`, or a `find` without `-user`, `-group` or `-exec {} +`),
 the stop logs a warning and goes on, and the deletion refuses the directories it could not give
 back, which then stay in the trash.
+
+### The image's file owners
+
+The extraction gives every file of the image to your uid, so root sees them all as its own, even
+those that the image gives to another user, and that user cannot write where the image lets it.
+`SandboxSpec(file_owners=...)` names a manifest of those owners
+([File owners](python-api.md#file-owners)), which a `fakeroot` sandbox applies once its instance
+runs, before the start's probe and before any command: `nsenter` enters the instance's user
+namespace, and the launcher (`anchor.py`'s `file-owners` form) changes the owners there, through the
+session's root filesystem on the host, which is the instance's root. Entries at or below `/dev`,
+`/proc`, `/sys`, `/tmp` and `/var/tmp` are skipped: the instance mounts its own there, and the
+give-back above, which sees the same mounts, could never give back what the manifest gave there.
+Sandboxes without `fakeroot` raise `ValueError` for a manifest, and a `fakeroot` sandbox raises
+`SandboxError` before anything starts when util-linux `nsenter` is missing.
+
+```python
+# file_owners.py: redis:7-alpine with owners from its layers, as root that can become redis
+import asyncio
+import tempfile
+from pathlib import Path
+
+from hpc_sandbox import SandboxSpec, SingularityProvider
+
+OWNERS = "0 42 /etc/shadow\n999 1000 /data\n"  # what its layers give to others than root
+AS_REDIS = "setpriv --reuid 999 --regid 1000 --clear-groups touch /data/notes"
+
+
+async def main() -> None:
+    owners = Path(tempfile.mkdtemp()) / "owners"
+    owners.write_text(OWNERS)
+    provider = SingularityProvider(fakeroot=True)
+    spec = SandboxSpec(image="docker://redis:7-alpine", file_owners=str(owners))
+    async with await provider.start(spec) as sandbox:
+        await sandbox.exec(AS_REDIS)
+        result = await sandbox.exec("stat -c '%u:%g %n' /etc/shadow /data /data/notes")
+        print(result.stdout, end="")
+    await provider.wait_for_deletions()
+
+
+asyncio.run(main())
+```
+
+```text
+0:42 /etc/shadow
+999:1000 /data
+999:1000 /data/notes
+```
+
+On the host, these files belong to your subordinate ids, and the stop gives them back to you with
+the rest. Each start applies the manifest to its own root filesystem, a copy of the image or of the
+node's template, which never changes. A snapshot copies the files as root of the instance's user
+namespace, which reads those of every user whatever their modes, and gives each copy to you: a
+snapshot keeps no owners, so a restore applies its spec's manifest again, and what commands wrote
+there as other users is root's in the restored sandbox.
 
 ## Instances
 

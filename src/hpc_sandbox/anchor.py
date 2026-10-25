@@ -4,6 +4,7 @@
 
     python -I -S anchor.py PARENT_PID NETWORK -- COMMAND [ARG...]
     python -I -S anchor.py PARENT_PID join HOLDER_PID [OPTION...] -- COMMAND [ARG...]
+    python -I -S anchor.py PARENT_PID file-owners MANIFEST ROOTFS
 
 The first form starts a sandbox of its own. It
 
@@ -38,18 +39,32 @@ them, without capabilities; ``subids`` maps every id the pod's namespace maps
 to itself, which the init writes for the child, so that root there can switch
 to the caller's subordinate ids. The init forwards SIGTERM, SIGINT and SIGHUP
 to the child, reaps orphans, and exits with the child's status; the runtime is
-never PID 1, so killing the init always ends the service.
+never PID 1, so killing the init always ends the service. With
+``--file-owners MANIFEST ROOTFS``, it first gives the paths below the service's
+root filesystem that the file owners manifest lists their owners, as root of
+the pod's user namespace.
+
+The ``file-owners`` form does only that, in the user namespace it is run in:
+the Singularity provider runs it with ``nsenter`` in a ``--fakeroot``
+instance's, once the instance runs and before any command does. Image
+extraction gives every file to the caller, and a file owners manifest
+(:func:`read_file_owners`, which the package also uses to check one before
+anything starts) says which paths the image gives to other users
+(:func:`apply_file_owners`).
 """
 
 from __future__ import annotations
 
 import ctypes
+import errno
 import fcntl
 import os
+import re
 import resource
 import select
 import signal
 import socket
+import stat
 import struct
 import sys
 
@@ -68,6 +83,22 @@ PR_SET_PDEATHSIG = 1
 SIOCGIFFLAGS = 0x8913
 SIOCSIFFLAGS = 0x8914
 IFF_UP = 0x1
+# How the report of the entries of a file owners manifest that were skipped starts, on stdout or
+# stderr.
+FILE_OWNERS_REPORT = "hpc-sandbox: file owners: "
+# What a sandbox mounts its own over: the kernel's file systems, and the private /tmp and /var/tmp
+# (sandbox.RESERVED_TARGETS). The files of the root filesystem at or below them are never seen
+# inside, and a --fakeroot sandbox's give-back, which sees the same mounts, cannot reach them.
+MOUNTED_OVER = ("/dev", "/proc", "/sys", "/tmp", "/var/tmp")
+_MOUNTED_OVER = tuple(tuple(path.encode().split(b"/")[1:]) for path in MOUNTED_OVER)
+# A file owners manifest's line: UID GID PATH, the path absolute and running to the end of the line.
+# A carriage return fails the line: CRLF line ends would leave one at the end of every path.
+_FILE_OWNERS_LINE = re.compile(rb"[ \t]*([0-9]{1,10})[ \t]+([0-9]{1,10})[ \t]+(/[^\0\r]*)")
+_MAX_ID = 0xFFFFFFFE  # chown reads (uid_t) -1 as "leave it"
+_SET_ID = stat.S_ISUID | stat.S_ISGID  # the bits that a chown clears on a regular file
+_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_NAMES_NOTHING = (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)  # also a link, or a file, on the way
+_REPORTED = 10
 
 _libc = ctypes.CDLL(None, use_errno=True)
 
@@ -124,10 +155,164 @@ def _setns(path: str, nstype: int) -> None:
         os.close(fd)
 
 
+FileOwner = tuple[int, int, tuple[bytes, ...]]  # a uid, a gid, and the components of a path
+
+
+def read_file_owners(path: str) -> list[FileOwner]:
+    """The entries of the file owners manifest at ``path``, in its order.
+
+    Each line is ``UID GID PATH``: two decimal ids, then an absolute path in the image, which runs
+    to the end of the line and may hold spaces, but no carriage return. Empty and ``.`` components
+    are dropped, so ``/srv/app/`` is ``/srv/app``. Blank lines and lines that start with ``#`` are
+    skipped. Raises ``ValueError`` for the first line that is none of these, or whose path climbs
+    with ``..``, and ``OSError`` when the file cannot be read.
+    """
+    with open(path, "rb") as stream:
+        lines = stream.read().split(b"\n")
+    entries = []
+    for number, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith(b"#"):
+            continue
+        match = _FILE_OWNERS_LINE.fullmatch(line)
+        if match is not None:
+            uid, gid = int(match[1]), int(match[2])
+            parts = tuple(part for part in match[3].split(b"/") if part not in (b"", b"."))
+            if max(uid, gid) <= _MAX_ID and b".." not in parts:
+                entries.append((uid, gid, parts))
+                continue
+        shown = line[:200].decode(errors="replace")
+        crlf = " (CRLF line ends?)" if b"\r" in line else ""
+        raise ValueError(
+            f"file owners manifest {path}, line {number}: expected UID GID /PATH, with ids up to "
+            f"{_MAX_ID} and no .. or carriage return in the path, not {shown!r}{crlf}"
+        )
+    return entries
+
+
+def apply_file_owners(entries: list[FileOwner], rootfs: str) -> list[str]:
+    """Give each path that ``entries`` list below the directory ``rootfs`` its uid and gid.
+
+    Run it as root of a user namespace that maps those ids: an id it does not map raises
+    ``OSError`` before anything changes. Entries apply in order, so a later one for the same path
+    wins, and a regular file keeps the set-user-ID and set-group-ID bits that the chown clears. A
+    symbolic link is never followed: a link gets the owner itself, and a path below a link or a
+    file names nothing, as do a missing path and one on another filesystem. A path at or below
+    one of :data:`MOUNTED_OVER` is left alone, since the sandbox never sees it. Returns the paths
+    of the entries skipped for either reason.
+    """
+    mapped = {name: _mapped_ids(f"/proc/self/{name}_map") for name in ("uid", "gid")}
+    for uid, gid, parts in entries:
+        for name, wanted in (("uid", uid), ("gid", gid)):
+            if not any(start <= wanted < start + count for start, count in mapped[name]):
+                ranges = ", ".join(f"{start}-{start + count - 1}" for start, count in mapped[name])
+                raise OSError(
+                    errno.EINVAL,
+                    f"the file owners manifest gives {_shown(parts)} to {name} {wanted}, which "
+                    f"this user namespace does not map (its {name}s: {ranges})",
+                )
+    root = os.open(rootfs, _DIRECTORY)
+    chain: list[tuple[bytes, int]] = []  # the open directories of the last parent, from the root
+    skipped = []
+    try:
+        device = os.fstat(root).st_dev
+        for uid, gid, parts in entries:
+            if any(parts[: len(mount)] == mount for mount in _MOUNTED_OVER):
+                skipped.append(_shown(parts))
+                continue
+            try:
+                parent = _open_parent(root, device, parts[:-1], chain)
+                if not parts:
+                    os.chown(root, uid, gid)
+                    continue
+                if parent is None:
+                    skipped.append(_shown(parts))
+                    continue
+                info = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                if info.st_dev != device:
+                    skipped.append(_shown(parts))
+                    continue
+                os.chown(parts[-1], uid, gid, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode) and info.st_mode & _SET_ID:
+                    _keep_mode(parent, parts[-1], info)
+            except OSError as error:
+                if error.errno not in _NAMES_NOTHING:
+                    detail = error.strerror or str(error)
+                    raise OSError(
+                        error.errno, f"cannot give {_shown(parts)} to {uid}:{gid}: {detail}"
+                    ) from None
+                skipped.append(_shown(parts))
+    finally:
+        for _, fd in chain:
+            os.close(fd)
+        os.close(root)
+    return skipped
+
+
+def file_owners_report(skipped: list[str], total: int) -> str:
+    """A line that names the paths of the ``total`` entries of a file owners manifest that
+    :func:`apply_file_owners` skipped."""
+    shown = ", ".join(skipped[:_REPORTED]) + (", ..." if len(skipped) > _REPORTED else "")
+    mounts = ", ".join(MOUNTED_OVER[:-1]) + f" or {MOUNTED_OVER[-1]}"
+    return (
+        f"{FILE_OWNERS_REPORT}skipped {len(skipped)} of {total} entries, whose paths name "
+        "nothing in the root filesystem (missing, below a link or a file, or on another "
+        f"filesystem) or lie where the sandbox mounts its own (at or below {mounts}): {shown}"
+    )
+
+
+def _keep_mode(parent: int, name: bytes, info: os.stat_result) -> None:
+    """Give the file ``name`` of the directory ``parent`` the mode ``info`` read, if it is still
+    that file: a chown clears its set-user-ID and set-group-ID bits, which Docker keeps."""
+    fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+    try:
+        now = os.fstat(fd)
+        if stat.S_ISREG(now.st_mode) and (now.st_dev, now.st_ino) == (info.st_dev, info.st_ino):
+            os.chmod(f"/proc/self/fd/{fd}", stat.S_IMODE(info.st_mode))  # that inode, not a path
+    finally:
+        os.close(fd)
+
+
+def _open_parent(
+    root: int, device: int, names: tuple[bytes, ...], chain: list[tuple[bytes, int]]
+) -> int | None:
+    """A descriptor of the directory ``names`` below ``root``, or None when that names no
+    directory of ``root``'s filesystem. ``chain`` holds the directories that the last call opened,
+    which serve the next as far as the two paths share them."""
+    shared = 0
+    while shared < min(len(chain), len(names)) and chain[shared][0] == names[shared]:
+        shared += 1
+    for _, fd in chain[shared:]:
+        os.close(fd)
+    del chain[shared:]
+    for name in names[shared:]:
+        try:
+            fd = os.open(name, _DIRECTORY, dir_fd=chain[-1][1] if chain else root)
+        except OSError as error:
+            if error.errno in _NAMES_NOTHING:
+                return None
+            raise
+        if os.fstat(fd).st_dev != device:
+            os.close(fd)
+            return None
+        chain.append((name, fd))
+    return chain[-1][1] if chain else root
+
+
+def _mapped_ids(path: str) -> list[tuple[int, int]]:
+    """The ids that a ``uid_map`` or ``gid_map`` maps: the first of each extent, and how many."""
+    with open(path) as stream:
+        extents = [line.split() for line in stream if line.strip()]
+    return [(int(inside), int(count)) for inside, _, count in extents]
+
+
+def _shown(parts: tuple[bytes, ...]) -> str:
+    return "/" + b"/".join(parts).decode(errors="replace")
+
+
 def _join(argv: list[str]) -> int:
     """The ``join`` form: a pod service below the holder ``argv[0]``."""
     holder, options, command = argv[0], argv[1 : argv.index("--")], argv[argv.index("--") + 1 :]
-    hostname, rlimits, shm, userns = None, [], None, None
+    hostname, rlimits, shm, userns, file_owners = None, [], None, None, None
     while options:
         option = options.pop(0)
         if option == "--hostname":
@@ -148,11 +333,16 @@ def _join(argv: list[str]) -> int:
                 or (mode == "caller" and uid.isdigit() and gid.isdigit())
             ):
                 raise OSError(22, f"unknown user namespace {userns}")
+        elif option == "--file-owners":
+            manifest, rootfs = options.pop(0), options.pop(0)
+            file_owners = (read_file_owners(manifest), rootfs)  # read as the caller, who wrote it
         else:
             raise OSError(22, f"unknown option {option}")
     # The user namespace first: it owns the network namespace.
     _setns(f"/proc/{holder}/ns/user", CLONE_NEWUSER)
     _setns(f"/proc/{holder}/ns/net", CLONE_NEWNET)
+    if file_owners is not None and (skipped := apply_file_owners(*file_owners)):  # as pod root
+        print(file_owners_report(skipped, len(file_owners[0])), file=sys.stderr, flush=True)
     _check(_libc.unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS), "unshare")
     _check(_libc.mount(b"none", b"/", None, MS_REC | MS_PRIVATE, None), "make / private")
     # The service writes to a pipe this process copies to its own output, as
@@ -318,10 +508,19 @@ def main(argv: list[str]) -> int:
         if os.getppid() != int(argv[0]):
             return 1  # the parent died before PR_SET_PDEATHSIG took effect
         return _join(argv[2:])
+    if len(argv) == 4 and argv[1] == "file-owners":
+        _die_with_parent()
+        if os.getppid() != int(argv[0]):
+            return 1
+        entries = read_file_owners(argv[2])
+        if skipped := apply_file_owners(entries, argv[3]):
+            print(file_owners_report(skipped, len(entries)))
+        return 0
     if len(argv) < 4 or argv[2] != "--" or argv[1] not in ("host", "none"):
         print(
             "usage: anchor.py PARENT_PID host|none -- COMMAND [ARG...]\n"
-            "       anchor.py PARENT_PID join HOLDER_PID [OPTION...] -- COMMAND [ARG...]",
+            "       anchor.py PARENT_PID join HOLDER_PID [OPTION...] -- COMMAND [ARG...]\n"
+            "       anchor.py PARENT_PID file-owners MANIFEST ROOTFS",
             file=sys.stderr,
         )
         return 2
@@ -372,9 +571,18 @@ def main(argv: list[str]) -> int:
     return os.WEXITSTATUS(status)
 
 
+def _message(error: Exception) -> str:
+    """``error`` as this script reports it: an ``OSError`` without the ``[Errno N]`` that
+    ``str()`` puts first."""
+    if not isinstance(error, OSError) or not error.strerror:
+        return str(error)
+    names = [repr(name) for name in (error.filename, error.filename2) if name is not None]
+    return f"{error.strerror}: {' -> '.join(names)}" if names else error.strerror
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except OSError as error:
-        print(f"hpc-sandbox: {error}", file=sys.stderr)
+    except (OSError, ValueError) as error:
+        print(f"hpc-sandbox: {_message(error)}", file=sys.stderr)
         sys.exit(1)

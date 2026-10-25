@@ -20,7 +20,7 @@ this table list; the other rows are needed only for what they name:
 | GNU coreutils and `find` | every sandbox: deleting it once it stopped, with `find` and `rm --one-file-system`, in the background under `nice -n 19`; and copies with `cp -a --reflink=auto` (snapshots, restores and Singularity's templates) |
 | unprivileged user namespaces | enroot sandboxes, pods with either runtime, and Singularity's fuse-overlay layout |
 | enroot's `+caps` package, whose `enroot-aufs2ovlfs` converts layer whiteouts | importing images with enroot; local `.sqsh` files need none |
-| util-linux `nsenter` | every command in an enroot sandbox or a pod service |
+| util-linux `nsenter` | every command in an enroot sandbox or a pod service, and a Singularity `fakeroot` sandbox's file owners manifest and snapshots ([File owners](python-api.md#file-owners)) |
 | util-linux `prlimit` | commands in pod services that set `ulimits` |
 | util-linux `flock` | optional: with it, the background deletions of stopped sandboxes run one at a time per session root; without it, all at once |
 | slirp4netns 0.4 or later, or the one `hpc-sandbox fetch-tools` downloads, and a `/dev/net/tun` that users may open | pods with egress ([Pods](pods.md#egress)) |

@@ -197,7 +197,7 @@ and `download` like any other ([Python API](python-api.md)).
 | Field | Default | Meaning |
 |---|---|---|
 | `name` | required | The service's name and hostname, which every service of the pod resolves to 127.0.0.1: a letter or digit, then up to 62 letters, digits, `_`, `.` or `-`. |
-| `sandbox` | required | A `SandboxSpec`: the image, `workdir`, `env`, `mounts` and `memory_mb`. Its `network` is ignored: services share the pod's. `cpus` is advisory. |
+| `sandbox` | required | A `SandboxSpec`: the image, `workdir`, `env`, `mounts` and `memory_mb`, and with `run_as="subids"` its `file_owners` ([Image file owners](#image-file-owners)). Its `network` is ignored: services share the pod's. `cpus` is advisory. |
 | `command` | `None` | The service's command, a full argv list. Without one, the service stays up, idle, for `exec`, like a sandbox. |
 | `healthcheck` | `None` | A `HealthCheck` ([Health checks](#health-checks)). |
 | `shm_mb` | `None` | The size of the service's `/dev/shm`, in MiB; 64 when `None`, as with Docker. |
@@ -215,7 +215,8 @@ behind, and a start that the pod's stop interrupts raises `SandboxStartError`.
 `start_service()` raises `ValueError` before anything starts for a name that is invalid or taken,
 an empty command, a `shm_mb` that is not positive, an unknown ulimit, a soft limit above its hard
 limit, an invalid health check, a `run_as` that is unknown or that the runtime cannot give, or
-`"subids"` in a pod without `users="subids"`, or a `sandbox` spec that `start()` would refuse.
+`"subids"` in a pod without `users="subids"`, `file_owners` in a service whose `run_as` is not
+`"subids"`, or a `sandbox` spec that `start()` would refuse.
 
 Each service gets:
 
@@ -268,9 +269,10 @@ and the switch succeed and do nothing, so the entrypoint, still root, starts ove
   `exec` run without the filter, and there these calls fail with `Invalid argument`.
 
 In every mode, the image's files belong to your uid on the host, as hpc-sandbox extracts them, so a
-service sees them as root's, or with `"caller"` as its own. Commands get `HOME=/root` unless `env`
-sets it. The service's owner record says how it ran: `run_as`, and `remap_root` and
-`container_uid` as for a sandbox, `false` and your uid with `"caller"`.
+service sees them as root's, or with `"caller"` as its own, unless a `"subids"` service gives them
+the owners they have in the image ([Image file owners](#image-file-owners)). Commands get
+`HOME=/root` unless `env` sets it. The service's owner record says how it ran: `run_as`, and
+`remap_root` and `container_uid` as for a sandbox, `false` and your uid with `"caller"`.
 
 A PostgreSQL server with its image's own entrypoint and command:
 
@@ -357,6 +359,32 @@ another id owns, never following a link or crossing into another filesystem. Thi
 When it fails, hpc-sandbox logs a warning, and the deletion refuses what is left, naming it. What a
 service writes as another user into a writable bind from outside `pod.path` stays your subordinate
 ids'.
+
+### Image file owners
+
+The image's files all belong to root in a `"subids"` service, even those that the image gives to
+another user, such as `redis:7-alpine`'s `/data`, which its user `redis` (uid 999) then cannot
+write. The service's `SandboxSpec(file_owners=...)` names a manifest of the owners that the image
+gives its files ([File owners](python-api.md#file-owners)), which the service's launcher applies
+once it has joined the pod's user namespace, as root there, before the container and its command
+start:
+
+```python
+REDIS = ServiceSpec(
+    "redis",
+    SandboxSpec(image="docker://redis:7-alpine", workdir="/data", file_owners="redis.owners"),
+    # As the image's user, which can write in /data with the owners of the image's layers.
+    command=["setpriv", "--reuid", "999", "--regid", "1000", "--clear-groups", "redis-server"],
+    run_as="subids",  # in a pod started with PodSpec(users="subids")
+)
+```
+
+An id that the pod's user namespace does not map, one beyond your subordinate ids, fails the start
+with `SandboxStartError`. The paths that name nothing in the root filesystem, and those at or below
+`/dev`, `/proc`, `/sys`, `/tmp` and `/var/tmp`, which the service mounts its own over, are skipped
+and logged. Services with `run_as="root"` or `"caller"` map one id, and raise `ValueError` for a
+manifest. What it gives to other users belongs to your subordinate ids on the host, and is given
+back with the rest ([Subordinate ids](#subordinate-ids)).
 
 ## Names
 

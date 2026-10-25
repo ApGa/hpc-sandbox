@@ -207,6 +207,7 @@ containers even with `--cleanenv`, and whose URLs may hold credentials. Give the
 | `HPC_SANDBOX_TEST_IMAGE` | Tests only | The image of the integration tests; default `docker://alpine:3.20`. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | Tests only | `1` also tests `network="none"` with Singularity, where the site allows it. enroot always tests it. |
 | `HPC_SANDBOX_TEST_FAKEROOT` | Tests only | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user. |
+| `HPC_SANDBOX_TEST_FILE_OWNERS_IMAGE` | Tests only | The image of the integration tests of file owners manifests, which run with `HPC_SANDBOX_TEST_FAKEROOT=1` or `HPC_SANDBOX_TEST_SUBIDS=1` and list the owners that the layers of `node:20-alpine` give; default `docker://node:20-alpine`. |
 | `HPC_SANDBOX_TEST_GPUS` | Tests only | Tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | Tests only | The image of the pod integration tests' services; default `docker://alpine:3.20`. |
 | `HPC_SANDBOX_TEST_APT_IMAGE` | Tests only | The image of the pod integration test that runs apt; default `docker://python:3.12-slim`. |

@@ -27,6 +27,33 @@ one minor release, require a range such as `hpc-sandbox>=0.4,<0.5`.
   your uid before the pod's files are deleted: at a stop, when a service stops before its pod, and
   when a janitor sweeps an abandoned pod. With Singularity, `hpc-sandbox doctor` shows your
   subordinate ids on a new `pods: subordinate ids` line. See [Users](docs/pods.md#users).
+- **Sandboxes that map other users can give an image's files the owners its layers give them**:
+  hpc-sandbox extracts every image as your uid, so in a `fakeroot` sandbox or a `"subids"` pod
+  service every file was root's, and a user that the image gives a directory, such as
+  `redis:7-alpine`'s `/data`, could not write there. `SandboxSpec(file_owners=...)` names a
+  manifest that you write, with one `UID GID PATH` line for each path that the image gives to an
+  owner other than root. A Singularity sandbox with `fakeroot=True` applies it as root of its
+  instance's user namespace, once the instance runs and before any command does, and a service
+  with `run_as="subids"` before its container and command start. Links are never followed, files
+  keep their set-user-ID and set-group-ID bits, and the paths that name nothing in the root
+  filesystem, or lie at or below `/dev`, `/proc`, `/sys`, `/tmp` and `/var/tmp`, which the sandbox
+  mounts its own over, are skipped with a warning. An id that the namespace does not map fails the
+  start with `SandboxStartError`, and a restore applies its spec's manifest again. A manifest that
+  cannot be read, or has a malformed line, such as one with CRLF line ends, raises `ValueError`
+  before anything starts, and so does any manifest in the other sandboxes and services, which map
+  one id. What a manifest gives to other users is given back to your uid with the rest before the
+  files are deleted. See [File owners](docs/python-api.md#file-owners).
+
+### Fixed
+
+- **A snapshot of a `fakeroot` sandbox reads the files of the sandbox's other users, whatever
+  their modes**: it copies them as root of the instance's user namespace, with util-linux
+  `nsenter`, and gives each copy to your uid, as before. Copied as your uid, a snapshot failed on a
+  file or directory of another user that kept you out, such as a file that a command wrote as
+  another user under a umask such as 027, or a directory that a file owners manifest gives to
+  another user, as those of Debian's and Ubuntu's images do: the `_apt` user's
+  `/var/cache/apt/archives/partial`, mode 700, or the home directory of `ubuntu:24.04`'s user
+  `ubuntu`, mode 750. See [Snapshots and restores](docs/python-api.md#snapshots-and-restores).
 
 ## 0.4.0 (2026-10-19)
 

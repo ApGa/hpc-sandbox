@@ -34,9 +34,10 @@ reaches, including services that listen on the node's own network addresses.
 - **Your subordinate ids.** With Singularity's `fakeroot` and in pods with `users="subids"`, root
   can switch to the users of your subordinate ids. The kernel treats them as other users of the
   node: a command that switched reaches your files only as far as their modes let others, and what
-  it writes belongs to that id until hpc-sandbox gives it back to you, before deleting it. Such
-  namespaces allow `setgroups`, so their root can also leave your groups, and reach what a mode
-  grants others but denies one of your groups.
+  it writes, like the image's files that a file owners manifest gives to such a user, belongs to
+  that id until hpc-sandbox gives it back to you, before deleting it. Such namespaces allow
+  `setgroups`, so their root can also leave your groups, and reach what a mode grants others but
+  denies one of your groups.
 - **The kernel.** Sandboxes share the host's kernel, so a kernel vulnerability, including one that
   unprivileged user namespaces expose, is a way out. Apart from the `ulimits` of pod services,
   hpc-sandbox does not limit the processes, CPU time, disk space or inodes a sandbox uses: `cpus` is
