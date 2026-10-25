@@ -910,16 +910,19 @@ class SingularityService(PodService, SingularitySandbox):
     """A pod service as a long-lived ``singularity exec``; start it with ``pod.start_service``.
 
     The launcher's init puts the runtime in a nested user namespace of its
-    own, so Singularity runs unprivileged (its non-setuid starter) as root of
-    that namespace, which holds no capability over the pod's network, and its
-    starter is never the service's PID 1. ``--containall`` gives the container
-    its own PID and IPC namespaces too; commands enter all of them.
+    own, so Singularity runs unprivileged (its non-setuid starter) in that
+    namespace, which holds no capability over the pod's network, and its
+    starter is never the service's PID 1. The namespace maps root alone with
+    ``run_as="root"``, and root and every subordinate id of the pod with
+    ``"subids"``; with ``"caller"`` it maps your uid and gid, and Singularity
+    runs with ``--userns`` as them. ``--containall`` gives the container its
+    own PID and IPC namespaces too; commands enter all of them.
     """
 
-    anchor_options = ("--userns",)
-
-    def _user(self) -> dict[str, Any]:
-        return {"remap_root": True, "container_uid": 0}
+    def _userns_options(self) -> list[str]:
+        if self.service.run_as == "caller":
+            return ["--userns", f"caller={os.getuid()}:{os.getgid()}"]
+        return ["--userns", self.service.run_as]  # root, or subids
 
     def _prepare_service_rootfs(self) -> None:
         assert self._session is not None
@@ -937,6 +940,7 @@ class SingularityService(PodService, SingularitySandbox):
         session = self._session
         args = [
             "exec",
+            *(["--userns"] if self.service.run_as == "caller" else []),
             "--cleanenv",
             "--no-eval",
             "--writable",

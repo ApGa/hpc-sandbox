@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Container, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,8 +52,9 @@ def identity_matches(pid: int, expected_start_time: str) -> bool:
     return pid > 0 and start_time(pid) == expected_start_time
 
 
-def owned_live_start_time(pid: int) -> str | None:
-    """Return the start time of a live (non-zombie) process owned by this uid."""
+def owned_live_start_time(pid: int, also: Container[int] = ()) -> str | None:
+    """Return the start time of a live (non-zombie) process owned by this uid, or by one of the
+    uids ``also`` names (the subordinate ids a pod service may switch to)."""
     if pid <= 0:
         return None
     try:
@@ -61,7 +62,7 @@ def owned_live_start_time(pid: int) -> str | None:
     except OSError:
         return None
     fields = _stat_fields(pid)
-    if owner != os.getuid() or fields is None or fields[0] == "Z":
+    if (owner != os.getuid() and owner not in also) or fields is None or fields[0] == "Z":
         return None
     return fields[19]
 

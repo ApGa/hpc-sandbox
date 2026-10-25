@@ -1090,13 +1090,28 @@ class EnrootService(PodService, EnrootSandbox):
     """A pod service as an enroot container; start it with ``pod.start_service``.
 
     Enroot's own user namespace, nested in the pod's, is where root lives, so
-    commands in the service hold no capability over the pod's network.
+    commands in the service hold no capability over the pod's network. With
+    ``run_as="caller"``, the launcher nests a user namespace that maps your uid
+    and gid to the pod's root, and enroot runs without ``--root`` in it, so
+    commands run as your uid. Enroot maps one id into a container, so it cannot
+    run ``"subids"`` services.
     """
+
+    run_modes = ("root", "caller")
+
+    def _userns_options(self) -> list[str]:
+        if self.service.run_as == "caller":
+            return ["--userns", f"caller={os.getuid()}:{os.getgid()}"]
+        return []  # enroot's own user namespace holds root
+
+    @property
+    def _remap_root(self) -> bool:
+        return self._provider.remap_root and self.service.run_as == "root"
 
     def _runtime_command(self, argv: list[str]) -> list[str]:
         assert self._session is not None
         session, provider = self._session, self._provider
-        args = ["start", "--rw", *(["--root"] if provider.remap_root else [])]
+        args = ["start", "--rw", *(["--root"] if self._remap_root else [])]
         args += ["--rc", str(session.path / RC_FILE)]
         mounts = [
             f"{session.tmp}:/tmp:none:x-create=dir,bind,rw,nosuid",
@@ -1118,9 +1133,8 @@ class EnrootService(PodService, EnrootSandbox):
 
     def _runtime_environment(self) -> dict[str, str]:
         assert self._session is not None
-        provider = self._provider
-        return provider.runtime.container_environment(
-            self._session, remap_root=provider.remap_root, gpus=None
+        return self._provider.runtime.container_environment(
+            self._session, remap_root=self._remap_root, gpus=None
         )
 
 

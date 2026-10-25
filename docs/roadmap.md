@@ -12,7 +12,7 @@ hpc-sandbox does not do these things yet. Each row says what happens today inste
 | sandboxes | separate PID namespaces for groups of commands inside one sandbox | each sandbox has one PID namespace, shared by all its commands |
 | pods | snapshots of services | `snapshot()` on a pod service raises `SandboxError` |
 | pods | GPUs | services get no GPUs |
-| pods | services that switch to other users | a pod maps one id, your uid, to root; more users would need subordinate id ranges |
+| pods | services that switch to other users on enroot, or without subordinate ids | enroot maps one id into a container, and a pod without `users="subids"` maps only your uid: their services run as root or as your uid ([Users](pods.md#users)) |
 | pods | host networking | a pod's network is loopback only, or egress through slirp4netns |
 | pods | egress allowlists | egress reaches every host that slirp4netns can reach, except the host's loopback |
 

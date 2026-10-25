@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from hpc_sandbox import EnrootProvider, SingularityProvider
+from hpc_sandbox import EnrootProvider, SingularityProvider, subids
 from hpc_sandbox.enroot import ANCHOR_SCRIPT
 from hpc_sandbox.sandbox import _DELETIONS
 
@@ -175,6 +175,65 @@ def namespaces_unavailable() -> str | None:
     if probe.returncode != 0:
         return f"unprivileged user namespaces are unavailable: {probe.stderr.decode().strip()}"
     return None
+
+
+# A stand-in for newuidmap and newgidmap (``newuidmap PID 0 ID 1 1 START COUNT``): it records its
+# arguments, then writes the one extent that an unprivileged process may write for another, its own
+# id as root, so a pod maps no subordinate ids but takes every step it takes to map them.
+FAKE_IDMAP = """\
+#!{python}
+import json, os, sys
+tool = os.path.basename(sys.argv[0])
+pid, own = sys.argv[1], sys.argv[3]
+with open({calls!r}, "a") as out:
+    out.write(json.dumps([tool, *sys.argv[1:]]) + "\\n")
+if os.path.exists({fails!r}):
+    print(f"{{tool}}: write to {{tool[3:6]}}_map failed: Operation not permitted", file=sys.stderr)
+    sys.exit(1)
+if tool == "newgidmap":
+    with open(f"/proc/{{pid}}/setgroups", "w") as stream:
+        stream.write("deny")
+with open(f"/proc/{{pid}}/{{tool[3:6]}}_map", "w") as stream:
+    stream.write(f"0 {{own}} 1\\n")
+"""
+
+
+class FakeSubids:
+    """Handle on the fake ``newuidmap`` and ``newgidmap`` and the subordinate id files."""
+
+    START, COUNT = 200000, 65536
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.fails = directory / "fails"  # exists: the tools refuse
+
+    def calls(self) -> list[list[str]]:
+        path = self.directory / "calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.fixture
+def fake_subids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSubids:
+    """Fake ``newuidmap`` and ``newgidmap`` first on PATH, and ``/etc/subuid`` and ``/etc/subgid``
+    that give this user (by uid, after another user's line) ``FakeSubids.COUNT`` ids from
+    ``FakeSubids.START``."""
+    directory = tmp_path / "subids"
+    directory.mkdir()
+    fake = FakeSubids(directory)
+    for tool in subids.TOOLS:
+        script = directory / tool
+        script.write_text(
+            FAKE_IDMAP.format(
+                python=sys.executable, calls=str(directory / "calls.jsonl"), fails=str(fake.fails)
+            )
+        )
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
+    for name in ("SUBUID", "SUBGID"):
+        listing = directory / name.lower()
+        listing.write_text(f"someone-else:100000:65536\n{os.getuid()}:{fake.START}:{fake.COUNT}\n")
+        monkeypatch.setattr(subids, name, listing)
+    return fake
 
 
 def hide_from_path(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:

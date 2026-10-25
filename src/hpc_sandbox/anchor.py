@@ -28,13 +28,17 @@ PID, IPC and UTS namespaces, and forks an init of its own as their PID 1. The
 init sets the service's hostname (``--hostname NAME``), resource limits
 (``--rlimit NAME=SOFT:HARD``, within the hard limits it has) and an optional
 sized tmpfs (``--shm DIR:BYTES``, for the runtime to bind at ``/dev/shm``),
-then runs COMMAND as its child, in a nested user namespace mapping root to
-root with ``--userns``, with its output through a pipe this process copies to
-its own (so the service cannot truncate the log, and no file size limit of the
-service applies to it). Root in a nested user namespace holds no capability
-over the pod's network. The init forwards SIGTERM, SIGINT and SIGHUP to the
-child, reaps orphans, and exits with the child's status; the runtime is never
-PID 1, so killing the init always ends the service.
+then runs COMMAND as its child, with its output through a pipe this process
+copies to its own (so the service cannot truncate the log, and no file size
+limit of the service applies to it). With ``--userns MODE`` the child runs it
+in a nested user namespace, which holds no capability over the pod's network:
+``root`` maps root to the pod's root, the caller, and nothing else;
+``caller=UID:GID`` maps the caller's own uid and gid, so that COMMAND runs as
+them, without capabilities; ``subids`` maps every id the pod's namespace maps
+to itself, which the init writes for the child, so that root there can switch
+to the caller's subordinate ids. The init forwards SIGTERM, SIGINT and SIGHUP
+to the child, reaps orphans, and exits with the child's status; the runtime is
+never PID 1, so killing the init always ends the service.
 """
 
 from __future__ import annotations
@@ -75,8 +79,12 @@ def _check(result: int, what: str) -> None:
 
 
 def _write(path: str, text: str) -> None:
-    with open(path, "w") as stream:
-        stream.write(text)
+    """Write ``text`` with one system call, as the kernel's id maps need."""
+    fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
 
 
 def _die_with_parent() -> None:
@@ -119,7 +127,7 @@ def _setns(path: str, nstype: int) -> None:
 def _join(argv: list[str]) -> int:
     """The ``join`` form: a pod service below the holder ``argv[0]``."""
     holder, options, command = argv[0], argv[1 : argv.index("--")], argv[argv.index("--") + 1 :]
-    hostname, rlimits, shm, nested = None, [], None, False
+    hostname, rlimits, shm, userns = None, [], None, None
     while options:
         option = options.pop(0)
         if option == "--hostname":
@@ -132,7 +140,14 @@ def _join(argv: list[str]) -> int:
             directory, _, size = options.pop(0).rpartition(":")
             shm = (directory, int(size))
         elif option == "--userns":
-            nested = True
+            userns = options.pop(0)
+            mode, _, ids = userns.partition("=")
+            uid, _, gid = ids.partition(":")
+            if not (
+                userns in ("root", "subids")
+                or (mode == "caller" and uid.isdigit() and gid.isdigit())
+            ):
+                raise OSError(22, f"unknown user namespace {userns}")
         else:
             raise OSError(22, f"unknown option {option}")
     # The user namespace first: it owns the network namespace.
@@ -156,7 +171,7 @@ def _join(argv: list[str]) -> int:
             os.dup2(output_write, 1)
             os.dup2(output_write, 2)
             os.close(output_write)
-            os._exit(_service_init(hostname, rlimits, shm, nested, command))
+            os._exit(_service_init(hostname, rlimits, shm, userns, command))
         except OSError as error:
             print(f"hpc-sandbox: {error}", file=sys.stderr)
             os._exit(1)
@@ -184,7 +199,7 @@ def _service_init(
     hostname: str | None,
     rlimits: list[tuple[str, int, int]],
     shm: tuple[str, int] | None,
-    nested: bool,
+    userns: str | None,
     command: list[str],
 ) -> int:
     """PID 1 of a service: set it up, run COMMAND as a child, pass on signals, reap."""
@@ -204,21 +219,29 @@ def _service_init(
             _libc.mount(b"tmpfs", directory.encode(), b"tmpfs", MS_NOSUID | MS_NODEV, options),
             f"mount tmpfs at {directory}",
         )
+    # For a namespace the init maps: the child made it, and its maps are written.
+    unshared_read, unshared_write = os.pipe()
+    mapped_read, mapped_write = os.pipe()
     child = os.fork()
     if child == 0:
+        os.close(unshared_read)
+        os.close(mapped_write)
         try:
             _die_with_parent()
-            if nested:
-                _check(_libc.unshare(CLONE_NEWUSER), "unshare (nested user namespace)")
-                _write("/proc/self/setgroups", "deny")
-                _write("/proc/self/uid_map", "0 0 1")
-                _write("/proc/self/gid_map", "0 0 1")
+            if userns is not None:
+                _nested_userns(userns, unshared_write, mapped_read)
             for ignored in (signal.SIGPIPE, signal.SIGXFSZ):
                 signal.signal(ignored, signal.SIG_DFL)
             os.execvp(command[0], command)
         except OSError as error:
             print(f"hpc-sandbox: cannot run {command[0]}: {error}", file=sys.stderr)
         os._exit(127)
+    os.close(unshared_write)
+    os.close(mapped_read)
+    if userns == "subids":
+        _map_like_the_pod(child, unshared_read, mapped_write)
+    os.close(unshared_read)
+    os.close(mapped_write)
     for forwarded in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(forwarded, lambda signum, _frame: _forward(child, signum))
     status = 0
@@ -233,6 +256,41 @@ def _service_init(
             status = 128 + os.WTERMSIG(raw) if os.WIFSIGNALED(raw) else os.WEXITSTATUS(raw)
             break
     return status
+
+
+def _nested_userns(mode: str, unshared: int, mapped: int) -> None:
+    """In the init's child: make the user namespace that ``--userns MODE`` asks for."""
+    _check(_libc.unshare(CLONE_NEWUSER), "unshare (nested user namespace)")
+    if mode == "subids":  # the init maps it: only a process outside may write several extents
+        os.write(unshared, b"1")
+        if os.read(mapped, 1) != b"1":
+            raise OSError(1, "the service's user namespace could not be mapped")
+        with open("/proc/self/setgroups") as stream:
+            if stream.read().strip() == "allow":
+                os.setgroups([0])  # without the host's supplementary groups, as root in Docker
+        return
+    uid, gid = mode.removeprefix("caller=").split(":") if mode != "root" else ("0", "0")
+    _write("/proc/self/setgroups", "deny")
+    _write("/proc/self/uid_map", f"{uid} 0 1")
+    _write("/proc/self/gid_map", f"{gid} 0 1")
+
+
+def _map_like_the_pod(child: int, unshared: int, mapped: int) -> None:
+    """Map the child's new user namespace as the pod's is, each id to itself: root to the pod's
+    root, the caller, and the subordinate ids to themselves."""
+    if os.read(unshared, 1) != b"1":
+        return  # the child failed first; its status and output say why
+    try:
+        for name in ("uid_map", "gid_map"):
+            with open(f"/proc/self/{name}") as stream:
+                extents = [line.split() for line in stream if line.strip()]
+            mirror = "".join(f"{inside} {inside} {count}\n" for inside, _, count in extents)
+            _write(f"/proc/{child}/{name}", mirror)
+    except OSError as error:
+        print(f"hpc-sandbox: cannot map the service's user namespace: {error}", file=sys.stderr)
+        os.write(mapped, b"0")
+        return
+    os.write(mapped, b"1")
 
 
 def _forward(child: int, signum: int) -> None:

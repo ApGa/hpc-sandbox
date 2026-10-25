@@ -72,6 +72,7 @@ from .types import (
 
 if TYPE_CHECKING:
     from .pods import SessionPod
+    from .subids import SubordinateIds
 
 log = logging.getLogger(__name__)
 
@@ -323,16 +324,48 @@ class SessionProvider(Generic[S]):
         """
         from .pods import SessionPod, check_pod
 
-        if "pods" not in self.capabilities or self.service_type is None:
-            raise ValueError(f"the {self.name} provider does not run pods")
+        self._check_pods()
         check_pod(spec)
+        ids = None
+        if spec.users == "subids":
+            ids = self._subordinate_ids()  # fail before anything starts
         if spec.network == "egress":
             self.slirp4netns()  # fail before anything starts
         self.nsenter  # noqa: B018 - fail before anything starts
         await self._prepare()
-        pod = SessionPod(self, spec)
+        pod = SessionPod(self, spec, ids=ids)
         await pod._boot()
         return pod
+
+    async def map_subordinate_ids(self) -> None:
+        """Map your subordinate ids for pods with ``users="subids"`` now, not at the first one.
+
+        The mapping is made once per process and serves its later pods, and those of the
+        processes it forks afterwards: a fork server calls this before it forks its workers.
+        Raises ``ValueError`` where the provider's services cannot switch users (enroot),
+        :class:`SandboxError` when your user has no subordinate ids or ``newuidmap`` or
+        ``newgidmap`` is missing, and :class:`SandboxStartError` when they refuse, or do not
+        finish within ``start_timeout_s``.
+        """
+        from .pods import id_namespace
+
+        self._check_pods()
+        await id_namespace(self._subordinate_ids(), self.start_timeout_s)
+
+    def _check_pods(self) -> None:
+        if "pods" not in self.capabilities or self.service_type is None:
+            raise ValueError(f"the {self.name} provider does not run pods")
+
+    def _subordinate_ids(self) -> SubordinateIds:
+        """Your subordinate ids and the tools that map them, for a pod with ``users="subids"``."""
+        from . import subids
+
+        if "subids" not in self.service_type.run_modes:
+            raise ValueError(
+                f"the {self.name} provider runs no services with run_as='subids', so its pods "
+                "cannot map subordinate ids (users='subids'): its containers map one id"
+            )
+        return subids.find()
 
     def slirp4netns(self) -> str:
         """The slirp4netns pods use for egress; see :func:`hpc_sandbox.tools.find_slirp4netns`."""
@@ -387,8 +420,9 @@ class SessionProvider(Generic[S]):
         return [*roots, (self.pod_root, True, self._stop_abandoned_pod)]
 
     async def _stop_abandoned_pod(self, path: Path, record: dict[str, Any] | None) -> bool:
-        """Stop the services, the holder and slirp4netns of an abandoned pod."""
-        from .pods import SERVICES_DIRECTORY
+        """Stop the services, the holder and slirp4netns of an abandoned pod, then give your uid
+        back what the other users of a pod with ``users="subids"`` left."""
+        from .pods import SERVICES_DIRECTORY, give_back
 
         stopped = False
         services = path / SERVICES_DIRECTORY
@@ -411,6 +445,11 @@ class SessionProvider(Generic[S]):
                 pid, started = record.get(f"{role}_pid"), record.get(f"{role}_start_time")
                 if isinstance(pid, int) and isinstance(started, str):
                     stopped |= await asyncio.to_thread(kill_exact, [(pid, started)], name)
+        if record is not None and record.get("users") == "subids":  # only now: nothing runs
+            try:
+                await give_back(path, self.nsenter)
+            except SandboxError as error:  # the deletion then names what it could not delete
+                log.warning("hpc-sandbox janitor: %s", error)
         return stopped
 
     async def _stop_abandoned_service(self, path: Path, record: dict[str, Any] | None) -> bool:

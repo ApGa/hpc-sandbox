@@ -60,6 +60,7 @@ builds a sandbox.
 | `await restore(snapshot, spec)` | Starts a sandbox whose files come from a snapshot; see [Snapshots and restores](#snapshots-and-restores). |
 | `await delete_snapshot(snapshot)` | Deletes a snapshot's files. |
 | `await start_pod(spec)` | Starts a pod; see [Pods](pods.md). |
+| `await map_subordinate_ids()` | Maps your subordinate ids for pods with `users="subids"` now, once per process, rather than at the first such pod; see [Subordinate ids](pods.md#subordinate-ids). |
 | `await reap(labels=None)` | Stops this provider's sandboxes and pods that carry `labels`, sweeps abandoned sessions on the node and returns a `JanitorReport`; see [Reaping and janitors](#reaping-and-janitors). |
 | `await wait_for_deletions(timeout_s=300.0)` | Waits until the files of the sandboxes and pods that this process stopped are deleted; returns `False` on timeout. |
 | `name` | `"singularity"` or `"enroot"`. |
@@ -607,8 +608,8 @@ protocol.
 `await provider.start_pod(PodSpec(...))` starts a pod: services that share one network, like a
 docker-compose project. It returns a `SessionPod`, whose `start_service(ServiceSpec(...))` returns a
 service: a `SingularityService` or an `EnrootService`, both `PodService` sandboxes with `exec`,
-`upload` and `download`. `HealthCheck`, `PodNetwork` and `ServiceHealth` complete the pod API.
-[Pods](pods.md) describes all of it.
+`upload` and `download`. `HealthCheck`, `PodNetwork`, `PodUsers`, `ServiceHealth` and `ServiceRunAs`
+complete the pod API. [Pods](pods.md) describes all of it.
 
 ## Capabilities
 
@@ -698,7 +699,7 @@ logging configuration, Python prints warnings and errors on stderr;
 | Results | `ExecResult`, `DownloadReport`, `DroppedLink`, `SandboxSnapshot`, `JanitorReport` |
 | Error contract | `CWD_ERROR_EXIT_CODE`, `CWD_ERROR_PREFIX`, `CWD_ERROR_REASONS`, `SandboxError`, `SandboxStartError`, `SandboxLostError` |
 | Protocols | `SandboxProvider`, `Sandbox`, `PodProvider`, `Pod` |
-| Pods | `PodSpec`, `ServiceSpec`, `HealthCheck`, `PodNetwork`, `ServiceHealth`, `SessionPod`, `PodService`, `SingularityService`, `EnrootService` |
+| Pods | `PodSpec`, `ServiceSpec`, `HealthCheck`, `PodNetwork`, `PodUsers`, `ServiceHealth`, `ServiceRunAs`, `SessionPod`, `PodService`, `SingularityService`, `EnrootService` |
 | Images | `ImageStore`, `ImageFormat`, `ResolvedImage`, `SifImages`, `SquashfsImages` |
 | Runtimes | `ContainerRuntime` and `EnrootRuntime`: the runtime command lines a provider runs, as its `runtime` attribute |
 
