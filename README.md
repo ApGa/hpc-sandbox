@@ -56,7 +56,7 @@ pip install hpc-sandbox
 ```
 
 This installs the `hpc_sandbox` package and the `hpc-sandbox` command (`python -m hpc_sandbox` runs
-the same). Below 1.0, a minor release may change the API, so pin one (`hpc-sandbox>=0.4,<0.5`);
+the same). Below 1.0, a minor release may change the API, so pin one (`hpc-sandbox>=0.5,<0.6`);
 [CHANGELOG.md](CHANGELOG.md) has the release notes.
 
 ## Quickstart
