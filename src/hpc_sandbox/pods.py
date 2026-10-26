@@ -1,8 +1,9 @@
 """Pods: services sharing one network, like a docker-compose project.
 
 A pod is a holder process (:mod:`hpc_sandbox.holder`) that owns a user
-namespace mapping the caller to root and a network namespace with only an up
-loopback, plus one container per service:
+namespace mapping the caller to root (and, with ``users="subids"``, the
+caller's subordinate ids to the users after it) and a network namespace with
+only an up loopback, plus one container per service:
 
 - **Services.** Each service is a sandbox whose container runs under the
   launcher's ``join`` form (:mod:`hpc_sandbox.anchor`): it joins the pod's user
@@ -13,6 +14,14 @@ loopback, plus one container per service:
   runtime puts the container in a nested user namespace, where root holds no
   capability over the pod's network: it can neither reconfigure it nor sniff
   it, as under Docker.
+- **Users.** A service's ``run_as`` says what that nested namespace maps:
+  root alone (``"root"``), the caller's own uid and gid, not root
+  (``"caller"``), or root and every subordinate id the pod maps
+  (``"subids"``). What a ``subids`` service writes as another user belongs to
+  a subordinate id on the host, which the caller cannot delete, so it is given
+  back to the caller (:func:`give_back`) before the files are deleted. The
+  launcher of a ``subids`` service whose spec has a file owners manifest gives
+  the image's paths their owners before the container and its command start.
 - **Names.** Every service resolves the names of all services, its own
   hostname and the pod's host aliases to 127.0.0.1 through an ``/etc/hosts``
   of its own, extended as services join; ``/etc/resolv.conf`` names
@@ -31,7 +40,8 @@ loopback, plus one container per service:
   exit pipe only the holder holds: it dies with the holder.
 - **Lifetime.** The holder, the launchers and their inits die with the
   process that started them; the pod's session directory holds the services'
-  session directories, so the janitor removes pods whole.
+  session directories, so the janitor removes pods whole, giving back what a
+  ``subids`` pod's other users left first.
 """
 
 from __future__ import annotations
@@ -47,16 +57,19 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+import weakref
+from collections.abc import AsyncIterator, Callable, Container, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self
 
-from . import procfs
-from .process import kill_tree
-from .sandbox import SessionSandbox, check_env, environment_script, poll
+from . import procfs, subids
+from .anchor import FILE_OWNERS_REPORT
+from .process import kill_tree, run_process
+from .sandbox import SessionSandbox, check_env, check_file_owners, environment_script, poll
 from .sessions import Session, create_session, new_instance_name, trash_session_awaiting
 from .types import (
     HealthCheck,
@@ -88,8 +101,9 @@ NAMESERVER = "10.0.2.3"  # slirp4netns's DNS forwarder
 LOG_TAIL_BYTES = 1 << 20
 READY = "hpc-sandbox-ready"
 # Run by /bin/sh -c as the service's container command, with its name, the
-# working directory and the command as arguments: announce that the container
-# is up, take the environment from the first line of stdin (see
+# umask that a missing working directory is made with (empty: the service's
+# own), the working directory and the command as arguments: announce that the
+# container is up, take the environment from the first line of stdin (see
 # environment_script), enter the working directory, creating it as Docker
 # does, and run the command with stdin from /dev/null.
 SERVICE_START = """\
@@ -99,9 +113,9 @@ hpc_sandbox_nl='
 IFS= read -r hpc_sandbox_env || exit 125
 eval "$hpc_sandbox_env" || exit 125
 exec </dev/null
-mkdir -p -- "$1" 2>/dev/null
-cd -- "$1" || exit 125
-shift
+( if [ -n "$1" ]; then umask "$1"; fi; mkdir -p -- "$2" ) 2>/dev/null
+cd -- "$2" || exit 125
+shift 2
 exec "$@"
 """
 # The command of a service without one: it stays up, idle, for exec.
@@ -111,6 +125,19 @@ command -v sleep >/dev/null 2>&1 || { echo "hpc-sandbox: the image has no sleep"
 exec >/dev/null 2>&1
 while :; do sleep 86400 & wait $!; done
 """
+# sh -c GIVE_BACK_SCRIPT hpc-sandbox-give-back TREE, run as root of a user namespace that maps the
+# caller's subordinate ids as a pod's with users="subids" does: give root, the caller outside, every
+# file below TREE that another id of the namespace owns, never following a link or crossing into
+# another filesystem. chown's failures, on owners the namespace does not map, are ignored: the
+# deletion refuses what is left, and names it. It exits with find's status.
+GIVE_BACK_SCRIPT = r"""
+find "$1" -xdev \( ! -user 0 -o ! -group 0 \) \
+  -exec /bin/sh -c 'chown -h 0:0 -- "$@" 2>/dev/null; exit 0' hpc-sandbox-chown {} +
+"""
+# How long giving back a pod's files may take: it walks every service's root filesystem.
+_GIVE_BACK_TIMEOUT_S = 600.0
+POD_USERS = ("single", "subids")
+RUN_AS = ("root", "caller", "subids")
 APT_DROP_IN = 'APT::Sandbox::User "root";\n'
 APT_DROP_IN_NAME = "99hpc-sandbox-aptfix"
 _SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
@@ -150,6 +177,8 @@ def check_pod(spec: PodSpec) -> dict[str, int]:
     """Validate ``spec``; return the pod port of each upstream."""
     if spec.network not in ("none", "egress"):
         raise ValueError(f"unknown pod network {spec.network!r}")
+    if spec.users not in POD_USERS:
+        raise ValueError(f"pod users must be one of {POD_USERS}, not {spec.users!r}")
     unknown = set(spec.upstream_ports) - set(spec.upstreams)
     if unknown:
         raise ValueError(f"upstream_ports names unknown upstreams: {sorted(unknown)}")
@@ -212,6 +241,13 @@ def check_service(spec: ServiceSpec) -> None:
         raise ValueError("a service command is a non-empty list of strings")
     if spec.shm_mb is not None and spec.shm_mb <= 0:
         raise ValueError("shm_mb must be positive")
+    if spec.run_as not in RUN_AS:
+        raise ValueError(f"run_as must be one of {RUN_AS}, not {spec.run_as!r}")
+    if spec.sandbox.file_owners is not None and spec.run_as != "subids":
+        raise ValueError(
+            "file_owners need run_as='subids': a service that runs as root alone or as your uid "
+            "maps one id, so its files cannot belong to other users"
+        )
     for name, limits in spec.ulimits.items():
         if name not in ULIMITS or (
             name not in UNAPPLIED_ULIMITS
@@ -297,13 +333,23 @@ class SessionPod:
     the block exits, however it exits.
     """
 
-    def __init__(self, provider: SessionProvider[Any], spec: PodSpec) -> None:
+    def __init__(
+        self,
+        provider: SessionProvider[Any],
+        spec: PodSpec,
+        *,
+        ids: subids.SubordinateIds | None = None,
+    ) -> None:
         self._id = new_instance_name()
         self.spec = spec
         self._ports = check_pod(spec)
         # The checked values, kept: a later change to the spec cannot reach the pod.
         self._exposes = tuple(spec.exposes)
         self._aliases = tuple(spec.hosts)
+        # The subordinate ids that a pod with users="subids" maps, and the user namespace of this
+        # process that maps them, which the pod's is made in (see id_namespace).
+        self._ids = ids
+        self._id_namespace: int | None = None
         self._routes = {name: f"http://127.0.0.1:{port}" for name, port in self._ports.items()}
         self._endpoints: dict[int, str] = {}
         self._expose_lock = asyncio.Lock()
@@ -394,7 +440,20 @@ class SessionPod:
             raise ValueError(f"wait must be 'started' or 'healthy', not {wait!r}")
         if spec.name in self._names:
             raise ValueError(f"pod {self.id} already has a service named {spec.name!r}")
+        if spec.run_as not in self._provider.service_type.run_modes:
+            raise ValueError(
+                f"the {self._provider.name} provider runs services with run_as in "
+                f"{self._provider.service_type.run_modes}, not {spec.run_as!r}: its containers "
+                "map one id"
+            )
+        if spec.run_as == "subids" and self.spec.users != "subids":
+            raise ValueError("run_as='subids' needs a pod started with PodSpec(users='subids')")
         self._provider._check(spec.sandbox, service=True)
+        if spec.sandbox.file_owners is not None:
+            await asyncio.to_thread(check_file_owners, spec.sandbox.file_owners)
+            self._require_running()
+            if spec.name in self._names:  # taken while the manifest was read
+                raise ValueError(f"pod {self.id} already has a service named {spec.name!r}")
         self._names.append(spec.name)
         task = asyncio.ensure_future(self._start_service(spec, wait))
         self._starting.add(task)
@@ -491,6 +550,8 @@ class SessionPod:
     async def _boot(self) -> None:
         provider = self._provider
         try:
+            if self._ids is not None:
+                self._id_namespace = await id_namespace(self._ids, provider.start_timeout_s)
             self._session = await create_session(provider.pod_root, self.id)
             self.services_root.mkdir(mode=0o700)
             self.exposed_root.mkdir(mode=0o700)
@@ -520,6 +581,7 @@ class SessionPod:
             provider=self._provider.name,
             kind="pod",
             labels=dict(self.spec.labels),
+            users=self.spec.users,
             holder_pid=self._holder.pid if self._holder else None,
             holder_start_time=self._holder_start_time,
             slirp_pid=self._slirp.pid if self._slirp else None,
@@ -528,6 +590,7 @@ class SessionPod:
 
     async def _start_holder(self) -> None:
         assert self._session is not None
+        namespace = self._id_namespace  # with users="subids", the holder makes the pod's inside
         ours, theirs = socket.socketpair()
         try:
             with (self._session.path / HOLDER_LOG).open("wb") as output:
@@ -541,11 +604,12 @@ class SessionPod:
                         str(os.getpid()),
                         str(theirs.fileno()),
                         self.id,
+                        "single" if namespace is None else f"nested:{namespace}",
                     ],
                     stdin=subprocess.DEVNULL,
                     stdout=output,
                     stderr=subprocess.STDOUT,
-                    pass_fds=[theirs.fileno()],
+                    pass_fds=[theirs.fileno(), *([] if namespace is None else [namespace])],
                     env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
                     start_new_session=True,
                 )
@@ -596,23 +660,16 @@ class SessionPod:
             await asyncio.to_thread(socket.send_fds, control, [data], fds)
         else:
             await loop.sock_sendall(control, data)
-        buffer = b""
-        deadline = time.monotonic() + _CONTROL_TIMEOUT_S
-        while b"\n" not in buffer:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:  # its answer may come later, out of step: give up on it
-                self._control = None
-                control.close()
-                raise SandboxLostError(f"the holder of pod {self.id} did not answer {request!r}")
-            try:
-                async with asyncio.timeout(remaining):
-                    chunk = await loop.sock_recv(control, 4096)
-            except TimeoutError:
-                continue
-            if not chunk:
-                raise SandboxLostError(f"the holder of pod {self.id} exited: {self._holder_log()}")
-            buffer += chunk
-        answer = buffer.decode(errors="replace").strip()
+        try:
+            answer = await _read_answer(control, _CONTROL_TIMEOUT_S)
+        except TimeoutError:  # its answer may come later, out of step: give up on it
+            self._control = None
+            control.close()
+            raise SandboxLostError(
+                f"the holder of pod {self.id} did not answer {request!r}"
+            ) from None
+        if answer is None:
+            raise SandboxLostError(f"the holder of pod {self.id} exited: {self._holder_log()}")
         if answer.startswith("error") or not answer.startswith(expected):
             raise SandboxError(f"the holder of pod {self.id} answered {answer!r}")
         return answer
@@ -885,6 +942,8 @@ class SessionPod:
             *(service.stop() for service in self._services.values()), return_exceptions=True
         )
         failures = [str(result) for result in results if isinstance(result, BaseException)]
+        if not failures and self.spec.users == "subids" and self._session is not None:
+            await self._give_back(self._session.path)  # nothing runs any more that could write
         await self._stop_egress()
         await self._stop_holder()
         if failures:
@@ -896,6 +955,15 @@ class SessionPod:
             self._session = None
             if doomed is not None:
                 await self._provider._delete_in_background(doomed)
+
+    async def _give_back(self, path: Path) -> None:
+        """Give your uid back what the pod's other users own below ``path``, in the holder's user
+        namespace while it lives. A failure is logged: the deletion then names what is left."""
+        holder = self._holder.pid if self._holder is not None and self.holder_alive() else None
+        try:
+            await give_back(path, self._provider.nsenter, holder=holder, ids=self._ids)
+        except (SandboxError, OSError) as error:
+            log.warning("pod %s: %s", self.id, error)
 
     async def _stop_holder(self) -> None:
         holder, control = self._holder, self._control
@@ -915,18 +983,25 @@ class PodService(SessionSandbox):
     """One service of a pod: a container under a launcher joined to the pod.
 
     Providers combine this with their sandbox class and implement
-    :meth:`_runtime_command`, :meth:`_runtime_environment` and
-    :meth:`_prepare_service_rootfs`.
+    :meth:`_runtime_command`, :meth:`_runtime_environment`,
+    :meth:`_prepare_service_rootfs` and :meth:`_userns_options`.
     """
 
     _tracked = False  # the pod tracks its services
-    anchor_options: tuple[str, ...] = ()
+    #: The ``run_as`` modes that the runtime can give a service.
+    run_modes: tuple[str, ...] = RUN_AS
 
     def __init__(self, provider: SessionProvider[Any], pod: SessionPod, service: ServiceSpec):
         super().__init__(provider, service.sandbox)  # type: ignore[arg-type]
         self.pod = pod
         self.service = service
         self.name = service.name
+        # Who may own the service's command on the host: you, or once it switched users, one of
+        # the subordinate ids its namespace maps.
+        ids = pod._ids
+        self._owners: Container[int] = (
+            ids.uids.ids if ids is not None and service.run_as == "subids" else ()
+        )
         self._exit_status: int | None = None
         self._ulimits = effective_ulimits(service.ulimits)
         self._service_anchor: subprocess.Popen[bytes] | None = None
@@ -951,6 +1026,24 @@ class PodService(SessionSandbox):
 
     def _prepare_service_rootfs(self) -> None:
         """Runtime-specific preparation of the rootfs; runs in a worker thread."""
+
+    def _userns_options(self) -> list[str]:
+        """The launcher's ``--userns`` option for the service's ``run_as``, which makes the user
+        namespace the runtime runs in; none when the runtime makes one of its own."""
+        return []
+
+    def _user(self) -> dict[str, Any]:
+        caller = self.service.run_as == "caller"
+        return {"remap_root": not caller, "container_uid": os.getuid() if caller else 0}
+
+    def _workdir_umask(self) -> str:
+        # Like a --fakeroot sandbox's: the users a subids service switches to must be able to
+        # enter a working directory that the start makes, as Docker's -w makes it.
+        return "022" if self.service.run_as == "subids" else ""
+
+    async def _apply_file_owners(self) -> None:
+        """Nothing: the launcher gave the image's paths their owners before the container started
+        (``--file-owners``)."""
 
     # Files.
 
@@ -1011,6 +1104,8 @@ class PodService(SessionSandbox):
         if self.pod._stop_task is not None:  # the pod's deletion takes these files too
             session.release()
             return
+        if self.service.run_as == "subids":  # only such a service writes as other users
+            await self.pod._give_back(session.path)
         await super()._discard(session)
 
     async def snapshot(self) -> SandboxSnapshot:
@@ -1033,13 +1128,17 @@ class PodService(SessionSandbox):
 
     def _service_argv(self) -> list[str]:
         command = self.service.command or ["/bin/sh", "-c", SERVICE_KEEPALIVE]
-        return ["/bin/sh", "-c", SERVICE_START, self.id, self.spec.workdir, *command]
+        umask = self._workdir_umask()
+        return ["/bin/sh", "-c", SERVICE_START, self.id, umask, self.spec.workdir, *command]
 
     def _anchor_command(self) -> list[str]:
         shm_mb = self.service.shm_mb or DEFAULT_SHM_MB
         options = ["--hostname", self.name, "--shm", f"{self.shm_path}:{shm_mb * 1024 * 1024}"]
         for name, (soft, hard) in self._ulimits.items():
             options += ["--rlimit", f"{name}={soft}:{hard}"]
+        if self.spec.file_owners is not None:  # a subids service: the pod's namespace maps them
+            rootfs = str(self._files / "rootfs")
+            options += ["--file-owners", os.path.abspath(self.spec.file_owners), rootfs]
         return [
             sys.executable,
             "-I",
@@ -1049,7 +1148,7 @@ class PodService(SessionSandbox):
             "join",
             str(self.pod.holder_pid),
             *options,
-            *self.anchor_options,
+            *self._userns_options(),
             "--",
             *self._runtime_command(self._service_argv()),
         ]
@@ -1088,6 +1187,7 @@ class PodService(SessionSandbox):
                     )
                 await asyncio.sleep(0.02)
             self._identify()
+            self._report_file_owners(log_path)
             # The container's environment, read while its shell waits for the
             # service's own variables on stdin.
             environ = procfs.environ(self._container) if self._container else None
@@ -1103,6 +1203,16 @@ class PodService(SessionSandbox):
             if anchor.stdin is not None and not anchor.stdin.closed:
                 anchor.stdin.close()
         self._record()
+
+    def _report_file_owners(self, log_path: Path) -> None:
+        """Log what the launcher said of the entries of the file owners manifest it skipped."""
+        if self.spec.file_owners is None:
+            return
+        with contextlib.suppress(OSError), log_path.open("rb") as stream:
+            head = stream.read(64 * 1024).partition(f"{READY}\n".encode())[0]
+            for line in head.decode(errors="replace").splitlines():
+                if line.startswith(FILE_OWNERS_REPORT):
+                    log.warning("pod %s: service %s: %s", self.pod.id, self.name, line)
 
     def _identify(self) -> None:
         """Find the init (the launcher's child) and the container's shell (by its name)."""
@@ -1120,7 +1230,7 @@ class PodService(SessionSandbox):
         for pid in procfs.descendants([init]):
             argv = procfs.argv(pid)
             if argv is not None and argv[:4] == wanted:
-                container_start = procfs.owned_live_start_time(pid)
+                container_start = procfs.owned_live_start_time(pid, self._owners)
                 if container_start is not None:
                     self._container, self._container_start = pid, container_start
                     return
@@ -1210,7 +1320,7 @@ class PodService(SessionSandbox):
         container = self._container
         return (
             container is not None
-            and procfs.owned_live_start_time(container) == self._container_start
+            and procfs.owned_live_start_time(container, self._owners) == self._container_start
         )
 
     def _container_alive(self) -> bool:
@@ -1249,6 +1359,7 @@ class PodService(SessionSandbox):
             "init_start_time": self._service_init_start,
             "container_pid": self._container,
             "container_start_time": self._container_start,
+            "run_as": self.service.run_as,
         }
 
     def terminate(self) -> None:
@@ -1276,11 +1387,7 @@ class PodService(SessionSandbox):
                 kill_tree(anchor.pid)
             if await poll(anchor.poll, self._provider.stop_timeout_s) is None:
                 raise SandboxError(f"the launcher of service {self.name!r} survived SIGKILL")
-        container = self._container
-        if (
-            container is not None
-            and procfs.owned_live_start_time(container) == self._container_start
-        ):
+        if self._command_running():
             raise SandboxError(f"the container of service {self.name!r} survived teardown")
         code = anchor.returncode  # negative when the launcher itself was killed
         self._exit_status = 128 - code if code < 0 else code
@@ -1315,6 +1422,174 @@ async def connect_unix(path: str, timeout_s: float) -> socket.socket:
     except BaseException:
         connection.close()
         raise
+
+
+# The user namespaces that map this process's subordinate ids, by those ids: open descriptors that
+# keep them, with the device and inode of the namespace they name, which the holders of pods with
+# users="subids" make theirs in. newuidmap and newgidmap map one once (they can take seconds where
+# the ranges of many users overlap: shadow-utils looks up the owner of each range that holds an id
+# it checks), and every later pod of the process, and of the processes it forks, reuses it. In an
+# event loop, its lock lets one start map while the others wait; event loops of other threads may
+# map at the same time, and then one namespace is kept.
+_ID_NAMESPACES: dict[subids.SubordinateIds, tuple[int, tuple[int, int]]] = {}
+_ID_NAMESPACES_LOCK = threading.Lock()
+_ID_NAMESPACE_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def id_namespace(ids: subids.SubordinateIds, timeout_s: float) -> int:
+    """A descriptor of a user namespace that maps root to your uid and gid and 1 to N to ``ids``:
+    this process's, made the first time with ``newuidmap`` and ``newgidmap``, each allowed
+    ``timeout_s``, or the one it inherited. Raises :class:`SandboxStartError` when they refuse."""
+    if (fd := _kept_id_namespace(ids)) is not None:
+        return fd
+    lock = _ID_NAMESPACE_LOCKS.setdefault(asyncio.get_running_loop(), asyncio.Lock())
+    async with lock:
+        if (fd := _kept_id_namespace(ids)) is None:
+            async with _mapped_holder(ids, timeout_s) as pid:
+                fd = os.open(f"/proc/{pid}/ns/user", os.O_RDONLY | os.O_CLOEXEC)
+                # Kept at once: the holder's exit, which follows, may be cancelled.
+                with _ID_NAMESPACES_LOCK:
+                    kept, _ = _ID_NAMESPACES.setdefault(ids, (fd, _identity(fd)))
+                if kept != fd:  # an event loop of another thread mapped them too
+                    os.close(fd)
+                    fd = kept
+    return fd
+
+
+def _kept_id_namespace(ids: subids.SubordinateIds) -> int | None:
+    """The descriptor of the namespace of ``ids`` that this process keeps, while it still names
+    that namespace: a process forked after the mapping inherits it, but may have closed it since,
+    and its number may be another file's."""
+    with _ID_NAMESPACES_LOCK:
+        if (kept := _ID_NAMESPACES.get(ids)) is None:
+            return None
+        fd, identity = kept
+        with contextlib.suppress(OSError):
+            if _identity(fd) == identity:
+                return fd
+        del _ID_NAMESPACES[ids]  # not closed: the number is no longer ours
+    return None
+
+
+def _identity(fd: int) -> tuple[int, int]:
+    status = os.fstat(fd)
+    return status.st_dev, status.st_ino
+
+
+async def give_back(
+    path: Path,
+    nsenter: str,
+    *,
+    holder: int | None = None,
+    ids: subids.SubordinateIds | None = None,
+    timeout_s: float = _GIVE_BACK_TIMEOUT_S,
+) -> None:
+    """Make your uid the owner again of everything below ``path`` that a subordinate id owns.
+
+    What a service with ``run_as="subids"`` writes as another user belongs to one of your
+    subordinate ids on the host, which you can neither change nor delete, nor delete a directory
+    that holds it. :data:`GIVE_BACK_SCRIPT` runs as root of a user namespace that maps those ids
+    as the pod's does, with the host's ``find`` and ``chown``: ``holder``'s (a live pod's holder),
+    else this process's (:func:`id_namespace`, of ``ids``, by default :func:`subids.find`'s).
+    Run it only once nothing in the pod runs any more. Raises :class:`SandboxError` when it could
+    not run.
+    """
+    if holder is not None:
+        namespace = f"/proc/{holder}/ns/user"
+    else:
+        fd = await id_namespace(ids or subids.find(), timeout_s)
+        namespace = f"/proc/{os.getpid()}/fd/{fd}"
+    argv = [
+        nsenter,
+        f"--user={namespace}",
+        "--preserve-credentials",
+        "--",
+        "/bin/sh",
+        "-c",
+        GIVE_BACK_SCRIPT,
+        "hpc-sandbox-give-back",
+        str(path),
+    ]
+    environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    result = await run_process(argv, timeout_s=timeout_s, env=environment)
+    if result.returncode != 0 or result.timed_out:
+        raise SandboxError(
+            f"could not give back what the pod's other users left in {path}: {result.detail()}"
+        )
+
+
+@contextlib.asynccontextmanager
+async def _mapped_holder(ids: subids.SubordinateIds, timeout_s: float) -> AsyncIterator[int]:
+    """A holder whose user namespace ``newuidmap`` and ``newgidmap`` map with ``ids``, for as long
+    as the block runs; it yields the holder's PID."""
+    ours, theirs = socket.socketpair()
+    output = tempfile.TemporaryFile()
+    try:
+        holder = subprocess.Popen(  # noqa: ASYNC220 - a fork and exec
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                str(HOLDER_SCRIPT),
+                str(os.getpid()),
+                str(theirs.fileno()),
+                "subordinate-ids",
+                "subids",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            pass_fds=[theirs.fileno()],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            start_new_session=True,
+        )
+    except BaseException:
+        ours.close()
+        output.close()
+        raise
+    finally:
+        theirs.close()
+    loop = asyncio.get_running_loop()
+
+    async def expect(expected: str) -> None:
+        try:
+            answer = await _read_answer(ours, _CONTROL_TIMEOUT_S)
+        except TimeoutError:
+            answer = "nothing in time"
+        if answer is None or not answer.startswith(expected):
+            output.seek(0)
+            detail = output.read().decode(errors="replace").strip() or answer or "no output"
+            raise SandboxStartError(f"could not map your subordinate ids: {detail}")
+
+    try:
+        ours.setblocking(False)
+        await expect("unshared")
+        await subids.map_ids(holder.pid, ids, timeout_s)
+        await loop.sock_sendall(ours, b"mapped\nstart\n")
+        await expect("ready")
+        yield holder.pid
+    finally:
+        ours.close()  # the holder exits when its control socket closes
+        if await poll(holder.poll, _KILL_WAIT_S) is None:
+            holder.kill()
+            await poll(holder.poll, _KILL_WAIT_S)
+        output.close()
+
+
+async def _read_answer(control: socket.socket, timeout_s: float) -> str | None:
+    """A holder's next answer on its control socket, or None if it closed it; raises
+    :class:`TimeoutError` after ``timeout_s``."""
+    loop = asyncio.get_running_loop()
+    buffer = b""
+    async with asyncio.timeout(timeout_s):
+        while b"\n" not in buffer:
+            chunk = await loop.sock_recv(control, 4096)
+            if not chunk:
+                return None
+            buffer += chunk
+    return buffer.decode(errors="replace").strip()
 
 
 def add_apt_drop_in(rootfs: Path) -> None:

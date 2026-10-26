@@ -2,14 +2,23 @@
 
 :mod:`hpc_sandbox.pods` runs this file as a script in a fresh interpreter::
 
-    python -I -S holder.py PARENT_PID CONTROL_FD [POD_ID]
+    python -I -S holder.py PARENT_PID CONTROL_FD [POD_ID [USERS]]
 
 (``POD_ID`` only names the process for janitors). It
 
 1. arranges to be SIGKILLed when its parent (the provider process) dies, and
    exits at once if that already happened;
-2. creates new user and network namespaces, mapping the calling user and group
-   to root (``setgroups`` denied), and brings the loopback interface up;
+2. creates new user and network namespaces. With USERS ``single``, the
+   default, it maps the calling user and group to root (``setgroups``
+   denied). With ``subids``, it answers ``unshared`` on the control socket and
+   waits for ``mapped``: meanwhile the provider maps root to the calling user
+   and group, and 1 to N to its subordinate ids, with ``newuidmap`` and
+   ``newgidmap``, which leave ``setgroups`` allowed. With ``nested:FD``, it
+   first joins the user namespace that the descriptor FD names, one mapped so,
+   and makes its own inside it, which a child it forks for this, and which
+   stays outside, maps as that one is, each id to itself: only a process
+   outside may write more than one extent. Then it brings the loopback
+   interface up;
 3. lets the pod's root bind ports below 1024 and every mapped group open ICMP
    echo sockets, as Docker does for containers: services sit in nested user
    namespaces, which hold no capability over this network;
@@ -65,8 +74,12 @@ def _check(result: int, what: str) -> None:
 
 
 def _write(path: str, text: str) -> None:
-    with open(path, "w") as stream:
-        stream.write(text)
+    """Write ``text`` with one system call, as the kernel's id maps need."""
+    fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
 
 
 def _loopback_up() -> None:
@@ -76,18 +89,77 @@ def _loopback_up() -> None:
         fcntl.ioctl(sock, SIOCSIFFLAGS, struct.pack("16sh", b"lo", flags | IFF_UP))
 
 
-def _enter_namespaces() -> list[str]:
+def _read_line(control: socket.socket) -> str:
+    """One line from the control socket, a byte at a time: what follows it is the serve loop's."""
+    line = b""
+    while not line.endswith(b"\n"):
+        byte = control.recv(1)
+        if not byte:
+            return ""
+        line += byte
+    return line[:-1].decode(errors="replace")
+
+
+def _highest_mapped(path: str) -> int:
+    """The highest id that a ``uid_map`` or ``gid_map`` of this process maps."""
+    with open(path) as stream:
+        extents = [line.split() for line in stream if line.strip()]
+    return max((int(inside) + int(count) - 1 for inside, _, count in extents), default=0)
+
+
+def _nest(fd: int) -> None:
+    """Join the user namespace ``fd`` and make new user and network namespaces inside it, mapped
+    by a child that stays outside as the joined one is, each id to itself."""
+    _check(_libc.setns(fd, CLONE_NEWUSER), "setns (the user namespace of the subordinate ids)")
+    os.close(fd)
+    unshared_read, unshared_write = os.pipe()
+    mapper = os.fork()
+    if mapper == 0:  # root of the joined namespace, which may write any of its ids
+        os.close(unshared_write)
+        try:
+            _check(_libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0), "prctl")
+            if os.read(unshared_read, 1) != b"1":
+                os._exit(1)
+            for name in ("uid_map", "gid_map"):
+                with open(f"/proc/self/{name}") as stream:
+                    extents = [line.split() for line in stream if line.strip()]
+                mirror = "".join(f"{inside} {inside} {count}\n" for inside, _, count in extents)
+                _write(f"/proc/{os.getppid()}/{name}", mirror)
+        except OSError as error:
+            print(f"hpc-sandbox: cannot map the pod's user namespace: {error}", file=sys.stderr)
+            os._exit(1)
+        os._exit(0)
+    os.close(unshared_read)
+    _check(_libc.unshare(CLONE_NEWUSER | CLONE_NEWNET), "unshare (are user namespaces enabled?)")
+    os.write(unshared_write, b"1")
+    os.close(unshared_write)
+    _, status = os.waitpid(mapper, 0)
+    if os.waitstatus_to_exitcode(status) != 0 or os.getuid() != 0:  # the caller is root once mapped
+        raise OSError(errno.EPERM, "the pod's user namespace could not be mapped")
+
+
+def _enter_namespaces(users: str, control: socket.socket) -> list[str]:
     """Create the pod's namespaces; return what could not be set up (for the log)."""
     uid, gid = os.getuid(), os.getgid()
-    _check(_libc.unshare(CLONE_NEWUSER | CLONE_NEWNET), "unshare (are user namespaces enabled?)")
-    _write("/proc/self/setgroups", "deny")
-    _write("/proc/self/uid_map", f"0 {uid} 1")
-    _write("/proc/self/gid_map", f"0 {gid} 1")
+    if users.startswith("nested:"):
+        _nest(int(users.partition(":")[2]))
+    else:
+        _check(
+            _libc.unshare(CLONE_NEWUSER | CLONE_NEWNET), "unshare (are user namespaces enabled?)"
+        )
+    if users == "subids":
+        control.sendall(b"unshared\n")
+        if _read_line(control) != "mapped" or os.getuid() != 0:  # the caller is root once mapped
+            raise OSError(errno.EPERM, "the provider did not map the pod's user namespace")
+    elif users == "single":
+        _write("/proc/self/setgroups", "deny")
+        _write("/proc/self/uid_map", f"0 {uid} 1")
+        _write("/proc/self/gid_map", f"0 {gid} 1")
     _loopback_up()
     problems = []
     for path, value in (
         ("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0"),
-        ("/proc/sys/net/ipv4/ping_group_range", "0 0"),
+        ("/proc/sys/net/ipv4/ping_group_range", f"0 {_highest_mapped('/proc/self/gid_map')}"),
     ):
         try:
             _write(path, value)
@@ -269,15 +341,22 @@ async def _serve(control: socket.socket, problems: list[str]) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) not in (2, 3):
-        print("usage: holder.py PARENT_PID CONTROL_FD [POD_ID]", file=sys.stderr)
+    users = argv[3] if len(argv) == 4 else "single"
+    nested, _, fd = users.partition(":")
+    if len(argv) not in (2, 3, 4) or (
+        users not in ("single", "subids") and not (nested == "nested" and fd.isdigit())
+    ):
+        print(
+            "usage: holder.py PARENT_PID CONTROL_FD [POD_ID [single|subids|nested:FD]]",
+            file=sys.stderr,
+        )
         return 2
     parent, control_fd = int(argv[0]), int(argv[1])
     _check(_libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0), "prctl(PR_SET_PDEATHSIG)")
     if os.getppid() != parent:
         return 1  # the parent died before PR_SET_PDEATHSIG took effect
     control = socket.socket(fileno=control_fd)
-    problems = _enter_namespaces()
+    problems = _enter_namespaces(users, control)
     asyncio.run(_serve(control, problems))
     return 0
 

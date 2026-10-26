@@ -9,13 +9,18 @@ instance://`` runs commands on the host: ``--cwd`` and absolute-path arguments
 (except the script after ``-c``) are mapped onto the instance's binds and
 rootfs; system directories such as /bin and /usr stay host paths. ``exec
 DIRECTORY`` (as pod services run) needs to run as root of a user namespace,
-as it does under hpc-sandbox's launcher: like ``--containall``, it gives the
-command new mount and PID namespaces, the host's system directories, a fresh
-/proc and the binds, then chroots into the directory; a shim init runs the
-command as its child, as SingularityCE's does. ``exec --fakeroot DIRECTORY``
+as it does under hpc-sandbox's launcher, or with ``--userns``, which first
+makes a user namespace mapping the caller's uid and gid to themselves, as
+Singularity's does: like ``--containall``, it gives the command new mount and
+PID namespaces, the host's system directories, a fresh /proc and the binds,
+then chroots into the directory; a shim init runs the command as its child,
+as SingularityCE's does. ``exec --fakeroot DIRECTORY``
 (how a stopped --fakeroot sandbox's files are given back) checks its flags
 and binds and runs nothing: without subordinate ids, everything a sandbox of
-the fake wrote belongs to the caller already.
+the fake wrote belongs to the caller already. An instance started with
+``--fakeroot`` runs in a user namespace of its own that maps root to the
+caller, as Singularity's does where the caller has no subordinate ids, and
+commands entered into it still run on the host.
 
 State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_PULL_FAILURES   fail this many pulls first (default 0)
@@ -67,7 +72,7 @@ VALUED = {
 RECORDED_ENV = ("NVIDIA_VISIBLE_DEVICES",)
 HOST_DIRS = ("bin", "sbin", "usr", "lib", "lib32", "lib64", "libx32")
 HOST_FILES = ("etc/ld.so.cache", "etc/passwd", "etc/group", "etc/nsswitch.conf")
-CLONE_NEWNS, CLONE_NEWPID = 0x00020000, 0x20000000
+CLONE_NEWNS, CLONE_NEWUSER, CLONE_NEWPID = 0x00020000, 0x10000000, 0x20000000
 MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC = 0x1, 0x2, 0x4, 0x8
 MS_REMOUNT, MS_BIND, MS_REC, MS_PRIVATE = 0x20, 0x1000, 0x4000, 0x40000
 libc = ctypes.CDLL(None, use_errno=True)
@@ -138,6 +143,7 @@ def build(args: list[str]) -> int:
     if root.exists():
         return fail(f"{target} already exists")
     meta = json.loads(Path(source).read_bytes()[len(MAGIC) :] or b"{}")
+    os.umask(0o022)  # an image's directories have its modes, whatever the caller's umask
     for directory in (".singularity.d/env", "etc", "tmp", "var/tmp", "proc", "dev", "sys"):
         (root / directory).mkdir(parents=True)
     for name in HOST_DIRS:  # mount points for the host's, as exec DIRECTORY binds them
@@ -162,6 +168,17 @@ def build(args: list[str]) -> int:
     return 0
 
 
+def fakeroot_namespace() -> None:
+    """Before a --fakeroot instance's process runs: a user namespace of its own that maps root to
+    the caller. Where user namespaces are unavailable, it runs without one."""
+    uid, gid = os.getuid(), os.getgid()
+    if libc.unshare(CLONE_NEWUSER) != 0:
+        return
+    Path("/proc/self/setgroups").write_text("deny")
+    Path("/proc/self/uid_map").write_text(f"0 {uid} 1")
+    Path("/proc/self/gid_map").write_text(f"0 {gid} 1")
+
+
 def instance_start(args: list[str]) -> int:
     options, (rootfs, name) = parse(args)
     time.sleep(float(os.environ.get("FAKE_SINGULARITY_START_DELAY", "0")))
@@ -181,12 +198,14 @@ def instance_start(args: list[str]) -> int:
     startscript = root / ".singularity.d" / "startscript"
     keeps_running = os.access(startscript, os.X_OK) and "sleep" in startscript.read_text()
     title = f"Singularity instance: {os.environ.get('USER', 'user')} [{name}]"
+    fakeroot = "--fakeroot" in options or "-f" in options
     process = subprocess.Popen(
         [sys.executable, "-c", INSTANCE_LOOP, title],
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        preexec_fn=fakeroot_namespace if fakeroot else None,  # this process runs no threads
     )
     Path(options["--pid-file"][0]).write_text(f"{process.pid}\n")
     INSTANCES.mkdir(exist_ok=True)
@@ -278,6 +297,12 @@ def exec_directory(options: dict[str, list[str]], root: Path, command: list[str]
         if not (root / target.lstrip("/")).exists():
             return fail(f"destination {target} doesn't exist in container")
         binds.append((source, root / target.lstrip("/"), mode))
+    if "--userns" in options:  # as the caller, not root: its uid and gid mapped to themselves
+        uid, gid = os.getuid(), os.getgid()
+        check(libc.unshare(CLONE_NEWUSER), "unshare --userns")
+        Path("/proc/self/setgroups").write_text("deny")
+        Path("/proc/self/uid_map").write_text(f"{uid} {uid} 1")
+        Path("/proc/self/gid_map").write_text(f"{gid} {gid} 1")
     check(libc.unshare(CLONE_NEWNS | CLONE_NEWPID), "unshare (exec needs a user namespace)")
     mount("none", Path("/"), None, MS_REC | MS_PRIVATE)
     # Like SingularityCE: this process forwards signals to the container's

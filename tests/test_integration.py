@@ -12,7 +12,9 @@ BusyBox or a distribution's base system works, including a local .sif or
 .sqsh). Scratch defaults to the job-local directory, as in real runs; with
 Singularity, set ``HPC_SANDBOX_TEST_NETWORK_NONE=1`` where the site allows
 network namespaces, and ``HPC_SANDBOX_TEST_FAKEROOT=1`` where ``--fakeroot``
-works (the user has subordinate ids). On a GPU node, ``HPC_SANDBOX_TEST_GPUS``
+works (the user has subordinate ids); its test of file owners manifests runs
+``HPC_SANDBOX_TEST_FILE_OWNERS_IMAGE`` (default ``docker://node:20-alpine``, or
+a local copy of that image). On a GPU node, ``HPC_SANDBOX_TEST_GPUS``
 (``all`` with enroot, ``nv`` or ``rocm`` with Singularity) checks GPU passthrough with an
 image that has ``nvidia-smi`` or ``rocm-smi`` available through the runtime.
 """
@@ -26,6 +28,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -49,6 +52,7 @@ pytestmark = [
     ),
 ]
 IMAGE = os.environ.get("HPC_SANDBOX_TEST_IMAGE", "docker://alpine:3.20")
+FILE_OWNERS_IMAGE = os.environ.get("HPC_SANDBOX_TEST_FILE_OWNERS_IMAGE", "docker://node:20-alpine")
 RUNTIME = resolve_runtime(os.environ.get("HPC_SANDBOX_TEST_RUNTIME", "auto"))
 NETWORK_NONE = RUNTIME == "enroot" or os.environ.get("HPC_SANDBOX_TEST_NETWORK_NONE") == "1"
 FAKEROOT = RUNTIME != "enroot" and os.environ.get("HPC_SANDBOX_TEST_FAKEROOT") == "1"
@@ -72,6 +76,43 @@ chown 1000:1000 /tmp/left/file
 chmod 700 /srv/left /srv/left/deep /tmp/left
 su -s /bin/sh nobody -c 'id -u; mkdir /var/tmp/left/own && echo y > /var/tmp/left/own/file'
 """
+# node:20-alpine's home directory of its user node, a path in the image: written in parts, as it
+# reads like a home directory on this host otherwise.
+NODE_HOME = "/".join(("", "home", "node"))
+# What the layers of node:20-alpine (amd64) give to owners other than root's user and group, as
+# their tar headers in the registry said in October 2026. Once the tag moves, yarn's files may
+# carry another version, and are then skipped.
+NODE_OWNERS = f"""\
+0 42 /etc/shadow
+0 42 /etc/shadow-
+1000 1000 {NODE_HOME}
+503 20 /opt/yarn-v1.22.22/LICENSE
+503 20 /opt/yarn-v1.22.22/README.md
+503 20 /opt/yarn-v1.22.22/bin
+503 20 /opt/yarn-v1.22.22/bin/yarn
+503 20 /opt/yarn-v1.22.22/bin/yarn.cmd
+503 20 /opt/yarn-v1.22.22/bin/yarn.js
+503 20 /opt/yarn-v1.22.22/bin/yarnpkg
+503 20 /opt/yarn-v1.22.22/bin/yarnpkg.cmd
+503 20 /opt/yarn-v1.22.22/lib
+503 20 /opt/yarn-v1.22.22/lib/cli.js
+503 20 /opt/yarn-v1.22.22/lib/v8-compile-cache.js
+503 20 /opt/yarn-v1.22.22/package.json
+503 20 /opt/yarn-v1.22.22/preinstall.js
+"""
+# Entries for what every sandbox mounts its own over, which a start skips: a fakeroot sandbox that
+# gave them to another user could not give them back, and its files would stay in the trash.
+MOUNTED_OVER_OWNERS = "".join(
+    f"1000 1000 {path}\n" for path in ("/tmp", "/var/tmp", "/proc", "/sys", "/dev")
+)
+MOUNTED_OVER_SKIPPED = ": /tmp, /var/tmp, /proc, /sys, /dev"
+# As root: become the image's user node (with su: busybox's setpriv cannot switch users), write
+# in its home directory a file that keeps everyone else out, and say who owns what.
+AS_NODE = (
+    f"su -s /bin/sh node -c 'umask 077; echo x > {NODE_HOME}/notes' && "
+    f"stat -c '%u:%g %n' /etc/shadow {NODE_HOME} {NODE_HOME}/notes"
+)
+NODE_OWNED = ["0:42 /etc/shadow", f"1000:1000 {NODE_HOME}", f"1000:1000 {NODE_HOME}/notes"]
 
 
 def make_provider(scratch: Path) -> SessionProvider[Any]:
@@ -249,6 +290,67 @@ async def test_a_fakeroot_sandboxs_start_makes_a_missing_workdir_as_docker_does(
     assert found == [["755", "755"], ["700"]]
     assert await provider.wait_for_deletions(120)
     assert not any((provider.session_root / ".trash").iterdir())
+
+
+@fakeroot_only
+async def test_a_fakeroot_sandbox_applies_the_file_owners_of_its_image(scratch, tmp_path, caplog):
+    """With node:20-alpine's file owners, node writes in its home directory, which is root's
+    without them, and the entries for what the sandbox mounts over are skipped. A snapshot reads
+    what node closed to everyone else, as root of the sandbox's user namespace; a restore, whose
+    copy of the files is yours, gives the image's paths their owners again, and the file node
+    wrote is root's there. Nothing is left behind."""
+    owners = tmp_path / "owners"
+    owners.write_text(MOUNTED_OVER_OWNERS + NODE_OWNERS)
+    provider = SingularityProvider(scratch_root=scratch, fakeroot=True)
+    await provider.images.resolve(FILE_OWNERS_IMAGE)  # pulled before the starts are timed
+    started = time.monotonic()
+    bare = await provider.start(SandboxSpec(image=FILE_OWNERS_IMAGE))
+    without = time.monotonic() - started
+    try:
+        result = await bare.exec(AS_NODE)
+        assert result.exit_code != 0 and "Permission denied" in result.stderr, result
+    finally:
+        await bare.stop()
+    spec = SandboxSpec(image=FILE_OWNERS_IMAGE, file_owners=str(owners))
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="hpc_sandbox.singularity"):
+        sandbox = await provider.start(spec)
+    elapsed = time.monotonic() - started
+    assert MOUNTED_OVER_SKIPPED in caplog.text, caplog.text
+    session = sandbox.session_dir
+    assert session is not None
+    sessions = [session]
+    try:
+        result = await sandbox.exec(f"{AS_NODE} && chmod 700 {NODE_HOME}")
+        assert result.exit_code == 0, result
+        assert result.stdout.splitlines() == NODE_OWNED
+        home = session / "rootfs" / "home" / "node"
+        assert home.lstat().st_uid != os.getuid()  # a subordinate id's, on the host
+        snapshot = await sandbox.snapshot()  # of a directory and a file that keep you out
+    finally:
+        await sandbox.stop()
+    restored = await provider.restore(snapshot, spec)
+    sessions.append(restored.session_dir)
+    again = (
+        f"su -s /bin/sh node -c 'echo y > {NODE_HOME}/again' && "
+        f"stat -c '%u:%g %n' {NODE_HOME} {NODE_HOME}/notes {NODE_HOME}/again"
+    )
+    try:
+        result = await restored.exec(again)
+        assert result.exit_code == 0, result
+        assert result.stdout.splitlines() == [
+            f"1000:1000 {NODE_HOME}",
+            f"0:0 {NODE_HOME}/notes",  # the snapshot keeps no owners
+            f"1000:1000 {NODE_HOME}/again",
+        ]
+    finally:
+        await restored.stop()
+    await provider.delete_snapshot(snapshot)
+    assert await provider.wait_for_deletions(120)
+    assert not any(session is None or session.exists() for session in sessions)
+    assert not any((provider.session_root / ".trash").iterdir())
+    count = len(owners.read_text().splitlines())
+    print(f"\nfakeroot sandbox: up in {without:.2f} s, with {count} entries in {elapsed:.2f} s")
 
 
 CRASH_FAKEROOT = """\

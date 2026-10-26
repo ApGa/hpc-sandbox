@@ -84,15 +84,18 @@ take longer.
 | `exposes` | `[]` | Ports of the pod that the host may reach, each through a Unix socket ([Exposed ports](#exposed-ports)). |
 | `hosts` | `[]` | Host aliases: names that every service resolves to 127.0.0.1, besides the services' own, such as the name of an upstream ([Names](#names)). |
 | `labels` | `{}` | String pairs that `reap()` and `hpc-sandbox janitor --label` select pods by. |
+| `users` | `"single"` | A `PodUsers`: what the pod's user namespace maps. `"single"`: your uid and gid, as root. `"subids"`: your subordinate ids too, for services that switch users, with Singularity CE and Apptainer ([Users](#users)). |
 
-`start_pod()` raises `ValueError` for an invalid spec before anything starts: an unknown network, an
-upstream name that does not match `[A-Za-z_][A-Za-z0-9_.-]*`, a socket that is not an absolute
-`unix://` path shorter than 108 bytes, a port outside 1 to 65535 or used twice, `upstream_ports`
-naming an unknown upstream, a port to expose that is outside 1 to 65535, listed twice or an
-upstream's, or a host alias that is not a letter or digit followed by up to 252 letters, digits,
-`_`, `.` or `-`. It raises `SandboxError` when `nsenter` is missing, or for a pod with egress when
-no slirp4netns can be found, and `SandboxStartError` when the pod fails to start, after it stopped
-what it started.
+`start_pod()` raises `ValueError` for an invalid spec before anything starts: an unknown network or
+`users`, `users="subids"` with enroot, whose services cannot switch users, an upstream name that
+does not match `[A-Za-z_][A-Za-z0-9_.-]*`, a socket that is not an absolute `unix://` path shorter
+than 108 bytes, a port outside 1 to 65535 or used twice, `upstream_ports` naming an unknown
+upstream, a port to expose that is outside 1 to 65535, listed twice or an upstream's, or a host
+alias that is not a letter or digit followed by up to 252 letters, digits, `_`, `.` or `-`. It
+raises `SandboxError` when `nsenter` is missing, for a pod with egress when no slirp4netns can be
+found, and for a pod with `users="subids"` when your user has no subordinate ids or `newuidmap` or
+`newgidmap` is missing, and `SandboxStartError` when the pod fails to start, after it stopped what
+it started.
 
 | Member | What it does |
 |---|---|
@@ -123,11 +126,12 @@ that the holder has not accepted yet stays full for 30 seconds. Code typed again
 
 The holder is a small process that owns the pod's user and network namespaces:
 
-- Its user namespace maps your uid and gid to root, with `setgroups` denied. Its network namespace
-  has only a loopback interface, which it brings up.
-- It lets the pod's root bind ports below 1024 and send ICMP echo requests (`ping`), as Docker does
-  for containers: the services run in nested user namespaces, which hold no capability over this
-  network.
+- Its user namespace maps your uid and gid to root, with `setgroups` denied, or, with
+  `users="subids"`, your subordinate ids too ([Subordinate ids](#subordinate-ids)). Its network
+  namespace has only a loopback interface, which it brings up.
+- It lets the pod's users bind ports below 1024, and every group it maps send ICMP echo requests
+  (`ping`), as Docker does for containers: the services run in nested user namespaces, which hold no
+  capability over this network.
 - It relays the upstreams ([Upstreams](#upstreams)), serves the sockets of the exposed ports
   ([Exposed ports](#exposed-ports)) and, while the pod has egress, holds the pipe whose closing ends
   slirp4netns ([Egress](#egress)). It stays in the host's mount namespace, so these sockets are
@@ -279,11 +283,12 @@ and `download` like any other ([Python API](python-api.md)).
 | Field | Default | Meaning |
 |---|---|---|
 | `name` | required | The service's name and hostname, which every service of the pod resolves to 127.0.0.1: a letter or digit, then up to 62 letters, digits, `_`, `.` or `-`. |
-| `sandbox` | required | A `SandboxSpec`: the image, `workdir`, `env`, `mounts` and `memory_mb`. Its `network` is ignored: services share the pod's. `cpus` is advisory. |
+| `sandbox` | required | A `SandboxSpec`: the image, `workdir`, `env`, `mounts` and `memory_mb`, and with `run_as="subids"` its `file_owners` ([Image file owners](#image-file-owners)). Its `network` is ignored: services share the pod's. `cpus` is advisory. |
 | `command` | `None` | The service's command, a full argv list. Without one, the service stays up, idle, for `exec`, like a sandbox. |
 | `healthcheck` | `None` | A `HealthCheck` ([Health checks](#health-checks)). |
 | `shm_mb` | `None` | The size of the service's `/dev/shm`, in MiB; 64 when `None`, as with Docker. |
 | `ulimits` | `{}` | Resource limits by their docker-compose names, such as `nofile`, `stack` or `core`, each `(soft, hard)`, with `-1` for unlimited. |
+| `run_as` | `"root"` | A `ServiceRunAs`: who the command, and the commands entered into the service, run as: `"root"`, `"caller"` or `"subids"` ([Users](#users)). |
 
 With `wait="started"`, `start_service()` returns once the service's container runs; with
 `wait="healthy"`, once its health check passed too, which for a service without one is at once. It
@@ -295,7 +300,9 @@ turns unhealthy or its command exits before a check passed, or no check passes w
 behind, and a start that the pod's stop interrupts raises `SandboxStartError`.
 `start_service()` raises `ValueError` before anything starts for a name that is invalid or taken,
 an empty command, a `shm_mb` that is not positive, an unknown ulimit, a soft limit above its hard
-limit, an invalid health check, or a `sandbox` spec that `start()` would refuse.
+limit, an invalid health check, a `run_as` that is unknown or that the runtime cannot give, or
+`"subids"` in a pod without `users="subids"`, `file_owners` in a service whose `run_as` is not
+`"subids"`, or a `sandbox` spec that `start()` would refuse.
 
 Each service gets:
 
@@ -305,9 +312,9 @@ Each service gets:
   limits of the process that started the pod, and a `/dev/shm` tmpfs of `shm_mb`; runs the runtime,
   and so the command, as its child; passes SIGTERM, SIGINT and SIGHUP on to it; reaps orphans; and
   exits with the command's status;
-- root in a nested user namespace, which is your uid on the host: it holds no capability over the
-  pod's network, so code in a service can neither reconfigure that network nor open raw sockets to
-  watch the other services' traffic;
+- a nested user namespace, where it runs as root, which is your uid on the host, or as your uid
+  itself ([Users](#users)): it holds no capability over the pod's network, so code in a service can
+  neither reconfigure that network nor open raw sockets to watch the other services' traffic;
 - for its command, the image's environment, `HOME=/root`, then the spec's `env`, passed on its stdin
   and never on a command line; its `workdir`, created when missing, as the working directory; and
   `/dev/null` as stdin;
@@ -321,6 +328,149 @@ namespace, so a service's `nproc` would count every process of the pod (under Do
 bind root either), and `locks` has had no effect since Linux 2.4. A service without a command runs
 an idle loop, which needs `sleep` in the image. Services cannot be snapshotted yet, and get no GPUs
 ([Roadmap](roadmap.md)).
+
+## Users
+
+A service's `run_as` says who its command, and the commands entered into it, run as. Root alone is
+not always enough: the official images of databases such as PostgreSQL and Redis start as root,
+give their data directories to a user of their own with `chown`, and switch to it with `gosu` or
+`su-exec`. In a namespace that maps no other user, that `chown` fails with `Invalid argument`, and
+they exit at once. With enroot they never get ready instead: its seccomp filter makes that `chown`
+and the switch succeed and do nothing, so the entrypoint, still root, starts over again and again.
+
+| `run_as` | The command runs as | It can switch to | Needs | Runtimes |
+|---|---|---|---|---|
+| `"root"`, the default | root, which is your uid on the host | no other user | nothing | both |
+| `"caller"` | your own uid and gid, without capabilities | no other user | nothing | both |
+| `"subids"` | root, which is your uid on the host | uids and gids 1 to N: your subordinate ids | a pod with `users="subids"` ([Subordinate ids](#subordinate-ids)) | Singularity CE and Apptainer |
+
+- `"caller"` suits the images that run as any user, as `docker run --user` asks of them: the
+  database images skip their `chown` and their switch when they do not start as root. Images that
+  insist on root fail.
+- `"subids"` gives what Docker gives: a root that can become other users (`su`, `setpriv`, `gosu`)
+  and give them files (`chown`). A process that became another user cannot become root again.
+- With enroot, a service's command runs under enroot's seccomp filter, which lets package managers
+  run as root of one id: `chown`, `setuid` and their kin succeed and change nothing. So a `su` to
+  another user runs its command as the same uid, and files keep their owner. Commands entered with
+  `exec` run without the filter, and there these calls fail with `Invalid argument`.
+
+In every mode, the image's files belong to your uid on the host, as hpc-sandbox extracts them, so a
+service sees them as root's, or with `"caller"` as its own, unless a `"subids"` service gives them
+the owners they have in the image ([Image file owners](#image-file-owners)). Commands get
+`HOME=/root` unless `env` sets it. The service's owner record says how it ran: `run_as`, and
+`remap_root` and `container_uid` as for a sandbox, `false` and your uid with `"caller"`.
+
+A PostgreSQL server with its image's own entrypoint and command:
+
+```python
+import asyncio
+
+from hpc_sandbox import HealthCheck, PodSpec, SandboxSpec, ServiceSpec, SingularityProvider
+
+IMAGE = "docker://postgres:16-alpine"
+POSTGRES = ServiceSpec(
+    "postgres",
+    SandboxSpec(image=IMAGE, workdir="/", env={"POSTGRES_PASSWORD": "example"}),
+    command=["docker-entrypoint.sh", "postgres"],  # the image's ENTRYPOINT and CMD
+    healthcheck=HealthCheck(
+        ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"],
+        interval_s=10,
+        start_period_s=60,
+        start_interval_s=0.5,
+    ),
+    run_as="subids",  # "caller" where you have no subordinate ids, with PodSpec()
+)
+QUERY = ["psql", "-h", "postgres", "-U", "postgres", "-tAc", "select 6 * 7"]
+
+
+async def main() -> None:
+    provider = SingularityProvider()
+    async with await provider.start_pod(PodSpec(users="subids")) as pod:
+        await pod.start_service(POSTGRES, wait="healthy")
+        client = await pod.start_service(ServiceSpec("client", SandboxSpec(image=IMAGE)))
+        result = await client.exec(QUERY, env={"PGPASSWORD": "example"})
+        print(result.stdout, end="")
+    await provider.wait_for_deletions()
+
+
+asyncio.run(main())
+```
+
+```text
+42
+```
+
+### Subordinate ids
+
+`PodSpec(users="subids")` maps more than your uid into the pod's user namespace: root to your uid
+and gid, as always, and uids and gids 1 to N to the first range that `/etc/subuid` and
+`/etc/subgid` give your user, by name or by uid, such as `alice:100000:65536`. `newuidmap` and
+`newgidmap`, the setuid helpers of shadow-utils that rootless Docker, Podman and Singularity's
+`--fakeroot` use, write that map, and leave `setgroups` allowed. They do it once per process: the
+first such pod maps a user namespace that the pod's, and those of every later pod of the process
+and of the processes it forks, are made in, mapped as it is. That first pod can take seconds to
+start where the ranges of many users in `/etc/subuid` overlap: shadow-utils looks up the owner of
+each range that holds an id it checks.
+`hpc-sandbox doctor` shows your ranges on its `pods: subordinate ids` line
+([Command line](cli.md#doctor)). Only Singularity CE and Apptainer start such pods: enroot maps one
+id into a container, so `EnrootProvider.start_pod()` raises `ValueError` for them.
+
+`await provider.map_subordinate_ids()` makes that mapping at once, rather than at the first such
+pod, and raises what `start_pod()` would raise for such a pod before it starts anything. A fork
+server calls it before it forks its workers, whose pods then start without mapping: they inherit
+the mapping through an open descriptor. A process that closed that descriptor maps again at its
+next such pod.
+
+Such a pod runs services of every `run_as`. The namespace of a `"subids"` service maps every id
+that the pod's maps, each to itself, so its root can switch to any of them, and drops your
+supplementary groups, as root in a Docker container has none of the host's. The other services map
+root alone or your uid alone, as in any pod. A working directory that a `"subids"` service's image
+lacks is made with mode 755 whatever your umask, as Docker's `-w` makes it, so that the users it
+switches to can enter it.
+
+What a service writes as another user belongs, on the host, to one of your subordinate ids: you can
+neither change nor delete it, nor a directory that holds it. So before a pod's files are deleted,
+hpc-sandbox gives them back to your uid: as root of a user namespace that maps your subordinate ids
+as the pod's does, `find -xdev ... -exec chown -h 0:0` makes root, your uid, the owner of everything
+another id owns, never following a link or crossing into another filesystem. This runs:
+
+- at `stop()`, once the services have stopped, in the holder's namespace, over the pod's whole
+  session directory (`pod.path`), so directories you create there and bind into the services are
+  covered too;
+- when a `"subids"` service stops before its pod (a start that fails, or its own `stop()`), over
+  that service's files;
+- when a janitor sweeps an abandoned pod whose owner record says `users: "subids"`, once it has
+  stopped what still ran, in its process's namespace of subordinate ids.
+
+When it fails, hpc-sandbox logs a warning, and the deletion refuses what is left, naming it. What a
+service writes as another user into a writable bind from outside `pod.path` stays your subordinate
+ids'.
+
+### Image file owners
+
+The image's files all belong to root in a `"subids"` service, even those that the image gives to
+another user, such as `redis:7-alpine`'s `/data`, which its user `redis` (uid 999) then cannot
+write. The service's `SandboxSpec(file_owners=...)` names a manifest of the owners that the image
+gives its files ([File owners](python-api.md#file-owners)), which the service's launcher applies
+once it has joined the pod's user namespace, as root there, before the container and its command
+start:
+
+```python
+REDIS = ServiceSpec(
+    "redis",
+    SandboxSpec(image="docker://redis:7-alpine", workdir="/data", file_owners="redis.owners"),
+    # As the image's user, which can write in /data with the owners of the image's layers.
+    command=["setpriv", "--reuid", "999", "--regid", "1000", "--clear-groups", "redis-server"],
+    run_as="subids",  # in a pod started with PodSpec(users="subids")
+)
+```
+
+An id that the pod's user namespace does not map, one beyond your subordinate ids, fails the start
+with `SandboxStartError`. The paths that name nothing in the root filesystem, and those at or below
+`/dev`, `/proc`, `/sys`, `/tmp` and `/var/tmp`, which the service mounts its own over, are skipped
+and logged. Services with `run_as="root"` or `"caller"` map one id, and raise `ValueError` for a
+manifest. What it gives to other users belongs to your subordinate ids on the host, and is given
+back with the rest ([Subordinate ids](#subordinate-ids)).
 
 ## Names
 
@@ -360,8 +510,8 @@ On images based on Debian (those with `/etc/debian_version`), hpc-sandbox lets a
 
 `exec`, `upload`, `download` and health checks enter a service in two steps: the pod's user and
 network namespaces with `nsenter`, then the container's own namespaces and root directory. They run
-like the service's command, as root of its nested user namespace, with its `ulimits` (applied with
-`prlimit`). `exec` follows the rules of every sandbox: the same environment, timeouts, exit codes
+like the service's command, as the user its `run_as` gives ([Users](#users)), with its `ulimits`
+(applied with `prlimit`). `exec` follows the rules of every sandbox: the same environment, timeouts, exit codes
 and errors ([Running commands](python-api.md#running-commands)).
 
 Once a service's command has exited, its container is gone: `exec` and transfers raise
@@ -442,9 +592,11 @@ process that started the pod is killed.
 3. when the provider's `service_stop_grace_s` is above 0 (it is 0 by default), sends SIGTERM to the
    commands of the services that have one, through their inits, and waits up to that long for them
    to exit;
-4. kills each service's init, which takes every process of the service with it, then stops
-   slirp4netns and the holder;
-5. moves the pod's session directory, which holds the sessions of its services and the sockets of
+4. kills each service's init, which takes every process of the service with it;
+5. in a pod with `users="subids"`, gives back to your uid what the services wrote as other users
+   ([Subordinate ids](#subordinate-ids));
+6. stops slirp4netns and the holder;
+7. moves the pod's session directory, which holds the sessions of its services and the sockets of
    its exposed ports, into the trash, and deletes it in the background, as for a sandbox:
    `await provider.wait_for_deletions()` waits for that
    ([Stopping and deleting](python-api.md#stopping-and-deleting)).
@@ -455,9 +607,9 @@ tries again. Services stop with their pod; a command that ends early ends only i
 
 Pods die with the process that started them, with either runtime: the kernel kills the holder, and
 each service's launcher and init, when that process exits, even by SIGKILL. What remains are files,
-which a janitor removes: a provider's first start that finds the janitor lock free,
-`await provider.reap()`, or `hpc-sandbox janitor`; the last two take labels to limit the sweep to
-the pods that carry them ([Reaping and janitors](python-api.md#reaping-and-janitors)). With labels,
+which a janitor removes, giving back first what a `users="subids"` pod's other users left: a
+provider's first start that finds the janitor lock free, `await provider.reap()`, or
+`hpc-sandbox janitor`; the last two take labels to limit the sweep to the pods that carry them ([Reaping and janitors](python-api.md#reaping-and-janitors)). With labels,
 `reap()` also stops the provider's own live pods whose labels include them. A pod's files are on the
 scratch root, in `pods-singularity/` or `pods-enroot/`
 ([Where files go](configuration.md#where-files-go)).
@@ -470,15 +622,18 @@ scratch root, in `pods-singularity/` or `pods-enroot/`
 | util-linux `nsenter` | every pod: `exec`, transfers and health checks in its services |
 | util-linux `prlimit` | commands in services that set `ulimits` |
 | slirp4netns ([Egress](#egress)), and a `/dev/net/tun` that users may open, as it usually is | egress |
+| a range of subordinate ids for your user in `/etc/subuid` and `/etc/subgid`, and shadow-utils' `newuidmap` and `newgidmap` (the `uidmap` package on Debian and Ubuntu) | pods with `users="subids"`, with Singularity CE and Apptainer ([Subordinate ids](#subordinate-ids)) |
 | `/bin/sh` in the image and, for a service without a command, what a sandbox needs in its image ([Image references](python-api.md#image-references)) | every service |
 
-`hpc-sandbox doctor` shows on its `pods: egress` line which slirp4netns pods would use
-([Getting started](getting-started.md#check-the-installation)).
+`hpc-sandbox doctor` shows on its `pods: egress` line which slirp4netns pods would use, and, with
+Singularity, on its `pods: subordinate ids` line the ranges that pods with `users="subids"` would
+map ([Getting started](getting-started.md#check-the-installation)).
 
 - **Singularity CE and Apptainer.** A service runs `singularity exec --cleanenv --no-eval --writable
   --containall --no-home --no-mount home,cwd,bind-paths` on a root filesystem directory of its own,
   in a nested user namespace that the launcher creates, so the runtime runs unprivileged, with its
-  non-setuid starter, even where it is installed setuid. The service's `/tmp`, `/var/tmp`,
+  non-setuid starter, even where it is installed setuid; with `run_as="caller"`, that namespace maps
+  your uid and gid, and the runtime runs with `--userns` as them. The service's `/tmp`, `/var/tmp`,
   `/dev/shm`, `/etc/hosts` and `/etc/resolv.conf`, and the spec's mounts, are bound into the
   container. Pods never use `--network none`, so `allow_network_none` does not matter to them.
   Services always get the copy layout, whatever `rootfs_layout` says, and with
@@ -486,8 +641,11 @@ scratch root, in `pods-singularity/` or `pods-enroot/`
   ([Singularity CE and Apptainer](singularity.md)).
 - **enroot.** A service runs `enroot start --rw` on an `enroot create` extraction of its own, with
   `--root` unless the provider has `remap_root=False`, and with the provider's `extra_start_args`.
-  Root lives in enroot's own user namespace, nested in the pod's. The same files are bound into the
-  container as with Singularity, and services get no GPUs, whatever `gpus` says
+  Root lives in enroot's own user namespace, nested in the pod's. With `run_as="caller"`, the
+  launcher first nests a user namespace that maps your uid and gid to the pod's root, and enroot
+  runs without `--root` in it. enroot maps one id into a container, so it refuses
+  `run_as="subids"`, and pods with `users="subids"`. The same files are bound into the container as
+  with Singularity, and services get no GPUs, whatever `gpus` says
   ([enroot](enroot.md#pod-services)).
 
 ## Next steps

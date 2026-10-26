@@ -73,6 +73,7 @@ compute node of a new site, with the image you plan to use.
 | `image staging` | both | The directory images are staged to, or `off`. |
 | `reflink on scratch` | both | Whether the scratch root's filesystem makes reflink copies: snapshots are cheap with them, and full copies without. |
 | `pods: egress` | both | The slirp4netns that pods with egress would run, or `warn` with how to get one. |
+| `pods: subordinate ids` | Singularity | The uids and gids that pods with `users="subids"` would map, from your first ranges in `/etc/subuid` and `/etc/subgid`, and the `newuidmap` and `newgidmap` that map them. `info` when your user has no range, `warn` when either tool is missing: other pods need neither ([Pods](pods.md#subordinate-ids)). |
 | `sandbox start`, `exec`, `upload/download`, `sandbox stop` | both | With `--image` only: the steps above, each `ok` or `FAIL`. |
 
 Once it has found the runtime, `doctor` creates the scratch root, with mode 0700, and the image

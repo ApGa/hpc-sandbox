@@ -235,7 +235,11 @@ files.
 A pod's service runs `enroot start` on an extraction of its own, under the launcher's `join` form:
 the container joins the pod's user and network namespaces, with mount, PID, IPC and UTS namespaces
 of its own. Root lives in enroot's own user namespace, nested in the pod's, so commands in the
-service hold no capability over the pod's network. [Pods](pods.md) describes them.
+service hold no capability over the pod's network. A service with `run_as="caller"` runs as your
+uid: the launcher nests a user namespace that maps your uid and gid to the pod's root, and enroot
+runs in it without `--root`, so the node must let users nest three user namespaces: the pod's, the
+launcher's and enroot's. enroot maps one id into a container, so `run_as="subids"` raises
+`ValueError`, as `start_pod()` does for `PodSpec(users="subids")`. [Pods](pods.md) describes them.
 
 ## Site notes
 

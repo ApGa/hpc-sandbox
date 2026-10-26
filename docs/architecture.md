@@ -45,7 +45,8 @@ Starting a sandbox takes these steps:
    overlay.
 6. **Start the container**: a Singularity CE or Apptainer instance, or one long-lived
    `enroot start`. The provider records the identities of the container's processes in the owner
-   record.
+   record. A sandbox whose user namespace maps other users then gives the image's files the owners
+   of its spec's `file_owners` manifest, if it has one ([File owners](python-api.md#file-owners)).
 7. **Probe** that the root filesystem and the working directory are writable, creating the working
    directory if it is missing.
 
@@ -366,7 +367,9 @@ instant before the kill survives, and stays watched.
 2. It copies the root filesystem and the private `/tmp` and `/var/tmp` with `cp -a --reflink=auto`:
    nearly free on filesystems with reflinks, such as XFS and Btrfs, a full copy elsewhere. Of a
    sandbox with Singularity's fuse-overlay layout, it copies only the upper layer, which holds what
-   the sandbox wrote. The transfer directory is left out.
+   the sandbox wrote. Of one with `fakeroot`, it copies as root of the instance's user namespace
+   (`nsenter --user`), which reads what the sandbox's other users own whatever its mode, and gives
+   each copy to your uid (`--no-preserve=ownership`). The transfer directory is left out.
 3. It writes the snapshot's record, `snapshot.json`.
 
 Processes and memory are not captured, and files written during the copy may be captured partially:
@@ -474,8 +477,9 @@ of its holder and of slirp4netns, in `services/` the session root of its service
 `exposed/` the sockets through which the host reaches the ports it exposes: each service is a
 sandbox, started by the launcher in the pod's user and network namespaces. Stopping a pod stops
 its services, slirp4netns and the holder, then moves the pod's session, services and all, into the
-trash, to be deleted in the background like a sandbox's. Janitors stop and remove abandoned pods
-whole. [Pods](pods.md) describes them.
+trash, to be deleted in the background like a sandbox's; a pod with `users="subids"` first gives
+back to your uid what its services wrote as other users. Janitors stop and remove abandoned pods
+whole, giving that back too. [Pods](pods.md) describes them.
 
 ## Where the code is
 
@@ -496,9 +500,10 @@ The package is in `src/hpc_sandbox/`:
 | `runtime.py` | the Singularity CE and Apptainer command line and its environment |
 | `singularity.py` | `SingularityProvider`: instances, templates and the fuse-overlay layout |
 | `enroot.py` | `EnrootProvider`: imports, the system configuration, and containers entered with `nsenter` |
-| `anchor.py` | the launcher, run as a script: the namespaces and the init of an enroot sandbox or a pod service |
+| `anchor.py` | the launcher, run as a script: the namespaces and the init of an enroot sandbox or a pod service, and the owners that a file owners manifest gives an image's files |
 | `pods.py` | pods and their services |
 | `holder.py` | the process that holds a pod's user and network namespaces, relays its upstreams and serves its exposed ports |
+| `subids.py` | your subordinate ids, and mapping them into a pod's user namespace with `newuidmap` and `newgidmap` |
 | `tools.py` | finding and fetching slirp4netns |
 | `cli.py` | the `hpc-sandbox` command line |
 

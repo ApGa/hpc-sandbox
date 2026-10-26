@@ -124,6 +124,7 @@ uv run pytest tests/test_memory.py -q -k oom_score    # the tests whose names ma
 | Unprivileged user namespaces and util-linux `nsenter` | The enroot provider's tests, the pod tests, and the tests that mount file systems in a namespace skip. `unshare --user --map-root-user --mount --pid --ipc --net --fork true` succeeds where user namespaces work. Ubuntu 24.04 and later restrict them with AppArmor; `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts that until the next boot. |
 | util-linux `unshare` | The tests that mount file systems in a namespace skip (in `tests/test_trash.py` and `tests/test_fuse_overlay.py`). |
 | `/usr/bin/python3` | The pod tests (`tests/test_pods.py`) skip, and so do the memory watchdog tests that run Python in a fake sandbox. |
+| `newuidmap` and `newgidmap`, and subordinate ids for your user in `/etc/subuid` and `/etc/subgid` | The pod tests that switch users in a pod with `users="subids"` skip. The other tests of such pods use stand-ins for the tools and the ranges. |
 | util-linux `flock` | One test of background deletions in `tests/test_trash.py` skips. |
 | `bash` | The environment tests in `tests/test_commands.py` skip their `bash` cases; they test `dash` and `busybox` too where installed. |
 | `/etc/localtime` | The enroot provider's time zone tests skip. |
@@ -153,10 +154,14 @@ choose what they test:
 | `HPC_SANDBOX_TEST_RUNTIME` | `auto` | `singularity`, `enroot`, or `auto`: Singularity when `singularity` or `apptainer` is on `PATH`, else enroot. |
 | `HPC_SANDBOX_TEST_IMAGE` | `docker://alpine:3.20` | The image of `tests/test_integration.py`: any image that hpc-sandbox can start ([Image references](docs/python-api.md#image-references)) and that has the usual command-line tools, as BusyBox or a distribution's base system provides them: the tests use `tail`, `find`, `xargs`, `stat` and others. A local `.sif` or `.sqsh` file works too. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | unset | `1` also tests `network="none"` with Singularity, where the site lets users create network namespaces. With enroot it is always tested. |
-| `HPC_SANDBOX_TEST_FAKEROOT` | unset | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user (subordinate ids in `/etc/subuid` and `/etc/subgid`): commands that switch users, and that nothing they leave stays behind after a stop or a janitor's sweep. |
+| `HPC_SANDBOX_TEST_FAKEROOT` | unset | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user (subordinate ids in `/etc/subuid` and `/etc/subgid`): commands that switch users, the owners of an image's files, and that nothing they leave stays behind after a stop or a janitor's sweep. |
 | `HPC_SANDBOX_TEST_GPUS` | unset | On a GPU node, tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity, with an image in which the runtime makes `nvidia-smi` or `rocm-smi` available. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | `docker://alpine:3.20` | The image of the pod tests' services; its busybox serves and fetches HTTP. |
 | `HPC_SANDBOX_TEST_APT_IMAGE` | `docker://python:3.12-slim` | The image of the pod test that runs apt. |
+| `HPC_SANDBOX_TEST_REDIS_IMAGE` | `docker://redis:7-alpine` | The Redis image that the pod tests run as each `run_as`, with its entrypoint. |
+| `HPC_SANDBOX_TEST_POSTGRES_IMAGE` | `docker://postgres:16-alpine` | The PostgreSQL image that the pod tests run as each `run_as`, with its entrypoint. |
+| `HPC_SANDBOX_TEST_SUBIDS` | unset | `1` also tests pods with `users="subids"`, with Singularity, where your user has subordinate ids (`/etc/subuid` and `/etc/subgid`) and `newuidmap` and `newgidmap` map them: services that switch users, the owners of an image's files, and that nothing they leave stays behind after a stop or a janitor's sweep. |
+| `HPC_SANDBOX_TEST_FILE_OWNERS_IMAGE` | `docker://node:20-alpine` | The image of the tests of file owners manifests, which list the owners that its layers give: `node:20-alpine`, or a local copy of it. |
 | `HPC_SANDBOX_TEST_PODS` | `16` | How many pods the pod tests start at once. |
 
 The pod tests check egress where they find slirp4netns, the site's or the one that

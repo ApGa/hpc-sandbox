@@ -26,6 +26,7 @@ from .types import (
     PodNetwork,
     PodProvider,
     PodSpec,
+    PodUsers,
     Sandbox,
     SandboxError,
     SandboxLostError,
@@ -34,6 +35,7 @@ from .types import (
     SandboxSpec,
     SandboxStartError,
     ServiceHealth,
+    ServiceRunAs,
     ServiceSpec,
 )
 
@@ -59,6 +61,7 @@ __all__ = [
     "PodProvider",
     "PodService",
     "PodSpec",
+    "PodUsers",
     "ResolvedImage",
     "Sandbox",
     "SandboxError",
@@ -68,6 +71,7 @@ __all__ = [
     "SandboxSpec",
     "SandboxStartError",
     "ServiceHealth",
+    "ServiceRunAs",
     "ServiceSpec",
     "SessionPod",
     "SifImages",

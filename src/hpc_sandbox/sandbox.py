@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Generic, NoReturn, Self, TypeVar
 
 from . import memory, procfs, safefs
+from .anchor import read_file_owners
 from .images import ImageStore, ResolvedImage
 from .locks import open_lock_file
 from .paths import default_scratch_root
@@ -72,6 +73,7 @@ from .types import (
 
 if TYPE_CHECKING:
     from .pods import SessionPod
+    from .subids import SubordinateIds
 
 log = logging.getLogger(__name__)
 
@@ -300,6 +302,7 @@ class SessionProvider(Generic[S]):
 
     async def start(self, spec: SandboxSpec) -> S:
         self._check(spec)
+        await self._check_file_owners(spec)
         await self._prepare()
         image = await self.images.resolve(spec.image)
         return await self._launch(spec, partial(self._extract, image))
@@ -310,6 +313,7 @@ class SessionProvider(Generic[S]):
         source = self._snapshot_dir(snapshot)
         if snapshot.image != spec.image:
             raise ValueError(f"snapshot {snapshot.id} is of {snapshot.image!r}, not {spec.image!r}")
+        await self._check_file_owners(spec)
         await self._prepare()
         return await self._launch(spec, partial(self._copy_snapshot, source), restored=True)
 
@@ -323,16 +327,48 @@ class SessionProvider(Generic[S]):
         """
         from .pods import SessionPod, check_pod
 
-        if "pods" not in self.capabilities or self.service_type is None:
-            raise ValueError(f"the {self.name} provider does not run pods")
+        self._check_pods()
         check_pod(spec)
+        ids = None
+        if spec.users == "subids":
+            ids = self._subordinate_ids()  # fail before anything starts
         if spec.network == "egress":
             self.slirp4netns()  # fail before anything starts
         self.nsenter  # noqa: B018 - fail before anything starts
         await self._prepare()
-        pod = SessionPod(self, spec)
+        pod = SessionPod(self, spec, ids=ids)
         await pod._boot()
         return pod
+
+    async def map_subordinate_ids(self) -> None:
+        """Map your subordinate ids for pods with ``users="subids"`` now, not at the first one.
+
+        The mapping is made once per process and serves its later pods, and those of the
+        processes it forks afterwards: a fork server calls this before it forks its workers.
+        Raises ``ValueError`` where the provider's services cannot switch users (enroot),
+        :class:`SandboxError` when your user has no subordinate ids or ``newuidmap`` or
+        ``newgidmap`` is missing, and :class:`SandboxStartError` when they refuse, or do not
+        finish within ``start_timeout_s``.
+        """
+        from .pods import id_namespace
+
+        self._check_pods()
+        await id_namespace(self._subordinate_ids(), self.start_timeout_s)
+
+    def _check_pods(self) -> None:
+        if "pods" not in self.capabilities or self.service_type is None:
+            raise ValueError(f"the {self.name} provider does not run pods")
+
+    def _subordinate_ids(self) -> SubordinateIds:
+        """Your subordinate ids and the tools that map them, for a pod with ``users="subids"``."""
+        from . import subids
+
+        if "subids" not in self.service_type.run_modes:
+            raise ValueError(
+                f"the {self.name} provider runs no services with run_as='subids', so its pods "
+                "cannot map subordinate ids (users='subids'): its containers map one id"
+            )
+        return subids.find()
 
     def slirp4netns(self) -> str:
         """The slirp4netns pods use for egress; see :func:`hpc_sandbox.tools.find_slirp4netns`."""
@@ -387,8 +423,9 @@ class SessionProvider(Generic[S]):
         return [*roots, (self.pod_root, True, self._stop_abandoned_pod)]
 
     async def _stop_abandoned_pod(self, path: Path, record: dict[str, Any] | None) -> bool:
-        """Stop the services, the holder and slirp4netns of an abandoned pod."""
-        from .pods import SERVICES_DIRECTORY
+        """Stop the services, the holder and slirp4netns of an abandoned pod, then give your uid
+        back what the other users of a pod with ``users="subids"`` left."""
+        from .pods import SERVICES_DIRECTORY, give_back
 
         stopped = False
         services = path / SERVICES_DIRECTORY
@@ -411,6 +448,11 @@ class SessionProvider(Generic[S]):
                 pid, started = record.get(f"{role}_pid"), record.get(f"{role}_start_time")
                 if isinstance(pid, int) and isinstance(started, str):
                     stopped |= await asyncio.to_thread(kill_exact, [(pid, started)], name)
+        if record is not None and record.get("users") == "subids":  # only now: nothing runs
+            try:
+                await give_back(path, self.nsenter)
+            except SandboxError as error:  # the deletion then names what it could not delete
+                log.warning("hpc-sandbox janitor: %s", error)
         return stopped
 
     async def _stop_abandoned_service(self, path: Path, record: dict[str, Any] | None) -> bool:
@@ -543,6 +585,24 @@ class SessionProvider(Generic[S]):
             if not Path(mount.source).exists():
                 raise ValueError(f"mount source does not exist: {mount.source!r}")
 
+    async def _check_file_owners(self, spec: SandboxSpec) -> None:
+        """Refuse a file owners manifest that this provider's sandboxes cannot apply, or that is
+        none: ``ValueError``, or :class:`SandboxError` when ``nsenter`` is missing."""
+        if spec.file_owners is None:
+            return
+        if reason := self._file_owners_refusal():
+            raise ValueError(reason)
+        self.nsenter  # noqa: B018 - fail before anything starts
+        await asyncio.to_thread(check_file_owners, spec.file_owners)
+
+    def _file_owners_refusal(self) -> str | None:
+        """Why this provider's sandboxes take no file owners manifest, or None when they do."""
+        return (
+            f"the {self.name} provider's sandboxes map one id, your uid, so they cannot give the "
+            "image's files to other users: file_owners need a sandbox whose user namespace maps "
+            "them"
+        )
+
     def _make_scratch_directories(self) -> None:
         """Create the scratch directories; image pulls need them too."""
         for directory in self._scratch_directories():
@@ -608,7 +668,8 @@ class SessionSandbox:
 
     Subclasses implement :meth:`_prepare_rootfs`, :meth:`_start_container`,
     :meth:`_spawn`, :meth:`_container_alive`, :meth:`_stop_container` and
-    :meth:`_identity`, and may override :meth:`_watch_root`.
+    :meth:`_identity`, and may override :meth:`_watch_root`,
+    :meth:`_apply_file_owners` and :meth:`_snapshot_copy`.
     """
 
     probe_hint = ""
@@ -758,7 +819,7 @@ class SessionSandbox:
         try:
             snapshot_format, rootfs_metadata = await self._snapshot_rootfs(target)
             for source, name in ((session.tmp, "tmp"), (session.var_tmp, "var-tmp")):
-                await self._provider.copy_tree(source, target / name)
+                await self._snapshot_copy(source, target / name)
             await asyncio.to_thread(remove_tree, target / "tmp" / TRANSFER_DIR)
             await asyncio.to_thread(self._snapshot_files, target)
             snapshot = SandboxSnapshot(
@@ -846,6 +907,11 @@ class SessionSandbox:
         missing parents, such as ``"022"``; empty for the caller's own."""
         return ""
 
+    async def _apply_file_owners(self) -> None:
+        """Give the image's files the owners that ``spec.file_owners`` lists, once the container
+        runs and before any command runs in it; only sandboxes that map other users take a
+        manifest."""
+
     def _prepare_snapshot(self) -> None:
         """Make the rootfs copyable before a snapshot; runs in a worker thread."""
 
@@ -853,8 +919,13 @@ class SessionSandbox:
         """Copy the root filesystem into the snapshot directory ``target``; returns the snapshot's
         format and the metadata a restore needs.  The whole rootfs, by default."""
         assert self._session is not None
-        await self._provider.copy_tree(self._session.rootfs, target / "rootfs")
+        await self._snapshot_copy(self._session.rootfs, target / "rootfs")
         return SNAPSHOT_FORMAT, {}
+
+    async def _snapshot_copy(self, source: Path, target: Path) -> None:
+        """Copy ``source``, the session's root filesystem, ``/tmp`` or ``/var/tmp``, to ``target``
+        in a snapshot, as your uid (:meth:`SessionProvider.copy_tree`) by default."""
+        await self._provider.copy_tree(source, target)
 
     def _snapshot_files(self, target: Path) -> None:
         """Add provider files to the snapshot directory ``target``; runs in a worker thread."""
@@ -897,6 +968,7 @@ class SessionSandbox:
             await populate(self._session)
             await asyncio.to_thread(self._prepare_rootfs)
             await self._start_container()
+            await self._apply_file_owners()
             self._protected = {
                 pid: started
                 for pid in self._own_processes()
@@ -1141,6 +1213,15 @@ def _open_staging(tmp: Path, token: str) -> tuple[int, int]:
     except BaseException:
         os.close(root)
         raise
+
+
+def check_file_owners(path: str) -> None:
+    """Raise ``ValueError`` unless ``path`` is a file owners manifest that can be read
+    (:func:`hpc_sandbox.anchor.read_file_owners`)."""
+    try:
+        read_file_owners(str(path))
+    except OSError as error:
+        raise ValueError(f"cannot read the file owners manifest {path}: {error}") from None
 
 
 def check_env(env: Mapping[str, str]) -> None:
