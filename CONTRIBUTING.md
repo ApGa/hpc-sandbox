@@ -374,7 +374,7 @@ the distribution on every pull request, without publishing it.
 The version is set in one place, `version` in `pyproject.toml`; `hpc_sandbox.__version__` and
 `hpc-sandbox --version` report it. While the version is below 1.0, a minor release (0.4.0) may
 change the public API, and a patch release (0.3.1) only fixes bugs, so code built on hpc-sandbox
-requires a range within one minor release, such as `hpc-sandbox>=0.4,<0.5`.
+requires a range within one minor release, such as `hpc-sandbox>=0.5,<0.6`.
 [Public API and versioning](docs/python-api.md#public-api-and-versioning) says what the public API
 is.
 
