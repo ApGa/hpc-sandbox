@@ -1033,6 +1033,10 @@ class SingularityService(PodService, SingularitySandbox):
         args = [
             "exec",
             *(["--userns"] if self.service.run_as == "caller" else []),
+            # An idle service's keepalive is PID 1 of its PID namespace, which a kill of every
+            # process (kill -9 -1) from a command spares, as a sandbox's instance is: the shim init
+            # would exit with its one child (pods.SERVICE_KEEPALIVE).
+            *(["--no-init"] if self.service.command is None else []),
             "--cleanenv",
             "--no-eval",
             "--writable",
@@ -1096,9 +1100,12 @@ def make_mount_point(rootfs: Path, target: str, *, directory: bool) -> None:
             raise SandboxStartError(f"mount target {target} crosses a symlink in the image")
         try:
             if index < len(parts) - 1 or directory:
-                path.mkdir(exist_ok=True)
+                if not path.is_dir():
+                    path.mkdir()
+                    path.chmod(0o755)  # as Docker makes a mount point, whatever the umask
             elif not path.exists():
                 path.touch()
+                path.chmod(0o644)
             elif not path.is_file():
                 raise SandboxStartError(f"mount target {target} is not a file in the image")
         except FileExistsError as error:

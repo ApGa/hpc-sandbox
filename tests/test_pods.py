@@ -1467,6 +1467,82 @@ async def test_the_janitor_gives_back_what_an_abandoned_subids_pod_left(
     assert await provider.wait_for_deletions(30) and not path.exists()
 
 
+def run_give_back_script(tree: Path, bin_dir: Path) -> subprocess.CompletedProcess[str]:
+    """GIVE_BACK_SCRIPT on ``tree``, as give_back runs it but outside any namespace, with the
+    programs in ``bin_dir`` ahead of the host's."""
+    return subprocess.run(
+        ["/bin/sh", "-c", pods.GIVE_BACK_SCRIPT, "hpc-sandbox-give-back", str(tree)],
+        env={"PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin", "LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def test_the_give_back_ignores_what_disappears_while_it_walks(tmp_path):
+    """A dropped service's trash entry, which its own deletion empties while the pod's give-back
+    walks the pod: a directory that find has visited is gone before it enters it, which is no
+    error. Here chown, a fake, removes every directory of the tree when find runs its first
+    batch, which it does as a directory's name would overflow the batch (8000 long names fill
+    the largest -exec {} + batch), so that very directory is gone when find enters it."""
+    tree = tmp_path / "tree"
+    entry = tree / "trash-entry"
+    entry.mkdir(parents=True)
+    for number in range(8000):
+        (entry / f"dir-{number:04d}-{'x' * 240}").mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "chown-ran"
+    chown = bin_dir / "chown"
+    chown.write_text(
+        f'#!/bin/sh\n[ -e "{marker}" ] && exit 0\n'
+        f'touch "{marker}"; rm -rf "{entry}"/dir-*\nexit 0\n'
+    )
+    chown.chmod(0o755)
+    result = run_give_back_script(tree, bin_dir)
+    assert marker.exists() and not any(entry.iterdir())
+    assert (result.returncode, result.stderr) == (0, "")
+
+
+@pytest.mark.parametrize(
+    ("errors", "status"),
+    [
+        (["No such file or directory"], 0),
+        (["No such file or directory", "Permission denied"], 1),
+        ([], 1),
+    ],
+)
+def test_the_give_back_fails_on_finds_other_errors(tmp_path, errors, status):
+    """Only find's errors on what disappeared are dropped: another one fails the give-back, which
+    prints it (and only it), as does a failure find gives no reason for."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    find = bin_dir / "find"
+    lines = "".join(f"echo \"find: '/srv/{n}': {error}\" >&2\n" for n, error in enumerate(errors))
+    find.write_text(f"#!/bin/sh\n{lines}exit 1\n")
+    find.chmod(0o755)
+    result = run_give_back_script(tmp_path, bin_dir)
+    assert result.returncode == status
+    assert "No such file" not in result.stderr
+    assert ("Permission denied" in result.stderr) == ("Permission denied" in errors)
+
+
+async def test_the_give_back_runs_find_in_the_c_locale(tmp_path, monkeypatch):
+    """The script tells find's errors apart by C's messages."""
+    from hpc_sandbox.process import ProcessResult
+
+    environments: list[dict[str, str]] = []
+
+    async def run(argv: list[str], **options: Any) -> ProcessResult:
+        environments.append(options["env"])
+        return ProcessResult(0, b"", b"")
+
+    monkeypatch.setattr(pods, "run_process", run)
+    await pods.give_back(tmp_path, "nsenter", holder=os.getpid())
+    assert [environment.get("LC_ALL") for environment in environments] == ["C"]
+
+
 MAP_THEN_FORK = """\
 import asyncio, os, sys, traceback
 from pathlib import Path
