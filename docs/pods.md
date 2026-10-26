@@ -239,7 +239,9 @@ Each service gets:
 `ulimits` accepts `nproc` and `locks` but does not apply them: the kernel counts processes per user
 namespace, so a service's `nproc` would count every process of the pod (under Docker it does not
 bind root either), and `locks` has had no effect since Linux 2.4. A service without a command runs
-an idle loop, which needs `sleep` in the image. Services cannot be snapshotted yet, and get no GPUs
+`sleep`, which needs `sleep` in the image. With Singularity, that `sleep` is the PID 1 of the
+container's PID namespace, as in a Docker container, so a command's `kill -9 -1` ends the processes
+of the service's commands but not the service. Services cannot be snapshotted yet, and get no GPUs
 ([Roadmap](roadmap.md)).
 
 ## Users
@@ -334,17 +336,22 @@ the mapping through an open descriptor. A process that closed that descriptor ma
 next such pod.
 
 Such a pod runs services of every `run_as`. The namespace of a `"subids"` service maps every id
-that the pod's maps, each to itself, so its root can switch to any of them, and drops your
-supplementary groups, as root in a Docker container has none of the host's. The other services map
-root alone or your uid alone, as in any pod. A working directory that a `"subids"` service's image
-lacks is made with mode 755 whatever your umask, as Docker's `-w` makes it, so that the users it
-switches to can enter it.
+that the pod's maps, each to itself, so its root can switch to any of them. The other services map
+root alone or your uid alone, as in any pod. Every service keeps your supplementary groups,
+unmapped: the runtime enters your working directory and binds the service's mounts through them,
+such as project storage that only a group opens. A command that switches to another user, as `gosu`
+and `su-exec` do, gives it that user's groups instead. A working directory that a `"subids"`
+service's image lacks is made with mode 755 whatever your umask, as Docker's `-w` makes it, so that
+the users it switches to can enter it, and so are the mount points the image lacks
+([Mounts](python-api.md#mounts)).
 
 What a service writes as another user belongs, on the host, to one of your subordinate ids: you can
 neither change nor delete it, nor a directory that holds it. So before a pod's files are deleted,
 hpc-sandbox gives them back to your uid: as root of a user namespace that maps your subordinate ids
 as the pod's does, `find -xdev ... -exec chown -h 0:0` makes root, your uid, the owner of everything
-another id owns, never following a link or crossing into another filesystem. This runs:
+another id owns, never following a link or crossing into another filesystem. What disappears while
+it walks, such as the files of a dropped service that their own deletion takes meanwhile, is no
+error. This runs:
 
 - at `stop()`, once the services have stopped, in the holder's namespace, over the pod's whole
   session directory (`pod.path`), so directories you create there and bind into the services are

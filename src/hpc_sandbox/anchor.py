@@ -265,9 +265,9 @@ def _nested_userns(mode: str, unshared: int, mapped: int) -> None:
         os.write(unshared, b"1")
         if os.read(mapped, 1) != b"1":
             raise OSError(1, "the service's user namespace could not be mapped")
-        with open("/proc/self/setgroups") as stream:
-            if stream.read().strip() == "allow":
-                os.setgroups([0])  # without the host's supplementary groups, as root in Docker
+        # The host's supplementary groups stay, unmapped, as in the other modes: the runtime enters
+        # the caller's directory and binds the service's mounts through them (project storage that
+        # only a group opens), and a switch to another user drops them.
         return
     uid, gid = mode.removeprefix("caller=").split(":") if mode != "root" else ("0", "0")
     _write("/proc/self/setgroups", "deny")

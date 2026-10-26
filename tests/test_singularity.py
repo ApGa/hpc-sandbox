@@ -545,3 +545,17 @@ async def test_a_missing_working_directory_fails_the_command_not_the_sandbox(
     await sandbox.download("/tmp/out.txt", tmp_path / "out.txt")
     await sandbox.upload(tmp_path / "out.txt", "/tmp/back.txt")
     assert (sandbox.session_dir / "tmp" / "back.txt").read_text() == "payload\n"
+
+
+def test_mount_points_are_made_as_docker_makes_them_whatever_the_umask(tmp_path: Path):
+    from hpc_sandbox.singularity import make_mount_point
+
+    previous = os.umask(0o077)
+    try:
+        make_mount_point(tmp_path, "/logs/verifier", directory=True)
+        make_mount_point(tmp_path, "/etc/extra.conf", directory=False)
+    finally:
+        os.umask(previous)
+    made = ("logs", "logs/verifier", "etc", "etc/extra.conf")
+    modes = {path: stat.S_IMODE((tmp_path / path).stat().st_mode) for path in made}
+    assert modes == {"logs": 0o755, "logs/verifier": 0o755, "etc": 0o755, "etc/extra.conf": 0o644}

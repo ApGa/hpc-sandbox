@@ -137,7 +137,8 @@ and `cp` and `dirname`, which transfers use.
 
 A start creates the target in the sandbox's root filesystem when the image lacks it. With
 Singularity, a target whose path crosses a symlink in the image fails the start with
-`SandboxStartError`.
+`SandboxStartError`, and the directories it creates get mode 755, and a file 644, whatever your
+umask, as Docker makes a mount point, so that the users a command switches to can reach them.
 
 ## Running commands
 

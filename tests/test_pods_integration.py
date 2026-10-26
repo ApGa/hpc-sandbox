@@ -361,6 +361,27 @@ def owner(path: Path) -> int:
 
 
 @pytest.mark.parametrize("run_as", RUN_AS)
+async def test_a_service_keeps_your_supplementary_groups_in_every_mode(provider, run_as):
+    """A service's command has your supplementary groups, unmapped, whatever its mode, as a
+    sandbox does: the runtime enters your directory and binds the service's mounts through them,
+    such as project storage that only a group opens."""
+    skip_unless_possible(run_as)
+    if len(os.getgroups()) < 2:
+        pytest.skip("your user has no supplementary group besides its own")
+    pod = await provider.start_pod(PodSpec(users="subids" if run_as == "subids" else "single"))
+    record = "grep '^Groups:' /proc/self/status > /tmp/g && mv /tmp/g /tmp/groups && exec sleep 600"
+    spec = ServiceSpec(
+        "svc", SandboxSpec(image=IMAGE), command=["/bin/sh", "-c", record], run_as=run_as
+    )
+    service = await pod.start_service(spec)
+    groups = service.session_dir / "tmp" / "groups"
+    await until(lambda: groups.exists() or service.exit_status is not None, 60)
+    assert groups.exists(), await pod.logs("svc")
+    assert len(groups.read_text().split()[1:]) == len(os.getgroups()), groups.read_text()
+    await pod.stop()
+
+
+@pytest.mark.parametrize("run_as", RUN_AS)
 @pytest.mark.parametrize("database", sorted(DATABASES))
 async def test_database_images_run_as_the_caller_or_with_subordinate_ids(
     provider, database, run_as
@@ -406,6 +427,23 @@ async def test_database_images_run_as_the_caller_or_with_subordinate_ids(
     print(f"\n{database} as {run_as}: healthy in {healthy:.2f} s, pod stopped in {stopped:.2f} s")
 
 
+async def test_a_download_from_a_subids_service_gives_you_what_its_users_own(provider, tmp_path):
+    """What a service's users other than root wrote, only for themselves, reaches the host's
+    copy, which your uid owns: busybox's cp -p keeps owners, which the copy is taken from."""
+    skip_unless_possible("subids")
+    pod = await provider.start_pod(PodSpec(users="subids"))
+    spec = ServiceSpec("svc", SandboxSpec(image=IMAGE), run_as="subids")
+    service = await pod.start_service(spec)
+    made = await service.exec(
+        "mkdir -p /tmp/out/deep && echo kept > /tmp/out/deep/file && chmod 700 /tmp/out/deep"
+        " && chmod 600 /tmp/out/deep/file && chown -R 999:999 /tmp/out"
+    )
+    assert made.exit_code == 0, made
+    await service.download("/tmp/out", tmp_path / "out")
+    assert (tmp_path / "out" / "deep" / "file").read_text() == "kept\n"
+    await pod.stop()
+
+
 @pytest.mark.parametrize("run_as", RUN_AS)
 async def test_only_a_service_with_subordinate_ids_switches_users(provider, run_as):
     skip_unless_possible(run_as)
@@ -437,6 +475,30 @@ async def test_only_a_service_with_subordinate_ids_switches_users(provider, run_
     await pod.stop()
     assert await provider.wait_for_deletions(120) and not path.exists()
     assert list((provider.pod_root / ".trash").iterdir()) == []
+
+
+@pytest.mark.parametrize("run_as", RUN_AS)
+async def test_an_idle_service_outlives_a_kill_of_every_process(provider, run_as):
+    """A command's kill -9 -1 kills what the service's commands run, never the service, whose
+    keepalive is PID 1 there, as a sandbox's and a Docker container's are; nothing of the
+    service's own starts again behind it, so its processes are the ones it had before (what was
+    killed waits there as a zombie, which a PID 1 that forks nothing never reaps)."""
+    skip_unless_possible(run_as)
+    if RUNTIME == "enroot":
+        pytest.skip("with enroot, the service's init is the PID 1 that such a kill spares")
+    listing = (
+        'for p in /proc/[0-9]*; do p=${p#/proc/}; [ "$p" = "$$" ] && continue; '
+        'read -r s < "/proc/$p/stat" 2>/dev/null || continue; '
+        'case $s in *") Z "*) continue ;; esac; echo "$p"; done'
+    )
+    pod = await provider.start_pod(PodSpec(users="subids" if run_as == "subids" else "single"))
+    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=IMAGE), run_as=run_as))
+    before = set((await main.exec(listing)).stdout.split())
+    await main.exec("sleep 300 & kill -9 -1")
+    assert (await main.exec("echo alive")).stdout == "alive\n"
+    assert set((await main.exec(listing)).stdout.split()) <= before
+    assert await pod.health("main") == "healthy"
+    await pod.stop()
 
 
 CRASH_SUBIDS = """\

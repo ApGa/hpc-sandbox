@@ -6,6 +6,14 @@ one minor release, require a range such as `hpc-sandbox>=0.4,<0.5`.
 
 ## 0.5.0 (unreleased)
 
+### Changed behaviour
+
+- **With Singularity, a start makes the mount points that an image lacks as Docker does**: a mount
+  target's directories, and the parents a start creates for it, get mode 755, and a file 644,
+  whatever your umask, so that the users a command switches to can reach them. One that the image
+  has keeps its mode. Before, a umask such as 027 made them 750 and 640, and a user that a command
+  switched to could not enter a directory bound there. See [Mounts](docs/python-api.md#mounts).
+
 ### Added
 
 - **Pod services can run as your own uid, or as a root that switches to your subordinate ids**:
@@ -27,6 +35,19 @@ one minor release, require a range such as `hpc-sandbox>=0.4,<0.5`.
   your uid before the pod's files are deleted: at a stop, when a service stops before its pod, and
   when a janitor sweeps an abandoned pod. With Singularity, `hpc-sandbox doctor` shows your
   subordinate ids on a new `pods: subordinate ids` line. See [Users](docs/pods.md#users).
+
+### Fixed
+
+- **An idle pod service outlives a command's `kill -9 -1` with Singularity.** A service without a
+  command ran its idle loop under Singularity's own init, which exits with its one child, so a
+  command that killed every process it could, as an agent may, ended the service. Its `sleep` is
+  now the PID 1 of the container's PID namespace (`exec --no-init`), which such a kill spares, as
+  in a Docker container. See [Services](docs/pods.md#services).
+- **A download gives you the files that other users own in a sandbox or service whose root can
+  switch users, also from an image whose `cp` is BusyBox's.** BusyBox's `cp -p` kept their owners,
+  your subordinate ids on the host, so you could not read a copy that only its owner may read. The
+  copy is now given to root, your uid, before it reaches you. See
+  [Transfers](docs/python-api.md#transfers).
 
 ## 0.4.0 (2026-10-19)
 
