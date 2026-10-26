@@ -7,14 +7,20 @@ Run on a compute node (never a login node) with::
 ``HPC_SANDBOX_TEST_RUNTIME`` picks the runtime as for ``test_integration.py``.
 Services run ``HPC_SANDBOX_TEST_POD_IMAGE`` (default ``docker://alpine:3.20``,
 whose busybox serves and fetches HTTP); the apt check runs
-``HPC_SANDBOX_TEST_APT_IMAGE`` (default ``docker://python:3.12-slim``). Egress
-checks run where slirp4netns is found (see ``hpc-sandbox fetch-tools``) and
-reach PyPI and Debian's mirrors.
+``HPC_SANDBOX_TEST_APT_IMAGE`` (default ``docker://python:3.12-slim``), and the
+checks of who services run as run ``HPC_SANDBOX_TEST_REDIS_IMAGE`` (default
+``docker://redis:7-alpine``) and ``HPC_SANDBOX_TEST_POSTGRES_IMAGE`` (default
+``docker://postgres:16-alpine``), with their entrypoints. Egress checks run where
+slirp4netns is found (see ``hpc-sandbox fetch-tools``) and reach PyPI and
+Debian's mirrors. ``HPC_SANDBOX_TEST_SUBIDS=1`` also tests pods with
+``users="subids"``, with Singularity, where your user has subordinate ids that
+``newuidmap`` and ``newgidmap`` map.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import signal
 import socket
@@ -32,7 +38,7 @@ import pytest
 
 from hpc_sandbox import SandboxSpec
 from hpc_sandbox.procfs import owned_live_start_time
-from hpc_sandbox.types import HealthCheck, PodSpec, SandboxError, ServiceSpec
+from hpc_sandbox.types import HealthCheck, PodSpec, SandboxError, ServiceRunAs, ServiceSpec
 from test_integration import RUNTIME, make_provider
 
 pytestmark = [
@@ -44,6 +50,9 @@ pytestmark = [
 ]
 IMAGE = os.environ.get("HPC_SANDBOX_TEST_POD_IMAGE", "docker://alpine:3.20")
 APT_IMAGE = os.environ.get("HPC_SANDBOX_TEST_APT_IMAGE", "docker://python:3.12-slim")
+REDIS_IMAGE = os.environ.get("HPC_SANDBOX_TEST_REDIS_IMAGE", "docker://redis:7-alpine")
+POSTGRES_IMAGE = os.environ.get("HPC_SANDBOX_TEST_POSTGRES_IMAGE", "docker://postgres:16-alpine")
+SUBIDS = RUNTIME != "enroot" and os.environ.get("HPC_SANDBOX_TEST_SUBIDS") == "1"
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 JUDGE = (
     'echo judge up; while true; do printf "HTTP/1.0 200 OK\\r\\n\\r\\njudge-ok $SECRET\\n" '
@@ -295,3 +304,185 @@ async def test_many_pods_start_and_stop_cleanly(provider, gateway):
     timings.sort()
     p99 = timings[min(len(timings) - 1, round(0.99 * (len(timings) - 1)))]
     print(f"\n{count} pods: setup p50 {statistics.median(timings):.2f} s, p99 {p99:.2f} s")
+
+
+# Who services run as. The official database images start as root, give their data directories to
+# their own user and switch to it (gosu, su-exec); as another user they skip both.
+DATABASES = {
+    "redis": ServiceSpec(
+        "redis",
+        SandboxSpec(image=REDIS_IMAGE, workdir="/data"),
+        command=["docker-entrypoint.sh", "redis-server"],
+        healthcheck=HealthCheck(
+            ["CMD", "redis-cli", "ping"], interval_s=1, start_interval_s=0.2, start_period_s=120
+        ),
+    ),
+    "postgres": ServiceSpec(
+        "postgres",
+        SandboxSpec(image=POSTGRES_IMAGE, workdir="/", env={"POSTGRES_PASSWORD": "hpc-sandbox"}),
+        command=["docker-entrypoint.sh", "postgres"],
+        healthcheck=HealthCheck(
+            ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"],
+            interval_s=1,
+            start_interval_s=0.2,
+            start_period_s=120,
+        ),
+    ),
+}
+# Where each keeps its data, and its port.
+DATA = {"redis": "/data", "postgres": "/var/lib/postgresql/data"}
+PORTS = {"redis": 6379, "postgres": 5432}
+# As root, add a user of uid 999 (in group users: busybox takes gid 999 for a new user's group,
+# which alpine gives ping) and switch to it, write in a directory of its own, then stay up.
+SWITCH_USERS = (
+    "adduser -D -H -u 999 -G users svc && exec su -s /bin/sh svc -c '"
+    "id -u > /tmp/uid && mkdir -m 700 /tmp/own && echo x > /tmp/own/file && "
+    "touch /tmp/ready && exec sleep 600'"
+)
+RUN_AS: list[ServiceRunAs] = ["root", "caller", "subids"]
+
+
+def skip_unless_possible(run_as: ServiceRunAs) -> None:
+    if run_as == "subids" and RUNTIME == "enroot":
+        pytest.skip("enroot maps one id into a container: no subids services")
+    if run_as == "subids" and not SUBIDS:
+        pytest.skip("set HPC_SANDBOX_TEST_SUBIDS=1 where your user has subordinate ids")
+
+
+async def until(probe: Any, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not probe():
+        assert time.monotonic() < deadline, "timed out"
+        await asyncio.sleep(0.1)
+
+
+def owner(path: Path) -> int:
+    return path.lstat().st_uid
+
+
+@pytest.mark.parametrize("run_as", RUN_AS)
+@pytest.mark.parametrize("database", sorted(DATABASES))
+async def test_database_images_run_as_the_caller_or_with_subordinate_ids(
+    provider, database, run_as
+):
+    skip_unless_possible(run_as)
+    pod = await provider.start_pod(PodSpec(users="subids" if run_as == "subids" else "single"))
+    spec = dataclasses.replace(DATABASES[database], run_as=run_as)
+    started = time.monotonic()
+    if run_as == "root":
+        service = await pod.start_service(spec)
+        if RUNTIME == "enroot":
+            # enroot's seccomp filter makes chown and setuid succeed and do nothing: still root
+            # after the switch, the entrypoint starts over, again and again, and is never ready.
+            await asyncio.sleep(10)
+            assert service.exit_status is None, await pod.logs(database)
+            assert await pod.health(database) == "starting"
+            data = service.session_dir / "rootfs" / DATA[database].lstrip("/")
+            assert owner(data) == os.getuid()
+        else:  # with one id, chown to their user fails, and they exit at once
+            await until(lambda: service.exit_status is not None, 120)
+            assert service.exit_status != 0, await pod.logs(database)
+            assert "Invalid argument" in await pod.logs(database)
+        await pod.stop()
+        return
+    service = await pod.start_service(spec, wait="healthy")
+    healthy = time.monotonic() - started
+    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=IMAGE)))
+    reached = await main.exec(f"nc -z -w 5 {database} {PORTS[database]} && echo open")
+    assert reached.stdout == "open\n", reached
+    data = service.session_dir / "rootfs" / DATA[database].lstrip("/")
+    if run_as == "caller":  # it runs as your uid: what it writes is yours
+        assert owner(data) == os.getuid()
+        assert (await service.exec("id -u")).stdout == f"{os.getuid()}\n"
+    else:  # its own user's: one of your subordinate ids on the host
+        assert owner(data) in pod._ids.uids.ids, owner(data)
+    assert await pod.health(database) == "healthy"
+    started = time.monotonic()
+    path = pod.path
+    await pod.stop()
+    stopped = time.monotonic() - started
+    assert await provider.wait_for_deletions(120) and not path.exists()
+    assert list((provider.pod_root / ".trash").iterdir()) == []
+    print(f"\n{database} as {run_as}: healthy in {healthy:.2f} s, pod stopped in {stopped:.2f} s")
+
+
+@pytest.mark.parametrize("run_as", RUN_AS)
+async def test_only_a_service_with_subordinate_ids_switches_users(provider, run_as):
+    skip_unless_possible(run_as)
+    pod = await provider.start_pod(PodSpec(users="subids" if run_as == "subids" else "single"))
+    spec = ServiceSpec(
+        "svc", SandboxSpec(image=IMAGE), command=["/bin/sh", "-c", SWITCH_USERS], run_as=run_as
+    )
+    service = await pod.start_service(spec)
+    tmp = service.session_dir / "tmp"
+    if run_as == "root" and RUNTIME == "enroot":  # enroot's seccomp filter: su switches nothing
+        await until(lambda: (tmp / "ready").exists() or service.exit_status is not None, 60)
+        assert (tmp / "ready").exists(), await pod.logs("svc")
+        assert (tmp / "uid").read_text() == "0\n" and owner(tmp / "own") == os.getuid()
+        await pod.stop()
+        return
+    if run_as != "subids":  # the caller cannot add a user; root of one id cannot switch to it
+        await until(lambda: service.exit_status is not None, 60)
+        assert service.exit_status != 0, await pod.logs("svc")
+        await pod.stop()
+        return
+    await until(lambda: (tmp / "ready").exists() or service.exit_status is not None, 60)
+    assert (tmp / "ready").exists(), await pod.logs("svc")
+    assert (await service.exec("cat /tmp/uid; stat -c '%u %a' /tmp/own")).stdout == "999\n999 700\n"
+    assert owner(tmp / "own") == pod._ids.uids.start + 998
+    assert await pod.health("svc") == "healthy"  # its command switched users and runs on
+    down = await service.exec("ip link set lo down")  # its root, with every subordinate id
+    assert down.exit_code != 0 and "not permitted" in down.stderr.lower(), down
+    path = pod.path
+    await pod.stop()
+    assert await provider.wait_for_deletions(120) and not path.exists()
+    assert list((provider.pod_root / ".trash").iterdir()) == []
+
+
+CRASH_SUBIDS = """\
+import asyncio, os, signal, sys
+sys.path.insert(0, {src!r})
+from hpc_sandbox import SandboxSpec, SingularityProvider
+from hpc_sandbox.types import PodSpec, ServiceSpec
+
+async def main():
+    scratch, image, script = sys.argv[1:]
+    provider = SingularityProvider(scratch_root=scratch)
+    pod = await provider.start_pod(PodSpec(users="subids", labels={{"t": "crash"}}))
+    command = ["/bin/sh", "-c", script]
+    spec = ServiceSpec("svc", SandboxSpec(image=image), command=command, run_as="subids")
+    service = await pod.start_service(spec)
+    for _ in range(600):
+        if (service.session_dir / "tmp" / "ready").exists() or service.exit_status is not None:
+            break
+        await asyncio.sleep(0.1)
+    if not (service.session_dir / "tmp" / "ready").exists():
+        print(await pod.logs("svc"), file=sys.stderr, flush=True)
+    print(pod.id, pod._holder.pid, service._service_anchor.pid, service._service_init, flush=True)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+asyncio.run(main())
+"""
+
+
+async def test_the_janitor_gives_back_what_a_dead_owners_subids_pod_left(provider, scratch):
+    skip_unless_possible("subids")
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", CRASH_SUBIDS.format(src=SRC), str(scratch), IMAGE, SWITCH_USERS],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert result.returncode == -signal.SIGKILL, result.stderr
+    pod_id, *pids = result.stdout.split()
+    await until(lambda: not any(owned_live_start_time(int(pid)) for pid in pids), 10)
+    path = provider.pod_root / pod_id
+    owned = list(path.glob("services/hpcsb-*/tmp/own"))
+    assert len(owned) == 1, result.stderr
+    assert owner(owned[0]) != os.getuid()  # a subordinate id's, which you cannot delete
+    report = await provider.reap()
+    assert pod_id in report.removed and not report.errors
+    assert await provider.wait_for_deletions(120) and not path.exists()
+    assert list((provider.pod_root / ".trash").iterdir()) == []

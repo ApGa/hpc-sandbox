@@ -210,6 +210,8 @@ containers even with `--cleanenv`, and whose URLs may hold credentials. Give the
 | `HPC_SANDBOX_TEST_GPUS` | Tests only | Tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | Tests only | The image of the pod integration tests' services; default `docker://alpine:3.20`. |
 | `HPC_SANDBOX_TEST_APT_IMAGE` | Tests only | The image of the pod integration test that runs apt; default `docker://python:3.12-slim`. |
+| `HPC_SANDBOX_TEST_REDIS_IMAGE`, `HPC_SANDBOX_TEST_POSTGRES_IMAGE` | Tests only | The database images that the pod integration tests run as each `run_as`, with their entrypoints; default `docker://redis:7-alpine` and `docker://postgres:16-alpine`. |
+| `HPC_SANDBOX_TEST_SUBIDS` | Tests only | `1` also tests pods with `users="subids"`, with Singularity, where your user has subordinate ids that `newuidmap` and `newgidmap` map. |
 | `HPC_SANDBOX_TEST_PODS` | Tests only | How many pods the pod integration tests start at once; default 16. |
 
 [CONTRIBUTING.md](../CONTRIBUTING.md) describes how to run the tests.

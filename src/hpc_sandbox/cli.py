@@ -23,6 +23,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from . import subids
 from .enroot import ANCHOR_SCRIPT, STANDARD_HOOKS, EnrootProvider
 from .images import DIGEST
 from .paths import in_batch_job
@@ -418,6 +419,8 @@ async def _doctor(args: argparse.Namespace) -> int:
         report.line("ok", "pods: egress", f"slirp4netns {provider.slirp4netns()}")
     except SandboxError as error:
         report.line("warn", "pods: egress", str(error))
+    if "subids" in provider.service_type.run_modes:  # enroot's containers map one id
+        report.line(*_subids_check())
     if args.image:
         await _smoke(report, provider, args.image)
     return 1 if report.failures else 0
@@ -459,6 +462,19 @@ async def _enroot_checks(report: _Report, provider: EnrootProvider) -> None:
         report.line("warn", "sandbox hooks", f"{detail}; not enabled, so skipped: {missing}")
     else:
         report.line("ok", "sandbox hooks", detail)
+
+
+def _subids_check() -> tuple[str, str, str]:
+    """Whether pods with ``users="subids"`` can start here: your subordinate ids, and the tools that
+    map them. Their lack is no failure: the other pods need neither."""
+    name = "pods: subordinate ids"
+    uids, gids = subids.ranges()
+    try:
+        ids = subids.find()
+    except SandboxError as error:  # only the site gives ranges; the tools may just be missing
+        return "info" if uids is None or gids is None else "warn", name, str(error)
+    spans = (f"{extent.start}-{extent.start + extent.count - 1}" for extent in (ids.uids, ids.gids))
+    return "ok", name, "uids {}, gids {}; {}, {}".format(*spans, ids.newuidmap, ids.newgidmap)
 
 
 def _whiteout_check(temp_dir: Path) -> tuple[str, str, str]:

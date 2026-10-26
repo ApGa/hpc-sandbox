@@ -148,7 +148,9 @@ class SandboxProvider(Protocol):
 
 
 PodNetwork = Literal["none", "egress"]
+PodUsers = Literal["single", "subids"]
 ServiceHealth = Literal["starting", "healthy", "unhealthy", "exited"]
+ServiceRunAs = Literal["root", "caller", "subids"]
 
 
 @dataclass
@@ -182,7 +184,11 @@ class ServiceSpec:
     names (``nofile``, ``stack``...) to ``(soft, hard)``, ``-1`` for unlimited,
     within the hard limits of the host process; ``nproc`` and ``locks`` are
     accepted but not applied (``nproc`` would count every process of the pod,
-    and under Docker it does not bind root either).
+    and under Docker it does not bind root either). ``run_as`` is who the
+    command and the commands entered into the service run as: ``"root"``,
+    which is your uid on the host and cannot switch users; ``"caller"``, your
+    own uid, not root; or ``"subids"``, root that can switch to the users your
+    subordinate ids map, in a pod started with ``users="subids"``.
     """
 
     name: str
@@ -191,6 +197,7 @@ class ServiceSpec:
     healthcheck: HealthCheck | None = None
     shm_mb: int | None = None
     ulimits: dict[str, tuple[int, int]] = field(default_factory=dict)
+    run_as: ServiceRunAs = "root"
 
 
 @dataclass
@@ -202,13 +209,18 @@ class PodSpec:
     (``{"gateway": "unix:///path/gw.sock"}``) is reachable in every service at
     ``127.0.0.1:<port>``, by default 18080, 18081... in order
     (``upstream_ports`` overrides), relayed to the host's Unix socket.
-    ``labels`` select pods for :meth:`reap` and janitors.
+    ``labels`` select pods for :meth:`reap` and janitors. ``users`` is what
+    the pod's user namespace maps: ``"single"``, your uid and gid as root;
+    ``"subids"``, also your subordinate ids (``/etc/subuid``,
+    ``/etc/subgid``), mapped with ``newuidmap`` and ``newgidmap``, which
+    services with ``run_as="subids"`` need.
     """
 
     network: PodNetwork = "none"
     upstreams: dict[str, str] = field(default_factory=dict)
     upstream_ports: dict[str, int] = field(default_factory=dict)
     labels: dict[str, str] = field(default_factory=dict)
+    users: PodUsers = "single"
 
 
 @runtime_checkable

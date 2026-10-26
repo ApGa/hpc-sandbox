@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from conftest import hide_from_path
-from hpc_sandbox import SandboxSpec
+from conftest import FakeSubids, hide_from_path
+from hpc_sandbox import SandboxSpec, subids
 from hpc_sandbox.cli import main, resolve_runtime
 
 
@@ -58,6 +58,24 @@ def test_doctor_checks_the_site_and_smoke_tests_an_image(tmp_path, sif, fake_run
         assert f"[  ok] {check}" in output
 
 
+def test_doctor_reports_the_subordinate_ids_that_pods_would_map(
+    tmp_path, fake_runtime, fake_subids, capsys, monkeypatch
+):
+    name = "pods: subordinate ids"
+    refused = "pods with users='subids' cannot start here"
+    assert main(["doctor", *common(tmp_path)]) == 0
+    first, last = FakeSubids.START, FakeSubids.START + FakeSubids.COUNT - 1
+    tools = f"{fake_subids.directory / 'newuidmap'}, {fake_subids.directory / 'newgidmap'}"
+    expected = f"[  ok] {name}: uids {first}-{last}, gids {first}-{last}; {tools}\n"
+    assert expected in capsys.readouterr().out
+    hide_from_path(monkeypatch, "newgidmap")  # the site may install it: a warning
+    assert main(["doctor", *common(tmp_path)]) == 0
+    assert f"[warn] {name}: {refused}: no newgidmap" in capsys.readouterr().out
+    monkeypatch.setattr(subids, "SUBUID", tmp_path / "none")  # only the site gives ranges: info
+    assert main(["doctor", *common(tmp_path)]) == 0
+    assert f"[info] {name}: {refused}: no range of subordinate ids" in capsys.readouterr().out
+
+
 def test_doctor_fails_without_a_runtime(tmp_path, capsys):
     assert main(["doctor", *common(tmp_path), "--binary", str(tmp_path / "missing")]) == 1
     assert "[FAIL] runtime" in capsys.readouterr().out
@@ -86,6 +104,7 @@ def test_doctor_checks_enroot_and_smoke_tests_an_image(
     output = capsys.readouterr().out
     assert "3.5.0-fake" in output and "[  ok] namespaces" in output
     assert "[warn] pods: egress: pods with egress need slirp4netns" in output
+    assert "pods: subordinate ids" not in output  # enroot's pods map none
     for check in ("sandbox start", "exec", "upload/download", "sandbox stop"):
         assert f"[  ok] {check}" in output
 

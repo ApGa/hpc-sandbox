@@ -4,6 +4,30 @@ What each release of hpc-sandbox changes. Its version is below 1.0: a minor rele
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
 one minor release, require a range such as `hpc-sandbox>=0.4,<0.5`.
 
+## 0.5.0 (unreleased)
+
+### Added
+
+- **Pod services can run as your own uid, or as a root that switches to your subordinate ids**:
+  `ServiceSpec(run_as=...)` says who a service's command, and the commands entered into it, run as.
+  `"root"`, the default, is root of a namespace that maps no other user, as before. `"caller"` runs
+  them as your uid and gid, without capabilities (Singularity's `exec --userns`; enroot without
+  `--root`), so images that switch to a user of their own only when they start as root, such as the
+  official PostgreSQL and Redis images, run instead of exiting at once with
+  `chown: Invalid argument` (or, with enroot, whose seccomp filter fakes that `chown` and the
+  switch, starting over and over as root without getting ready).
+  `"subids"`, with Singularity CE and Apptainer, gives a root that can
+  switch users, as under Docker, in a pod started with `PodSpec(users="subids")`, which maps your
+  subordinate ids (`/etc/subuid`, `/etc/subgid`) into its user namespace: `newuidmap` and
+  `newgidmap` map them once per process, which can take seconds on some sites, and later pods reuse
+  that mapping, as do those of the processes it forks afterwards. `provider.map_subordinate_ids()`
+  maps them ahead, before a fork server forks its workers, for example. `start_pod()` raises
+  `SandboxError` where your user has none or the tools are missing, and `ValueError` with enroot,
+  which maps one id into a container. What such services write as other users is given back to
+  your uid before the pod's files are deleted: at a stop, when a service stops before its pod, and
+  when a janitor sweeps an abandoned pod. With Singularity, `hpc-sandbox doctor` shows your
+  subordinate ids on a new `pods: subordinate ids` line. See [Users](docs/pods.md#users).
+
 ## 0.4.0 (2026-10-19)
 
 ### Changed behaviour

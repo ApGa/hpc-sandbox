@@ -24,6 +24,7 @@ this table list; the other rows are needed only for what they name:
 | util-linux `prlimit` | commands in pod services that set `ulimits` |
 | util-linux `flock` | optional: with it, the background deletions of stopped sandboxes run one at a time per session root; without it, all at once |
 | slirp4netns 0.4 or later, or the one `hpc-sandbox fetch-tools` downloads, and a `/dev/net/tun` that users may open | pods with egress ([Pods](pods.md#egress)) |
+| a range of subordinate ids for your user in `/etc/subuid` and `/etc/subgid`, and shadow-utils' `newuidmap` and `newgidmap` | pods with `users="subids"`, whose services can switch users, with Singularity CE and Apptainer ([Pods](pods.md#subordinate-ids)) |
 | `fuse-overlayfs`, `fusermount3` or `fusermount`, and `/dev/fuse` | Singularity's fuse-overlay layout; janitors need only `fusermount3` or `fusermount` ([Singularity CE and Apptainer](singularity.md#the-fuse-overlay-layout)) |
 
 `hpc-sandbox doctor` checks the runtime, the scratch root and the image cache on a node, and with
@@ -120,6 +121,7 @@ something from you:
 | `[warn] scratch root` | Inside a batch job, the scratch root is on a shared filesystem or a tmpfs. Set `HPC_SANDBOX_SCRATCH` to a directory on the node's local disk ([Put the sandboxes on local disk](#put-the-sandboxes-on-local-disk)). |
 | `[FAIL] scratch root`, `[FAIL] image cache` | The directory cannot be created or written, or the scratch root belongs to another user. Choose another with `HPC_SANDBOX_SCRATCH` or `HPC_SANDBOX_IMAGE_CACHE`. |
 | `[warn] pods: egress` | No slirp4netns that pods can use was found. Only pods with egress need one: run `hpc-sandbox fetch-tools` once, where there is internet access ([Pods](pods.md#egress)). |
+| `[info] pods: subordinate ids`, `[warn] pods: subordinate ids` | Your user has no subordinate ids on this node (`info`), or `newuidmap` and `newgidmap` are missing (`warn`). Only pods with `users="subids"` need them; services elsewhere can run as root or as your uid ([Users](pods.md#users)). Ask your site's administrators for a range, or for shadow-utils' `uidmap` package. |
 | `[FAIL] sandbox start` | The message says why. When the compute nodes cannot reach the registry, run `hpc-sandbox pull IMAGE` on a machine that can, into an image cache the compute nodes share ([The image cache](configuration.md#the-image-cache)). |
 
 ## Your first sandbox
