@@ -248,7 +248,8 @@ A service's `run_as` says who its command, and the commands entered into it, run
 not always enough: the official images of databases such as PostgreSQL and Redis start as root,
 give their data directories to a user of their own with `chown`, and switch to it with `gosu` or
 `su-exec`. In a namespace that maps no other user, that `chown` fails with `Invalid argument`, and
-they exit at once.
+they exit at once. With enroot they never get ready instead: its seccomp filter makes that `chown`
+and the switch succeed and do nothing, so the entrypoint, still root, starts over again and again.
 
 | `run_as` | The command runs as | It can switch to | Needs | Runtimes |
 |---|---|---|---|---|
@@ -261,6 +262,10 @@ they exit at once.
   insist on root fail.
 - `"subids"` gives what Docker gives: a root that can become other users (`su`, `setpriv`, `gosu`)
   and give them files (`chown`). A process that became another user cannot become root again.
+- With enroot, a service's command runs under enroot's seccomp filter, which lets package managers
+  run as root of one id: `chown`, `setuid` and their kin succeed and change nothing. So a `su` to
+  another user runs its command as the same uid, and files keep their owner. Commands entered with
+  `exec` run without the filter, and there these calls fail with `Invalid argument`.
 
 In every mode, the image's files belong to your uid on the host, as hpc-sandbox extracts them, so a
 service sees them as root's, or with `"caller"` as its own. Commands get `HOME=/root` unless `env`

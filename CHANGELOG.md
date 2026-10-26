@@ -14,7 +14,9 @@ one minor release, require a range such as `hpc-sandbox>=0.4,<0.5`.
   them as your uid and gid, without capabilities (Singularity's `exec --userns`; enroot without
   `--root`), so images that switch to a user of their own only when they start as root, such as the
   official PostgreSQL and Redis images, run instead of exiting at once with
-  `chown: Invalid argument`. `"subids"`, with Singularity CE and Apptainer, gives a root that can
+  `chown: Invalid argument` (or, with enroot, whose seccomp filter fakes that `chown` and the
+  switch, starting over and over as root without getting ready).
+  `"subids"`, with Singularity CE and Apptainer, gives a root that can
   switch users, as under Docker, in a pod started with `PodSpec(users="subids")`, which maps your
   subordinate ids (`/etc/subuid`, `/etc/subgid`) into its user namespace: `newuidmap` and
   `newgidmap` map them once per process, which can take seconds on some sites, and later pods reuse

@@ -369,11 +369,20 @@ async def test_database_images_run_as_the_caller_or_with_subordinate_ids(
     pod = await provider.start_pod(PodSpec(users="subids" if run_as == "subids" else "single"))
     spec = dataclasses.replace(DATABASES[database], run_as=run_as)
     started = time.monotonic()
-    if run_as == "root":  # with one id, chown to their user fails, and they exit at once
+    if run_as == "root":
         service = await pod.start_service(spec)
-        await until(lambda: service.exit_status is not None, 120)
-        assert service.exit_status != 0, await pod.logs(database)
-        assert "Invalid argument" in await pod.logs(database)
+        if RUNTIME == "enroot":
+            # enroot's seccomp filter makes chown and setuid succeed and do nothing: still root
+            # after the switch, the entrypoint starts over, again and again, and is never ready.
+            await asyncio.sleep(10)
+            assert service.exit_status is None, await pod.logs(database)
+            assert await pod.health(database) == "starting"
+            data = service.session_dir / "rootfs" / DATA[database].lstrip("/")
+            assert owner(data) == os.getuid()
+        else:  # with one id, chown to their user fails, and they exit at once
+            await until(lambda: service.exit_status is not None, 120)
+            assert service.exit_status != 0, await pod.logs(database)
+            assert "Invalid argument" in await pod.logs(database)
         await pod.stop()
         return
     service = await pod.start_service(spec, wait="healthy")
@@ -405,12 +414,18 @@ async def test_only_a_service_with_subordinate_ids_switches_users(provider, run_
         "svc", SandboxSpec(image=IMAGE), command=["/bin/sh", "-c", SWITCH_USERS], run_as=run_as
     )
     service = await pod.start_service(spec)
+    tmp = service.session_dir / "tmp"
+    if run_as == "root" and RUNTIME == "enroot":  # enroot's seccomp filter: su switches nothing
+        await until(lambda: (tmp / "ready").exists() or service.exit_status is not None, 60)
+        assert (tmp / "ready").exists(), await pod.logs("svc")
+        assert (tmp / "uid").read_text() == "0\n" and owner(tmp / "own") == os.getuid()
+        await pod.stop()
+        return
     if run_as != "subids":  # the caller cannot add a user; root of one id cannot switch to it
         await until(lambda: service.exit_status is not None, 60)
         assert service.exit_status != 0, await pod.logs("svc")
         await pod.stop()
         return
-    tmp = service.session_dir / "tmp"
     await until(lambda: (tmp / "ready").exists() or service.exit_status is not None, 60)
     assert (tmp / "ready").exists(), await pod.logs("svc")
     assert (await service.exec("cat /tmp/uid; stat -c '%u %a' /tmp/own")).stdout == "999\n999 700\n"
