@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import textwrap
@@ -32,7 +33,7 @@ from conftest import (
     namespaces_unavailable,
 )
 from hpc_sandbox import EnrootService, SandboxSpec, SingularityService, pods, sessions, subids
-from hpc_sandbox.pods import check_pod, health_argv, hosts_file
+from hpc_sandbox.pods import check_pod, connect_unix, health_argv, hosts_file
 from hpc_sandbox.procfs import owned_live_start_time
 from hpc_sandbox.types import (
     HealthCheck,
@@ -47,7 +48,7 @@ from test_trash import janitor_lock_held
 PYTHON = "/usr/bin/python3"
 SERVER = textwrap.dedent(
     """\
-    import http.server, os, sys
+    import http.server, os, socket, sys
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             body = f"{os.environ.get('GREETING', 'ok')}\\n".encode()
@@ -56,8 +57,12 @@ SERVER = textwrap.dedent(
             self.wfile.write(body)
         def log_message(self, *args):
             pass
+    port, address = int(sys.argv[1]), sys.argv[2]
+    class Server(http.server.HTTPServer):
+        address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        request_queue_size = 64  # for many connections at once
     print("serving", flush=True)
-    http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+    Server((address, port), Handler).serve_forever()
     """
 )
 FETCH = (
@@ -111,17 +116,18 @@ def gateway(tmp_path: Path) -> Iterator[Path]:
     server.close()
 
 
-def server(port: int) -> list[str]:
-    return [PYTHON, "-c", SERVER, str(port)]
+def server(port: int, address: str = "127.0.0.1") -> list[str]:
+    return [PYTHON, "-c", SERVER, str(port), address]
 
 
 def fetch(url: str) -> list[str]:
     return [PYTHON, "-c", FETCH, url]
 
 
-def ready(port: int) -> HealthCheck:
+def ready(port: int, address: str = "127.0.0.1") -> HealthCheck:
+    host = f"[{address}]" if ":" in address else address
     return HealthCheck(
-        ["CMD", *fetch(f"http://127.0.0.1:{port}/")],
+        ["CMD", *fetch(f"http://{host}:{port}/")],
         interval_s=0.2,
         start_period_s=30,
         start_interval_s=0.2,
@@ -241,6 +247,238 @@ async def test_upstream_ports_are_the_pods_own(runtime, gateway):
     await second.stop()
 
 
+async def request(pod: Any, port: int) -> bytes:
+    """What an HTTP request to an exposed port gets back, sent from the host through its socket."""
+    reader, writer = await pod.open_connection(port)
+    try:
+        writer.write(b"GET / HTTP/1.0\r\n\r\n")
+        writer.write_eof()  # half-closed: the reply must still come back
+        async with asyncio.timeout(10):
+            return await reader.read()
+    finally:
+        writer.close()
+
+
+def web(name: str, port: int, image: str) -> ServiceSpec:
+    return ServiceSpec(
+        name,
+        SandboxSpec(image=image, env={"GREETING": f"{name}-ok"}),
+        command=server(port),
+        healthcheck=ready(port),
+    )
+
+
+async def test_exposed_ports_reach_services_from_the_host(runtime, tmp_path):
+    provider, image = runtime
+    # A scratch root deep enough that the sockets' paths are longer than a socket address holds.
+    deep = tmp_path / ("d" * 60) / ("e" * 60)
+    make = make_enroot_provider if type(provider).__name__.startswith("Enroot") else make_provider
+    deep_provider = make(tmp_path, scratch_root=deep)
+    pod = await deep_provider.start_pod(PodSpec(exposes=[8082]))
+    try:
+        assert pod.endpoints == {8082: str(pod.path / "exposed" / "8082.sock")}
+        path = Path(pod.endpoints[8082])
+        assert len(os.fsencode(path)) >= 108
+        with socket.socket(socket.AF_UNIX) as direct, pytest.raises(OSError):
+            direct.connect(str(path))  # too long for connect(): open_connection() goes around it
+        # The socket and its directory are the caller's alone.
+        assert stat.S_ISSOCK(path.lstat().st_mode)
+        for each in (path, path.parent):
+            info = each.lstat()
+            assert info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, oct(info.st_mode)
+        # Nothing listens yet: the holder closes the connection at once.
+        reader, writer = await pod.open_connection(8082)
+        async with asyncio.timeout(10):
+            assert await reader.read() == b""
+        writer.close()
+        await pod.start_service(web("web", 8082, image), wait="healthy")
+        assert (await request(pod, 8082)).endswith(b"\r\n\r\nweb-ok\n")
+        # Exposed later, once, however many ask at the same time.
+        await pod.start_service(web("late", 8083, image), wait="healthy")
+        paths = await asyncio.gather(*(pod.expose(8083) for _ in range(4)))
+        assert set(paths) == {str(path.parent / "8083.sock")}
+        assert set(pod.endpoints) == {8082, 8083}
+        assert (await request(pod, 8083)).endswith(b"late-ok\n")
+        many = await asyncio.gather(*(request(pod, 8082) for _ in range(16)))
+        assert all(reply.endswith(b"web-ok\n") for reply in many)
+        with pytest.raises(KeyError):
+            await pod.open_connection(8084)
+        for bad in (0, 70000):
+            with pytest.raises(ValueError):
+                await pod.expose(bad)
+    finally:
+        await pod.stop()
+        assert await deep_provider.wait_for_deletions(30)
+    assert not path.parent.exists()
+    with pytest.raises(SandboxError, match="not running"):
+        await pod.expose(8084)
+    with pytest.raises(SandboxError, match="not running"):
+        await pod.open_connection(8082)
+
+
+async def test_exposed_ports_reach_services_that_listen_on_ipv6_loopback_alone(runtime):
+    provider, image = runtime
+    pod = await provider.start_pod(PodSpec(exposes=[8082]))
+    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))
+    bind = "import socket; socket.socket(socket.AF_INET6).bind(('::1', 0))"
+    if (await main.exec([PYTHON, "-c", bind])).exit_code != 0:
+        pytest.skip("needs IPv6 on the pod's loopback interface")
+    # As a server that listens on localhost does where localhost resolves to ::1 first.
+    six = ServiceSpec(
+        "six",
+        SandboxSpec(image=image, env={"GREETING": "six-ok"}),
+        command=server(8082, "::1"),
+        healthcheck=ready(8082, "::1"),
+    )
+    await pod.start_service(six, wait="healthy")
+    assert (await request(pod, 8082)).endswith(b"six-ok\n")
+    await pod.stop()
+
+
+async def test_connect_unix_waits_while_the_backlog_is_full(tmp_path):
+    """A non-blocking connect to a Unix socket whose backlog is full fails with EAGAIN and
+    starts nothing, so connect_unix() tries again until its timeout."""
+    directory = tmp_path / ("x" * 60) / ("y" * 60)
+    directory.mkdir(parents=True)
+    path = directory / "listener.sock"
+    assert len(os.fsencode(path)) >= 108  # longer than a socket address holds
+    fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    listener = socket.socket(socket.AF_UNIX)
+    connections: list[socket.socket] = []
+    try:
+        listener.bind(f"/proc/self/fd/{fd}/{path.name}")
+        listener.listen(1)
+        listener.setblocking(False)
+        async with asyncio.timeout(30):
+            for _ in range(4):  # the backlog holds one or two connections, as kernels count
+                started = time.monotonic()
+                try:
+                    connections.append(await connect_unix(str(path), 0.5))
+                except TimeoutError as error:
+                    assert "accepted no connection within 0.5 s" in str(error)
+                    assert time.monotonic() - started >= 0.5
+                    break
+            else:
+                pytest.fail("the backlog never filled")
+            # Once the listener accepts one, the connect that waits goes through.
+            asyncio.get_running_loop().call_later(
+                0.3, lambda: connections.append(listener.accept()[0])
+            )
+            started = time.monotonic()
+            connections.append(await connect_unix(str(path), 5))
+            assert time.monotonic() - started >= 0.2
+            listener.close()
+            with pytest.raises(ConnectionRefusedError):
+                await connect_unix(str(path), 5)
+    finally:
+        listener.close()
+        os.close(fd)
+        for connection in connections:
+            connection.close()
+
+
+async def test_open_connection_waits_for_a_busy_holder_and_raises_lost_if_it_dies(runtime):
+    provider, _ = runtime
+    pod = await provider.start_pod(PodSpec(exposes=[8082]))
+    waiting: list[socket.socket] = []
+    os.kill(pod.holder_pid, signal.SIGSTOP)  # it accepts no more connections: its backlog fills
+    try:
+        async with asyncio.timeout(60):
+            while True:
+                try:
+                    waiting.append(await connect_unix(pod.endpoints[8082], 0.2))
+                except TimeoutError:
+                    break
+            attempt = asyncio.ensure_future(pod.open_connection(8082))
+            await asyncio.sleep(0.3)
+            assert not attempt.done()  # it waits for room in the backlog
+            # The holder dies after open_connection() found it alive: the connect is refused.
+            os.kill(pod.holder_pid, signal.SIGKILL)
+            with pytest.raises(SandboxLostError):
+                await attempt
+    finally:
+        for connection in waiting:
+            connection.close()
+    await pod.stop()
+
+
+async def test_a_failed_exposure_leaves_the_pod_working(runtime):
+    provider, image = runtime
+    pod = await provider.start_pod(PodSpec())
+    (pod.exposed_root / "9000.sock").write_text("")  # the holder cannot bind there
+    with pytest.raises(SandboxError, match="9000"):
+        await pod.expose(9000)
+    assert pod.endpoints == {}
+    await pod.start_service(web("web", 9001, image), wait="healthy")
+    await pod.expose(9001)
+    assert (await request(pod, 9001)).endswith(b"web-ok\n")
+    await pod.stop()
+
+
+async def test_upstream_ports_cannot_be_exposed(runtime, gateway):
+    provider, _ = runtime
+    with pytest.raises(ValueError, match="upstream"):
+        await provider.start_pod(
+            PodSpec(upstreams={"gateway": f"unix://{gateway}"}, exposes=[18080])
+        )
+    pod = await provider.start_pod(PodSpec(upstreams={"gateway": f"unix://{gateway}"}))
+    with pytest.raises(ValueError, match="upstream 'gateway'"):
+        await pod.expose(18080)
+    await pod.stop()
+
+
+async def test_host_aliases_resolve_in_every_service(runtime, gateway):
+    provider, image = runtime
+    spec = PodSpec(
+        upstreams={"judge": f"unix://{gateway}"},
+        upstream_ports={"judge": 8090},
+        hosts=["judge", "api.internal"],
+    )
+    pod = await provider.start_pod(spec)
+    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))
+    assert (await main.exec(fetch("http://judge:8090/"))).stdout == "gateway-ok\n"
+    for name in ("judge", "api.internal"):
+        assert (await main.exec(f"getent hosts {name}")).stdout.split()[0] == "127.0.0.1"
+    # A failed start rewrites the other services' /etc/hosts: the aliases stay.
+    ghost = ServiceSpec(
+        "ghost",
+        SandboxSpec(image=image),
+        command=["sleep", "600"],
+        healthcheck=HealthCheck("exit 1", interval_s=0.1, retries=1),
+    )
+    with pytest.raises(SandboxStartError):
+        await pod.start_service(ghost, wait="healthy")
+    hosts = (await main.exec("cat /etc/hosts")).stdout
+    assert "127.0.0.1\tjudge\n" in hosts and "127.0.0.1\tapi.internal\n" in hosts
+    assert "ghost" not in hosts
+    # The aliases are those the pod checked when it started: a later change to the spec stays out.
+    spec.hosts.append("late\n10.9.9.9\tpypi.org")
+    # A service named like an alias is one more name for the same address, listed once.
+    api = await pod.start_service(ServiceSpec("api.internal", SandboxSpec(image=image)))
+    for service in (main, api):
+        hosts = (await service.exec("cat /etc/hosts")).stdout
+        assert hosts.count("\tapi.internal\n") == 1 and hosts.count("\tjudge\n") == 1, hosts
+        assert "late" not in hosts and "pypi.org" not in hosts, hosts
+    await pod.stop()
+
+
+async def test_a_pod_reaches_another_pods_exposed_port_as_an_upstream(runtime, tmp_path):
+    provider, image = runtime
+    judging = await provider.start_pod(PodSpec(exposes=[8082]))
+    await judging.start_service(web("judge", 8082, image), wait="healthy")
+    # Upstream paths must fit in a socket address: a short link to the socket does.
+    link = tmp_path / "judge.sock"
+    link.symlink_to(judging.endpoints[8082])
+    spec = PodSpec(
+        upstreams={"judge": f"unix://{link}"}, upstream_ports={"judge": 8082}, hosts=["judge"]
+    )
+    using = await provider.start_pod(spec)
+    main = await using.start_service(ServiceSpec("main", SandboxSpec(image=image)))
+    assert (await main.exec(fetch("http://judge:8082/"))).stdout == "judge-ok\n"
+    await using.stop()
+    await judging.stop()
+
+
 async def test_services_get_their_ulimits_and_a_sized_shm(runtime):
     provider, image = runtime
     pod = await provider.start_pod(PodSpec())
@@ -317,7 +555,9 @@ async def test_health_says_exited_once_the_command_exits(runtime):
 
 async def test_stop_leaves_nothing(runtime, gateway):
     provider, image = runtime
-    pod = await provider.start_pod(PodSpec(upstreams={"gateway": f"unix://{gateway}"}))
+    pod = await provider.start_pod(
+        PodSpec(upstreams={"gateway": f"unix://{gateway}"}, exposes=[8082])
+    )
     await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))
     await pod.start_service(ServiceSpec("job", SandboxSpec(image=image), command=["sleep", "600"]))
     processes = [pod._holder.pid] + [
@@ -410,6 +650,8 @@ async def test_calls_after_the_holder_died_raise_lost(runtime):
         await main.exec("true")
     with pytest.raises(SandboxLostError):
         await pod.start_service(ServiceSpec("other", SandboxSpec(image=image)))
+    with pytest.raises(SandboxLostError):
+        await pod.expose(8082)
     await pod.stop()
 
 
@@ -434,7 +676,7 @@ async def main():
     kind, scratch, cache, image = sys.argv[1:]
     providers = {{"enroot": EnrootProvider, "singularity": SingularityProvider}}
     provider = providers[kind](scratch_root=scratch, image_cache=cache, stage_images=False)
-    pod = await provider.start_pod(PodSpec(labels={{"t": "crash"}}))
+    pod = await provider.start_pod(PodSpec(labels={{"t": "crash"}}, exposes=[8082]))
     service = await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))
     print(pod.id, pod._holder.pid, service._service_anchor.pid, service._container, flush=True)
     os.kill(os.getpid(), signal.SIGKILL)
@@ -508,6 +750,7 @@ def test_pod_spec_validation():
         PodSpec(upstreams={"a": "unix:///a", "b": "unix:///b"}, upstream_ports={"a": 18081})
     )
     assert ports == {"a": 18081, "b": 18080}
+    assert check_pod(PodSpec(exposes=[80, 8080], hosts=["judge", "api.internal", "x" * 253])) == {}
     for bad in (
         PodSpec(network="host"),  # type: ignore[arg-type]
         PodSpec(upstreams={"a": "http://x"}),
@@ -515,6 +758,19 @@ def test_pod_spec_validation():
         PodSpec(upstreams={"a": "unix:///a"}, upstream_ports={"b": 1}),
         PodSpec(upstreams={"a": "unix:///a", "b": "unix:///b"}, upstream_ports={"a": 9, "b": 9}),
         PodSpec(upstreams={"a": "unix:///a"}, upstream_ports={"a": 70000}),
+        PodSpec(exposes=[0]),
+        PodSpec(exposes=[70000]),
+        PodSpec(exposes=["8080"]),  # type: ignore[list-item]
+        PodSpec(exposes=[True]),
+        PodSpec(exposes=[8080, 8080]),
+        PodSpec(upstreams={"a": "unix:///a"}, exposes=[18080]),
+        PodSpec(hosts=[""]),
+        PodSpec(hosts=["two words"]),
+        PodSpec(hosts=["judge\n10.0.0.1\tevil"]),
+        PodSpec(hosts=["-judge"]),
+        PodSpec(hosts=["x" * 254]),
+        PodSpec(hosts=[None]),  # type: ignore[list-item]
+        PodSpec(hosts="judge"),  # type: ignore[arg-type]
     ):
         with pytest.raises(ValueError):
             check_pod(bad)

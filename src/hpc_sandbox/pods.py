@@ -22,15 +22,20 @@ only an up loopback, plus one container per service:
   back to the caller (:func:`give_back`) before the files are deleted. The
   launcher of a ``subids`` service whose spec has a file owners manifest gives
   the image's paths their owners before the container and its command start.
-- **Names.** Every service resolves the names of all services, and its own
-  hostname, to 127.0.0.1 through an ``/etc/hosts`` of its own, extended as
-  services join; ``/etc/resolv.conf`` names slirp4netns's resolver.
+- **Names.** Every service resolves the names of all services, its own
+  hostname and the pod's host aliases to 127.0.0.1 through an ``/etc/hosts``
+  of its own, extended as services join; ``/etc/resolv.conf`` names
+  slirp4netns's resolver.
 - **Commands** enter a service in two steps: the pod's user and network
   namespaces, then the container's own namespaces, so that they end as root
   of the container's nested user namespace.
 - **Upstreams.** The holder relays a pod port per upstream to a Unix socket
   on the host. It binds before any service starts, without ``SO_REUSEPORT``,
   so no service can take the port over.
+- **Exposed ports** go the other way: the holder listens on a Unix socket per
+  exposed port in the pod's directory, ``exposed/<port>.sock``, which only the
+  caller can reach, and forwards each connection to the port on the pod's
+  loopback, at 127.0.0.1 or else ::1.
 - **Egress** goes through slirp4netns with ``--disable-host-loopback``, whose
   exit pipe only the holder holds: it dies with the holder.
 - **Lifetime.** The holder, the launchers and their inits die with the
@@ -86,6 +91,7 @@ log = logging.getLogger(__name__)
 HOLDER_SCRIPT = Path(__file__).with_name("holder.py")
 ANCHOR_SCRIPT = Path(__file__).with_name("anchor.py")
 SERVICES_DIRECTORY = "services"
+EXPOSED_DIRECTORY = "exposed"
 HOLDER_LOG = "holder.log"
 SLIRP_LOG = "slirp4netns.log"
 SERVICE_LOG = "service.log"
@@ -136,8 +142,10 @@ APT_DROP_IN = 'APT::Sandbox::User "root";\n'
 APT_DROP_IN_NAME = "99hpc-sandbox-aptfix"
 _SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 _UPSTREAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
+_HOST_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}")
 _CONTROL_TIMEOUT_S = 30.0
 _UNIX_PATH_MAX = 108  # sun_path, with its terminating NUL
+_CONNECT_RETRY_S = 0.01
 _EXIT_STATUS_WAIT_S = 1.0
 _KILL_WAIT_S = 5.0
 _SHELL_STATE = ("PWD", "OLDPWD", "SHLVL", "_")
@@ -191,7 +199,25 @@ def check_pod(spec: PodSpec) -> dict[str, int]:
         if port in ports.values():
             raise ValueError(f"upstreams share port {port}")
         ports[name] = port
+    for port in spec.exposes:
+        check_exposed_port(port, ports)
+    if len(set(spec.exposes)) != len(spec.exposes):
+        raise ValueError(f"exposes names a port twice: {spec.exposes!r}")
+    if isinstance(spec.hosts, str):
+        raise ValueError(f"hosts is a list of names, not the string {spec.hosts!r}")
+    for alias in spec.hosts:
+        if not isinstance(alias, str) or not _HOST_ALIAS.fullmatch(alias):
+            raise ValueError(f"invalid host alias {alias!r}")
     return ports
+
+
+def check_exposed_port(port: int, upstream_ports: Mapping[str, int]) -> None:
+    """Validate a port to expose: a pod port that no upstream relays."""
+    if type(port) is not int or not 0 < port < 65536:  # not a bool either
+        raise ValueError(f"invalid port {port!r} to expose")
+    for name, upstream_port in upstream_ports.items():
+        if port == upstream_port:
+            raise ValueError(f"port {port} relays upstream {name!r}: it cannot be exposed")
 
 
 def upstream_path(url: str) -> str:
@@ -317,11 +343,16 @@ class SessionPod:
         self._id = new_instance_name()
         self.spec = spec
         self._ports = check_pod(spec)
+        # The checked values, kept: a later change to the spec cannot reach the pod.
+        self._exposes = tuple(spec.exposes)
+        self._aliases = tuple(spec.hosts)
         # The subordinate ids that a pod with users="subids" maps, and the user namespace of this
         # process that maps them, which the pod's is made in (see id_namespace).
         self._ids = ids
         self._id_namespace: int | None = None
         self._routes = {name: f"http://127.0.0.1:{port}" for name, port in self._ports.items()}
+        self._endpoints: dict[int, str] = {}
+        self._expose_lock = asyncio.Lock()
         self._provider = provider
         self._session: Session | None = None
         self._services: dict[str, PodService] = {}
@@ -360,6 +391,11 @@ class SessionPod:
         return dict(self._routes)
 
     @property
+    def endpoints(self) -> Mapping[int, str]:
+        """Where each exposed port is, on the host: ``{8080: "/.../exposed/8080.sock"}``."""
+        return dict(self._endpoints)
+
+    @property
     def services(self) -> Mapping[str, PodService]:
         """The services that started, by name (stopped with the pod)."""
         return dict(self._services)
@@ -378,6 +414,11 @@ class SessionPod:
     def services_root(self) -> Path:
         assert self._session is not None
         return self._session.path / SERVICES_DIRECTORY
+
+    @property
+    def exposed_root(self) -> Path:
+        assert self._session is not None
+        return self._session.path / EXPOSED_DIRECTORY
 
     @property
     def holder_pid(self) -> int:
@@ -459,6 +500,43 @@ class SessionPod:
             if mode == "egress":
                 await self._start_egress()
 
+    async def expose(self, port: int) -> str:
+        """Make ``port`` of the pod reachable from the host; return the path of its socket.
+
+        The holder listens on the Unix socket ``exposed/<port>.sock`` in the pod's
+        directory, which only the caller's uid can reach, and forwards each
+        connection to ``port`` on the pod's loopback (127.0.0.1, else ::1), whether
+        or not a service listens there yet. A port that is exposed already keeps
+        its socket.
+        """
+        self._require_running()
+        check_exposed_port(port, self._ports)
+        async with self._expose_lock:
+            if port not in self._endpoints:
+                # Runs to its end even when cancelled, so the holder and the endpoints agree.
+                await _finish(asyncio.ensure_future(self._expose(port)))
+        return self._endpoints[port]
+
+    async def open_connection(self, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Connect to an exposed port from the host, like
+        :func:`asyncio.open_unix_connection` on its socket, whatever the length of
+        the socket's path."""
+        self._require_running()
+        if port not in self._endpoints:
+            raise KeyError(f"pod {self.id} does not expose port {port}")
+        try:
+            connection = await connect_unix(self._endpoints[port], _CONTROL_TIMEOUT_S)
+        except (ConnectionRefusedError, FileNotFoundError):
+            # The holder died, or the pod stopped, since the check: say which.
+            await poll(lambda: None if self.holder_alive() else True, _EXIT_STATUS_WAIT_S)
+            self._require_running()
+            raise
+        try:
+            return await asyncio.open_unix_connection(sock=connection)
+        except BaseException:
+            connection.close()
+            raise
+
     async def stop(self) -> None:
         """Stop every service and the holder and delete the pod; idempotent and
         cancellation-safe, like :meth:`SessionSandbox.stop`."""
@@ -476,8 +554,12 @@ class SessionPod:
                 self._id_namespace = await id_namespace(self._ids, provider.start_timeout_s)
             self._session = await create_session(provider.pod_root, self.id)
             self.services_root.mkdir(mode=0o700)
+            self.exposed_root.mkdir(mode=0o700)
+            self.exposed_root.chmod(0o700)  # whatever the umask: the holder binds in it
             self._record()
             await self._start_holder()
+            for port in self._exposes:
+                await self._expose(port)
             if self.spec.network == "egress":
                 await self._start_egress()
         except BaseException as error:
@@ -591,6 +673,16 @@ class SessionPod:
         if answer.startswith("error") or not answer.startswith(expected):
             raise SandboxError(f"the holder of pod {self.id} answered {answer!r}")
         return answer
+
+    async def _expose(self, port: int) -> None:
+        """Have the holder listen on ``port``'s socket, in the directory it gets as a descriptor."""
+        directory = self.exposed_root
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            await self._ask(f"expose {port}", "exposed", fds=[fd])
+        finally:
+            os.close(fd)
+        self._endpoints[port] = str(directory / f"{port}.sock")
 
     def _holder_log(self) -> str:
         if self._session is None:
@@ -721,11 +813,16 @@ class SessionPod:
                 if other != name:
                     service.add_host(name)
 
+    def _host_names(self, own: str) -> list[str]:
+        """The names a service's /etc/hosts maps to 127.0.0.1: the other services',
+        the pod's host aliases, and its own."""
+        others = [name for name in list(self._names) if name != own]
+        return list(dict.fromkeys([*others, *self._aliases, own]))
+
     def _write_hosts(self, service: PodService) -> None:
         """Write a new service's /etc/hosts; from now on it hears of names that join."""
         with self._hosts_lock:
-            names = [name for name in list(self._names) if name != service.name]
-            service.hosts_path.write_text(hosts_file([*names, service.name]))
+            service.hosts_path.write_text(hosts_file(self._host_names(service.name)))
             self._hosts[service.name] = service
 
     def _forget(self, name: str) -> None:
@@ -733,8 +830,7 @@ class SessionPod:
         with self._hosts_lock:
             self._hosts.pop(name, None)
             for other, service in self._hosts.items():
-                names = [n for n in list(self._names) if n != other]
-                service.rewrite_hosts(hosts_file([*names, other]))
+                service.rewrite_hosts(hosts_file(self._host_names(other)))
 
     async def _settled(self, name: str) -> ServiceHealth:
         """Wait until the service is no longer starting."""
@@ -1296,6 +1392,36 @@ class PodService(SessionSandbox):
         code = anchor.returncode  # negative when the launcher itself was killed
         self._exit_status = 128 - code if code < 0 else code
         self._service_anchor = None
+
+
+async def connect_unix(path: str, timeout_s: float) -> socket.socket:
+    """A Unix stream socket connected to ``path``, however long the path.
+
+    A socket address holds at most 107 bytes of path, so the connection goes
+    through ``/proc/self/fd`` and a descriptor of the socket itself. While the
+    listener's backlog is full, it tries again until ``timeout_s`` passes.
+    """
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.setblocking(False)
+        target = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        try:
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    connection.connect(f"/proc/self/fd/{target}")
+                    return connection
+                except BlockingIOError:  # the backlog is full; nothing was started
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"{path} accepted no connection within {timeout_s:g} s"
+                        ) from None
+                    await asyncio.sleep(_CONNECT_RETRY_S)
+        finally:
+            os.close(target)
+    except BaseException:
+        connection.close()
+        raise
 
 
 # The user namespaces that map this process's subordinate ids, by those ids: open descriptors that

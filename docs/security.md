@@ -22,7 +22,12 @@ Both providers have the `isolation` capability. Each sandbox gets:
 
 The services of a [pod](pods.md) share a network namespace of their own: loopback only, or egress
 through slirp4netns, which never reaches the host's loopback but does reach what the node's network
-reaches, including services that listen on the node's own network addresses.
+reaches, including services that listen on the node's own network addresses. From the host, only
+the ports you expose reach that network, each through a Unix socket in a directory of mode 0700 in
+the pod's session ([Exposed ports](pods.md#exposed-ports)): what runs as your uid on the node can
+connect to them, other users cannot. Any service of the pod can answer on an exposed port, not only
+the one you mean to reach, since all of them share the pod's loopback as your uid: trust what a
+host client reads there no more than the pod's least trusted service.
 
 ## What isolation does not cover
 
@@ -66,7 +71,7 @@ reaches, including services that listen on the node's own network addresses.
 ## Reducing exposure
 
 - Use `network="none"` for code that needs no network, or a pod whose `upstreams` relay only the
-  host services the code needs.
+  host services the code needs, and that exposes only the ports the host has to reach.
 - Mount only what the code needs, and keep mounts read-only, the default.
 - Set `memory_mb`, and leave the node some headroom above it.
 - Keep the image cache where only you can write, and pin images by digest.

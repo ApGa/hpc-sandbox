@@ -23,7 +23,8 @@ What it gives you:
 - **Memory limits without cgroups.** A sampling watchdog kills the branch of processes that holds
   the memory, so a command that runs away dies and the harness that started it survives.
 - **Pods.** Services that share one network, like a docker-compose project: a sandbox reaches the
-  databases, tool servers or graders it works with by name.
+  databases, tool servers or graders it works with by name, and the host reaches the ports you
+  expose through Unix sockets.
 - **Clean nodes.** Teardown proves each process's identity before signalling it, and janitors
   recover what a crashed process or job left behind, from running containers to files and mounts.
 - **Built for busy nodes.** Images are cached and staged once per node, sessions are deleted in the

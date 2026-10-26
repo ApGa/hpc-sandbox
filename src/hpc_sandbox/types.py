@@ -219,7 +219,11 @@ class PodSpec:
     the pod's user namespace maps: ``"single"``, your uid and gid as root;
     ``"subids"``, also your subordinate ids (``/etc/subuid``,
     ``/etc/subgid``), mapped with ``newuidmap`` and ``newgidmap``, which
-    services with ``run_as="subids"`` need.
+    services with ``run_as="subids"`` need. Each port in ``exposes`` is
+    reachable from the host through a Unix socket in the pod's directory
+    (:attr:`SessionPod.endpoints`), and every service resolves each name in
+    ``hosts`` to 127.0.0.1, as it resolves the services' names (``"judge"``
+    for an upstream that a pod port relays).
     """
 
     network: PodNetwork = "none"
@@ -227,6 +231,8 @@ class PodSpec:
     upstream_ports: dict[str, int] = field(default_factory=dict)
     labels: dict[str, str] = field(default_factory=dict)
     users: PodUsers = "single"
+    exposes: list[int] = field(default_factory=list)
+    hosts: list[str] = field(default_factory=list)
 
 
 @runtime_checkable

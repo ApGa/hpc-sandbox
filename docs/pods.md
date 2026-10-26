@@ -3,9 +3,10 @@
 A pod runs several services that share one network, like a docker-compose project: an agent's
 sandbox next to the databases, tool servers or graders it reaches by name on fixed ports. Each
 service is a sandbox, with its own image, root filesystem and processes. The pod gives the services
-a network of their own: nothing outside the pod can reach it, and from it the services reach only
-each other and the host services you relay into it, unless you give the pod egress to other hosts.
-Both providers run pods (their `capabilities` include `pods`), with the same API.
+a network of their own: from outside the pod, only the ports you expose to the host reach it, and
+from it the services reach only each other and the host services you relay into it, unless you
+give the pod egress to other hosts. Both providers run pods (their `capabilities` include `pods`),
+with the same API.
 
 ## An example
 
@@ -80,17 +81,21 @@ take longer.
 | `network` | `"none"` | A `PodNetwork`. `"none"`: the services reach each other and the upstreams, and nothing else. `"egress"`: they also reach other hosts ([Egress](#egress)). |
 | `upstreams` | `{}` | Host services the pod may reach: names mapped to Unix sockets on the host, given as `"unix:///absolute/path"` ([Upstreams](#upstreams)). |
 | `upstream_ports` | `{}` | The port of an upstream inside the pod, by name. The others get 18080, 18081 and so on, in the order of `upstreams`, skipping the ports given here. |
+| `exposes` | `[]` | Ports of the pod that the host may reach, each through a Unix socket ([Exposed ports](#exposed-ports)). |
+| `hosts` | `[]` | Host aliases: names that every service resolves to 127.0.0.1, besides the services' own, such as the name of an upstream ([Names](#names)). |
 | `labels` | `{}` | String pairs that `reap()` and `hpc-sandbox janitor --label` select pods by. |
 | `users` | `"single"` | A `PodUsers`: what the pod's user namespace maps. `"single"`: your uid and gid, as root. `"subids"`: your subordinate ids too, for services that switch users, with Singularity CE and Apptainer ([Users](#users)). |
 
 `start_pod()` raises `ValueError` for an invalid spec before anything starts: an unknown network or
 `users`, `users="subids"` with enroot, whose services cannot switch users, an upstream name that
 does not match `[A-Za-z_][A-Za-z0-9_.-]*`, a socket that is not an absolute `unix://` path shorter
-than 108 bytes, a port outside 1 to 65535 or used twice, or `upstream_ports` naming an unknown
-upstream. It raises `SandboxError` when `nsenter` is missing, for a pod with egress when no
-slirp4netns can be found, and for a pod with `users="subids"` when your user has no subordinate ids
-or `newuidmap` or `newgidmap` is missing, and `SandboxStartError` when the pod fails to start, after
-it stopped what it started.
+than 108 bytes, a port outside 1 to 65535 or used twice, `upstream_ports` naming an unknown
+upstream, a port to expose that is outside 1 to 65535, listed twice or an upstream's, or a host
+alias that is not a letter or digit followed by up to 252 letters, digits, `_`, `.` or `-`. It
+raises `SandboxError` when `nsenter` is missing, for a pod with egress when no slirp4netns can be
+found, and for a pod with `users="subids"` when your user has no subordinate ids or `newuidmap` or
+`newgidmap` is missing, and `SandboxStartError` when the pod fails to start, after it stopped what
+it started.
 
 | Member | What it does |
 |---|---|
@@ -98,6 +103,9 @@ it stopped what it started.
 | `await start_service(spec, wait="started")` | Starts a service and returns it ([Services](#services)). |
 | `services` | The services that started, by name. |
 | `routes` | Where each upstream is, inside the pod: `{"api": "http://127.0.0.1:18080"}`. |
+| `endpoints` | Where each exposed port is, on the host: `{8000: "/.../exposed/8000.sock"}` ([Exposed ports](#exposed-ports)). |
+| `await expose(port)` | Exposes a port to the host, and returns the path of its socket. |
+| `await open_connection(port)` | Connects to an exposed port from the host, and returns a `(reader, writer)` pair of asyncio streams. |
 | `network` | `"egress"` while the pod has egress, else `"none"`. |
 | `await health(name)` | `"starting"`, `"healthy"`, `"unhealthy"` or `"exited"` ([Health checks](#health-checks)). |
 | `await logs(name)` | The tail of what the service's command printed, stdout and stderr together, up to 1 MiB. |
@@ -106,10 +114,13 @@ it stopped what it started.
 
 `async with pod:`, or `async with await provider.start_pod(spec) as pod:`, stops the pod when the
 block exits. `provider.pods` holds the pods that a provider started and has not stopped.
-`start_service()`, `health()`, `logs()` and `set_network()` raise `SandboxError` once the pod is
-stopped, and `SandboxLostError` once its holder died; `health()` and `logs()` raise `KeyError` for
-a name that is not one of the pod's services. Code typed against the `PodProvider` and `Pod`
-protocols works with either provider ([Protocols](python-api.md#protocols)).
+`start_service()`, `health()`, `logs()`, `set_network()`, `expose()` and `open_connection()` raise
+`SandboxError` once the pod is stopped, and `SandboxLostError` once its holder died; `health()` and
+`logs()` raise `KeyError` for a name that is not one of the pod's services, and `open_connection()`
+for a port that is not exposed. `expose()` raises `ValueError` for a port outside 1 to 65535 or an
+upstream's, and `open_connection()` raises `TimeoutError` when the socket's backlog of connections
+that the holder has not accepted yet stays full for 30 seconds. Code typed against the
+`PodProvider` and `Pod` protocols works with either provider ([Protocols](python-api.md#protocols)).
 
 ### The holder
 
@@ -121,12 +132,14 @@ The holder is a small process that owns the pod's user and network namespaces:
 - It lets the pod's users bind ports below 1024, and every group it maps send ICMP echo requests
   (`ping`), as Docker does for containers: the services run in nested user namespaces, which hold no
   capability over this network.
-- It relays the upstreams ([Upstreams](#upstreams)) and, while the pod has egress, holds the pipe
-  whose closing ends slirp4netns ([Egress](#egress)).
+- It relays the upstreams ([Upstreams](#upstreams)), serves the sockets of the exposed ports
+  ([Exposed ports](#exposed-ports)) and, while the pod has egress, holds the pipe whose closing ends
+  slirp4netns ([Egress](#egress)). It stays in the host's mount namespace, so these sockets are
+  files on the host.
 - The kernel kills it when the process that started the pod exits, however that process exits.
 
 The services join the holder's namespaces. Once the holder is gone, calls on the pod and commands in
-its services raise `SandboxLostError`.
+its services raise `SandboxLostError`, and connections to the exposed ports' sockets are refused.
 
 ## Upstreams
 
@@ -185,8 +198,81 @@ hello from the host
 - The holder connects to the socket for each connection, as your uid, so the socket must exist when
   a service connects, not when the pod starts. When the connection fails, the relay closes the
   service's side of it.
-- Nothing outside the pod can reach these ports. Without egress, the upstreams are the only host
-  services the pod reaches.
+- Nothing outside the pod can reach these ports, and they cannot be exposed. Without egress, the
+  upstreams are the only host services the pod reaches.
+- The holder connects to the path you give, so a symbolic link to a socket works: it is the way to
+  give a socket whose path is 108 bytes or longer, such as another pod's exposed port
+  ([Exposed ports](#exposed-ports)).
+
+## Exposed ports
+
+An exposed port goes the other way: a service listens on it inside the pod, and code on the host,
+such as a client of a tool server, reaches it through a Unix socket that the holder serves. List
+the ports in `exposes`, or expose one later with `await pod.expose(port)`, which returns the path of
+its socket. `pod.endpoints` maps each exposed port to its socket, and
+`await pod.open_connection(port)` connects to it, as `asyncio.open_unix_connection()` would:
+
+```python
+import asyncio
+
+from hpc_sandbox import HealthCheck, PodSpec, SandboxSpec, ServiceSpec, SingularityProvider
+
+IMAGE = "docker://python:3.12-slim"
+CHECK = "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"
+WEB = ServiceSpec(
+    "web",
+    SandboxSpec(image=IMAGE, workdir="/srv"),
+    command=["python", "-m", "http.server", "8000"],
+    healthcheck=HealthCheck(
+        ["CMD", "python", "-c", CHECK], interval_s=10, start_period_s=60, start_interval_s=0.5
+    ),
+)
+
+
+async def main() -> None:
+    provider = SingularityProvider()  # EnrootProvider() on a site with enroot
+    pod = await provider.start_pod(PodSpec(exposes=[8000]))
+    async with pod:
+        await pod.start_service(WEB, wait="healthy")
+        print(pod.endpoints[8000])
+        reader, writer = await pod.open_connection(8000)
+        writer.write(b"GET / HTTP/1.0\r\n\r\n")
+        print((await reader.readline()).decode(), end="")
+        writer.close()
+    await provider.wait_for_deletions()
+
+
+asyncio.run(main())
+```
+
+```text
+/tmp/hpc-sandbox-1000/pods-singularity/hpcsb-3f2a9c41d0b64e7a8c15f6e2b9d07a44/exposed/8000.sock
+HTTP/1.0 200 OK
+```
+
+- The socket is `exposed/<port>.sock` in the pod's directory, `pod.path`. The holder forwards each
+  connection to `127.0.0.1:<port>` inside the pod, or to `[::1]:<port>` when nothing listens at
+  `127.0.0.1`, so the service may listen on either loopback address or on all addresses.
+- Only your uid can connect: the socket, its directory and the pod's directory have mode 0700. The
+  pod's services, and other sandboxes and pods, see the socket only if you mount its directory into
+  them.
+- The port is the pod's, not a service's: whatever listens on it in the pod answers. All services
+  run as your uid and share one loopback interface, so any of them can take the port before the
+  service you mean to reach starts, or after it exits, or share it when that service sets
+  `SO_REUSEPORT`; the holder keeps services off the upstreams' ports only, by binding them itself.
+  Trust what a host client reads from an exposed port no more than the least trusted service of the
+  pod.
+- The holder accepts a connection even when nothing listens on the port yet, and then closes it at
+  once: the client reads the end of the stream. Half-closed connections and long streams pass
+  through, as for upstreams.
+- Exposing a port again returns the same socket. An upstream's port cannot be exposed: the holder
+  itself listens there. A port stays exposed until the pod stops.
+- A Unix socket address holds a path of at most 107 bytes, and the pod's directory is deep below the
+  scratch root, so the path of a socket is often longer. `open_connection()` connects whatever the
+  length, through `/proc/self/fd`, and the holder binds the socket the same way. A program of your
+  own can connect through a shorter symbolic link to the socket, or open the socket with `O_PATH`
+  and connect to `/proc/self/fd/<descriptor>`. Give another pod a link, too, when it should reach
+  the port as an upstream.
 
 ## Services
 
@@ -389,12 +475,30 @@ back with the rest ([Subordinate ids](#subordinate-ids)).
 ## Names
 
 Each service has an `/etc/hosts` of its own, bound read-only into it. It maps `localhost` to
-127.0.0.1 and ::1, and the service's own name and the names of the other services to 127.0.0.1. A
-service's name is added to the other services' files when it starts, and taken out again if its
-start fails. Since all services share one loopback interface, a service that listens on a port is
-reachable from every service of the pod as `name:port`, `localhost:port` or `127.0.0.1:port`.
-Unlike docker-compose, which gives each service an address of its own, a pod has one address for
-all its services: give them different ports.
+127.0.0.1 and ::1, and the service's own name, the names of the other services and the pod's host
+aliases to 127.0.0.1. A service's name is added to the other services' files when it starts, and
+taken out again if its start fails. Since all services share one loopback interface, a service that
+listens on a port is reachable from every service of the pod as `name:port`, `localhost:port` or
+`127.0.0.1:port`. Unlike docker-compose, which gives each service an address of its own, a pod has
+one address for all its services: give them different ports.
+
+The host aliases, the names in the `PodSpec`'s `hosts`, let the services reach an upstream by a
+name: give the upstream the port its clients expect, and its name as an alias, and every service
+reaches it as `name:port`, as if it ran in the pod:
+
+```python
+from hpc_sandbox import PodSpec
+
+spec = PodSpec(
+    upstreams={"judge": "unix:///run/judge/judge.sock"},
+    upstream_ports={"judge": 8081},
+    hosts=["judge"],
+)  # in every service, http://judge:8081/ reaches the host's socket
+```
+
+The upstream can be another pod's exposed port, such as a judge that many pods share: give its
+socket, or a link to it ([Exposed ports](#exposed-ports)). The aliases are those of the spec that
+started the pod: changing `pod.spec.hosts` afterwards changes nothing.
 
 `/etc/resolv.conf` names `10.0.2.3`, slirp4netns's DNS forwarder, which answers while the pod has
 egress. The names of the services resolve through `/etc/hosts` either way.
@@ -492,9 +596,10 @@ process that started the pod is killed.
 5. in a pod with `users="subids"`, gives back to your uid what the services wrote as other users
    ([Subordinate ids](#subordinate-ids));
 6. stops slirp4netns and the holder;
-7. moves the pod's session directory, which holds the sessions of its services, into the trash, and
-   deletes it in the background, as for a sandbox: `await provider.wait_for_deletions()` waits for
-   that ([Stopping and deleting](python-api.md#stopping-and-deleting)).
+7. moves the pod's session directory, which holds the sessions of its services and the sockets of
+   its exposed ports, into the trash, and deletes it in the background, as for a sandbox:
+   `await provider.wait_for_deletions()` waits for that
+   ([Stopping and deleting](python-api.md#stopping-and-deleting)).
 
 `stop()` is idempotent, and safe to cancel: the teardown runs to its end. When a service cannot be
 stopped, it raises `SandboxError` and keeps the pod's files for a janitor, and a later `stop()`

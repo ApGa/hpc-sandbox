@@ -66,7 +66,7 @@ Everything a sandbox writes is on node-local scratch, below the scratch root:
 |---|---|
 | `sessions/` | the sessions of Singularity sandboxes |
 | `sessions-enroot/` | the sessions of enroot sandboxes |
-| `pods-singularity/`, `pods-enroot/` | one session per pod, holding its services' sessions in `services/` |
+| `pods-singularity/`, `pods-enroot/` | one session per pod, holding its services' sessions in `services/` and the sockets of its exposed ports in `exposed/` |
 | `snapshots/` | snapshots, one `snap-<32 hex digits>` directory each |
 | `images/` | images staged from an image cache on another filesystem, and the remembered digests of local images |
 | `templates/` | Singularity templates |
@@ -473,8 +473,9 @@ A sweep's result is a `JanitorReport`: the sessions it `stopped` (something stil
 ## Pods
 
 A pod reuses this machinery. Its session, in `pods-singularity/` or `pods-enroot/`, holds the logs
-of its holder and of slirp4netns and, in `services/`, the session root of its services: each service
-is a sandbox, started by the launcher in the pod's user and network namespaces. Stopping a pod stops
+of its holder and of slirp4netns, in `services/` the session root of its services, and in
+`exposed/` the sockets through which the host reaches the ports it exposes: each service is a
+sandbox, started by the launcher in the pod's user and network namespaces. Stopping a pod stops
 its services, slirp4netns and the holder, then moves the pod's session, services and all, into the
 trash, to be deleted in the background like a sandbox's; a pod with `users="subids"` first gives
 back to your uid what its services wrote as other users. Janitors stop and remove abandoned pods
@@ -501,7 +502,7 @@ The package is in `src/hpc_sandbox/`:
 | `enroot.py` | `EnrootProvider`: imports, the system configuration, and containers entered with `nsenter` |
 | `anchor.py` | the launcher, run as a script: the namespaces and the init of an enroot sandbox or a pod service, and the owners that a file owners manifest gives an image's files |
 | `pods.py` | pods and their services |
-| `holder.py` | the process that holds a pod's user and network namespaces and relays its upstreams |
+| `holder.py` | the process that holds a pod's user and network namespaces, relays its upstreams and serves its exposed ports |
 | `subids.py` | your subordinate ids, and mapping them into a pod's user namespace with `newuidmap` and `newgidmap` |
 | `tools.py` | finding and fetching slirp4netns |
 | `cli.py` | the `hpc-sandbox` command line |
