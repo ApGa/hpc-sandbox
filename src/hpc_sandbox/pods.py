@@ -19,7 +19,9 @@ only an up loopback, plus one container per service:
   (``"caller"``), or root and every subordinate id the pod maps
   (``"subids"``). What a ``subids`` service writes as another user belongs to
   a subordinate id on the host, which the caller cannot delete, so it is given
-  back to the caller (:func:`give_back`) before the files are deleted.
+  back to the caller (:func:`give_back`) before the files are deleted. The
+  launcher of a ``subids`` service whose spec has a file owners manifest gives
+  the image's paths their owners before the container and its command start.
 - **Names.** Every service resolves the names of all services, and its own
   hostname, to 127.0.0.1 through an ``/etc/hosts`` of its own, extended as
   services join; ``/etc/resolv.conf`` names slirp4netns's resolver.
@@ -60,8 +62,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 from . import procfs, subids
+from .anchor import FILE_OWNERS_REPORT
 from .process import kill_tree, run_process
-from .sandbox import SessionSandbox, check_env, environment_script, poll
+from .sandbox import SessionSandbox, check_env, check_file_owners, environment_script, poll
 from .sessions import Session, create_session, new_instance_name, trash_session_awaiting
 from .types import (
     HealthCheck,
@@ -214,6 +217,11 @@ def check_service(spec: ServiceSpec) -> None:
         raise ValueError("shm_mb must be positive")
     if spec.run_as not in RUN_AS:
         raise ValueError(f"run_as must be one of {RUN_AS}, not {spec.run_as!r}")
+    if spec.sandbox.file_owners is not None and spec.run_as != "subids":
+        raise ValueError(
+            "file_owners need run_as='subids': a service that runs as root alone or as your uid "
+            "maps one id, so its files cannot belong to other users"
+        )
     for name, limits in spec.ulimits.items():
         if name not in ULIMITS or (
             name not in UNAPPLIED_ULIMITS
@@ -400,6 +408,11 @@ class SessionPod:
         if spec.run_as == "subids" and self.spec.users != "subids":
             raise ValueError("run_as='subids' needs a pod started with PodSpec(users='subids')")
         self._provider._check(spec.sandbox, service=True)
+        if spec.sandbox.file_owners is not None:
+            await asyncio.to_thread(check_file_owners, spec.sandbox.file_owners)
+            self._require_running()
+            if spec.name in self._names:  # taken while the manifest was read
+                raise ValueError(f"pod {self.id} already has a service named {spec.name!r}")
         self._names.append(spec.name)
         task = asyncio.ensure_future(self._start_service(spec, wait))
         self._starting.add(task)
@@ -932,6 +945,10 @@ class PodService(SessionSandbox):
         # enter a working directory that the start makes, as Docker's -w makes it.
         return "022" if self.service.run_as == "subids" else ""
 
+    async def _apply_file_owners(self) -> None:
+        """Nothing: the launcher gave the image's paths their owners before the container started
+        (``--file-owners``)."""
+
     # Files.
 
     @property
@@ -1023,6 +1040,9 @@ class PodService(SessionSandbox):
         options = ["--hostname", self.name, "--shm", f"{self.shm_path}:{shm_mb * 1024 * 1024}"]
         for name, (soft, hard) in self._ulimits.items():
             options += ["--rlimit", f"{name}={soft}:{hard}"]
+        if self.spec.file_owners is not None:  # a subids service: the pod's namespace maps them
+            rootfs = str(self._files / "rootfs")
+            options += ["--file-owners", os.path.abspath(self.spec.file_owners), rootfs]
         return [
             sys.executable,
             "-I",
@@ -1071,6 +1091,7 @@ class PodService(SessionSandbox):
                     )
                 await asyncio.sleep(0.02)
             self._identify()
+            self._report_file_owners(log_path)
             # The container's environment, read while its shell waits for the
             # service's own variables on stdin.
             environ = procfs.environ(self._container) if self._container else None
@@ -1086,6 +1107,16 @@ class PodService(SessionSandbox):
             if anchor.stdin is not None and not anchor.stdin.closed:
                 anchor.stdin.close()
         self._record()
+
+    def _report_file_owners(self, log_path: Path) -> None:
+        """Log what the launcher said of the entries of the file owners manifest it skipped."""
+        if self.spec.file_owners is None:
+            return
+        with contextlib.suppress(OSError), log_path.open("rb") as stream:
+            head = stream.read(64 * 1024).partition(f"{READY}\n".encode())[0]
+            for line in head.decode(errors="replace").splitlines():
+                if line.startswith(FILE_OWNERS_REPORT):
+                    log.warning("pod %s: service %s: %s", self.pod.id, self.name, line)
 
     def _identify(self) -> None:
         """Find the init (the launcher's child) and the container's shell (by its name)."""

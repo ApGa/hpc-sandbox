@@ -50,7 +50,14 @@ delete. So once such an instance has stopped, a short ``exec --fakeroot`` over
 the session's root filesystem and private ``/tmp`` and ``/var/tmp`` gives those
 files back to root of the namespace, the calling user, before the session is
 deleted (:func:`restore_owner`); janitors do the same for an abandoned session
-whose owner record says it ran so.
+whose owner record says it ran so. Extraction gives every file of the image to
+the calling user, so root inside sees them all as its own: a spec's file owners
+manifest gives the paths it lists their owners in the image, as root of the
+instance's user namespace (``nsenter`` into it runs the launcher's
+``file-owners`` form, :mod:`hpc_sandbox.anchor`), once the instance runs and
+before any command does. A snapshot copies the files as root of that namespace
+too, which reads those of every user it maps, and gives each copy to the
+calling user.
 """
 
 from __future__ import annotations
@@ -76,7 +83,7 @@ from . import procfs
 from .images import ImageStore, ResolvedImage, SifImages
 from .locks import locked
 from .paths import default_image_cache, should_stage
-from .pods import PodService
+from .pods import ANCHOR_SCRIPT, PodService
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import PASSED_DESPITE_CLEANENV, ContainerRuntime, instance_pid
 from .sandbox import (
@@ -276,6 +283,14 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         assert self.runtime.tmp_dir is not None and self.runtime.cache_dir is not None
         return [*super()._scratch_directories(), self.runtime.tmp_dir, self.runtime.cache_dir]
 
+    def _file_owners_refusal(self) -> str | None:
+        if self.fakeroot:
+            return None
+        return (
+            "file_owners need fakeroot=True: without --fakeroot, a sandbox's user namespace maps "
+            "only your uid, so its files cannot belong to other users"
+        )
+
     async def _extract(self, image: ResolvedImage, session: Session) -> None:
         if self.rootfs_layout == "fuse-overlay":
             template = await self._rootfs_template(image)
@@ -306,6 +321,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
                 "restore it with rootfs_layout='fuse-overlay'"
             )
         lower = self._snapshot_lower(snapshot)
+        await self._check_file_owners(spec)
         await self._prepare()
         return await self._launch(
             spec, partial(self._restore_overlay, source, lower), restored=True
@@ -457,6 +473,82 @@ class SingularitySandbox(SessionSandbox):
 
     def _watch_root(self) -> int | None:
         return self._instance_pid
+
+    async def _apply_file_owners(self) -> None:
+        """Give the image's paths that ``spec.file_owners`` lists their owners, as root of the
+        instance's user namespace, which maps them with ``--fakeroot``: the launcher's
+        ``file-owners`` form, run there, changes them through the host's view of the session's
+        root filesystem, which is the instance's root, before any command runs."""
+        if self.spec.file_owners is None:
+            return
+        assert self._session is not None
+        command = [
+            sys.executable,
+            "-I",
+            "-S",
+            str(ANCHOR_SCRIPT),
+            str(os.getpid()),
+            "file-owners",
+            os.path.abspath(self.spec.file_owners),
+            str(self._session.rootfs),
+        ]
+        result = await self._as_instance_root(
+            command, "apply its file owners", self._provider.start_timeout_s, SandboxStartError
+        )
+        if result.returncode != 0 or result.timed_out:
+            raise SandboxStartError(
+                f"could not apply the file owners of {self.spec.file_owners}: {result.detail()}"
+            )
+        if report := result.stdout.decode(errors="replace").strip():
+            log.warning("sandbox %s: %s", self.id, report)
+
+    async def _snapshot_copy(self, source: Path, target: Path) -> None:
+        """A ``--fakeroot`` sandbox's snapshot copies its files as root of the instance's user
+        namespace, which reads those of every user it maps whatever their modes, and gives each
+        copy to the calling user (``--no-preserve=ownership``): as that user, the copy failed on
+        a file or directory of another user that kept it out."""
+        if not self._provider.fakeroot:
+            await super()._snapshot_copy(source, target)
+            return
+        command = ["cp", "-a", "--no-preserve=ownership", "--reflink=auto", "--"]
+        result = await self._as_instance_root(
+            [*command, str(source), str(target)],
+            "copy its files",
+            self._provider.start_timeout_s,
+            SandboxError,
+        )
+        if result.returncode != 0 or result.timed_out:
+            raise SandboxError(f"could not copy {source} to {target}: {result.detail()}")
+
+    async def _as_instance_root(
+        self, command: list[str], doing: str, timeout_s: float, error: type[SandboxError]
+    ) -> ProcessResult:
+        """Run ``command`` as root of the instance's user namespace, in this mount namespace:
+        ``nsenter`` enters the namespace through a descriptor opened before the instance's
+        identity is proven again, so it is this instance's. Raises ``error``, saying what could
+        not be done (``doing``), when the instance is gone."""
+        assert self._instance_pid is not None
+        pid = self._instance_pid
+        try:
+            namespace = os.open(f"/proc/{pid}/ns/user", os.O_RDONLY | os.O_CLOEXEC)
+        except OSError as failure:
+            raise error(
+                f"could not {doing}: cannot enter the instance's user namespace: {failure}"
+            ) from failure
+        try:
+            if procfs.owned_live_start_time(pid) != self._instance_start_time:
+                raise error(f"could not {doing}: the instance exited")
+            argv = [
+                self._provider.nsenter,
+                f"--user=/proc/{os.getpid()}/fd/{namespace}",
+                "--preserve-credentials",
+                "--",
+                *command,
+            ]
+            environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+            return await run_process(argv, timeout_s=timeout_s, env=environment)
+        finally:
+            os.close(namespace)
 
     async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
         """A fuse-overlay sandbox's snapshot is its upper layer, what it wrote over the node's

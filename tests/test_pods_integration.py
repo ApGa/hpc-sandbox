@@ -14,13 +14,15 @@ checks of who services run as run ``HPC_SANDBOX_TEST_REDIS_IMAGE`` (default
 slirp4netns is found (see ``hpc-sandbox fetch-tools``) and reach PyPI and
 Debian's mirrors. ``HPC_SANDBOX_TEST_SUBIDS=1`` also tests pods with
 ``users="subids"``, with Singularity, where your user has subordinate ids that
-``newuidmap`` and ``newgidmap`` map.
+``newuidmap`` and ``newgidmap`` map; its test of file owners manifests runs
+``HPC_SANDBOX_TEST_FILE_OWNERS_IMAGE`` (default ``docker://node:20-alpine``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import os
 import signal
 import socket
@@ -39,7 +41,16 @@ import pytest
 from hpc_sandbox import SandboxSpec
 from hpc_sandbox.procfs import owned_live_start_time
 from hpc_sandbox.types import HealthCheck, PodSpec, SandboxError, ServiceRunAs, ServiceSpec
-from test_integration import RUNTIME, make_provider
+from test_integration import (
+    AS_NODE,
+    FILE_OWNERS_IMAGE,
+    MOUNTED_OVER_OWNERS,
+    MOUNTED_OVER_SKIPPED,
+    NODE_OWNED,
+    NODE_OWNERS,
+    RUNTIME,
+    make_provider,
+)
 
 pytestmark = [
     pytest.mark.integration,
@@ -486,3 +497,38 @@ async def test_the_janitor_gives_back_what_a_dead_owners_subids_pod_left(provide
     assert pod_id in report.removed and not report.errors
     assert await provider.wait_for_deletions(120) and not path.exists()
     assert list((provider.pod_root / ".trash").iterdir()) == []
+
+
+async def test_a_subids_service_applies_the_file_owners_of_its_image(provider, tmp_path, caplog):
+    """With node:20-alpine's file owners, node writes in its home directory, which is root's
+    without them, the entries for what the service mounts over are skipped, and nothing is left
+    behind."""
+    skip_unless_possible("subids")
+    owners = tmp_path / "owners"
+    owners.write_text(MOUNTED_OVER_OWNERS + NODE_OWNERS)
+    pod = await provider.start_pod(PodSpec(users="subids"))
+    await provider.images.resolve(FILE_OWNERS_IMAGE)  # pulled before the starts are timed
+    started = time.monotonic()
+    bare = await pod.start_service(
+        ServiceSpec("bare", SandboxSpec(image=FILE_OWNERS_IMAGE), run_as="subids")
+    )
+    without = time.monotonic() - started
+    result = await bare.exec(AS_NODE)
+    assert result.exit_code != 0 and "Permission denied" in result.stderr, result
+    started = time.monotonic()
+    spec = SandboxSpec(image=FILE_OWNERS_IMAGE, file_owners=str(owners))
+    with caplog.at_level(logging.WARNING, logger="hpc_sandbox.pods"):
+        service = await pod.start_service(ServiceSpec("node", spec, run_as="subids"))
+    elapsed = time.monotonic() - started
+    assert MOUNTED_OVER_SKIPPED in caplog.text, caplog.text
+    result = await service.exec(AS_NODE)
+    assert result.exit_code == 0, result
+    assert result.stdout.splitlines() == NODE_OWNED
+    home = service.session_dir / "rootfs" / "home" / "node"
+    assert owner(home) == pod._ids.uids.start + 999  # node's subordinate id, on the host
+    path = pod.path
+    await pod.stop()
+    assert await provider.wait_for_deletions(120) and not path.exists()
+    assert list((provider.pod_root / ".trash").iterdir()) == []
+    count = len(owners.read_text().splitlines())
+    print(f"\nsubids service: up in {without:.2f} s, with {count} entries in {elapsed:.2f} s")

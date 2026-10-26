@@ -9,6 +9,7 @@ import dataclasses
 import errno
 import fcntl
 import json
+import logging
 import os
 import signal
 import socket
@@ -1434,5 +1435,100 @@ async def test_the_janitor_gives_back_what_a_dead_owners_subids_service_wrote(ru
     assert owned[0].lstat().st_uid != os.getuid()  # a subordinate id's, which you cannot delete
     report = await provider.reap()
     assert pod_id in report.removed and not report.errors
+    assert await provider.wait_for_deletions(30) and not path.exists()
+    assert list((provider.pod_root / ".trash").iterdir()) == []
+
+
+# File owners manifests: what a subids service's launcher gives the image's paths before the
+# container and its command start.
+
+
+def owners_manifest(tmp_path: Path, content: str, name: str = "owners") -> str:
+    path = tmp_path / name
+    path.write_text(content)
+    return str(path)
+
+
+async def test_only_subids_services_take_file_owners(runtime, tmp_path):
+    provider, image = runtime
+    owners = owners_manifest(tmp_path, "0 0 /app\n")
+    pod = await provider.start_pod(PodSpec())
+    for run_as in ("root", "caller"):
+        spec = ServiceSpec("x", SandboxSpec(image=image, file_owners=owners), run_as=run_as)
+        with pytest.raises(ValueError, match="file_owners need run_as='subids'"):
+            await pod.start_service(spec)
+    assert pod.services == {}
+    await pod.stop()
+
+
+@on_singularity
+async def test_a_subids_service_applies_its_file_owners_before_its_command_starts(
+    runtime, fake_subids, tmp_path, caplog
+):
+    """The fake tools map no subordinate ids, so the pod maps root alone: entries of root apply,
+    an owner beyond fails the start in the launcher, which then leaves nothing, and the entries
+    skipped are logged."""
+    provider, image = runtime
+    pod = await provider.start_pod(PodSpec(users="subids"))
+    owners = owners_manifest(tmp_path, "0 0 /app/hello.txt\n0 0 /missing\n0 0 /var/tmp/x\n")
+    spec = ServiceSpec("svc", SandboxSpec(image=image, file_owners=owners), run_as="subids")
+    with caplog.at_level(logging.WARNING, logger="hpc_sandbox.pods"):
+        service = await pod.start_service(spec)
+    assert "skipped 2 of 3 entries" in caplog.text and ": /missing, /var/tmp/x" in caplog.text
+    assert (await service.exec("cat /app/hello.txt")).stdout == "hello\n"
+    beyond = owners_manifest(tmp_path, "1 1 /app\n", "beyond")
+    beyond_spec = ServiceSpec(
+        "beyond", SandboxSpec(image=image, file_owners=beyond), run_as="subids"
+    )
+    with pytest.raises(SandboxStartError, match=r"gives /app to uid 1, .* \(its uids: 0-0\)") as e:
+        await pod.start_service(beyond_spec)
+    assert "[Errno" not in str(e.value)
+    bad = owners_manifest(tmp_path, "1 /app\n", "bad")
+    bad_spec = ServiceSpec("bad", SandboxSpec(image=image, file_owners=bad), run_as="subids")
+    with pytest.raises(ValueError, match="line 1: expected UID GID /PATH"):
+        await pod.start_service(bad_spec)
+    assert set(pod.services) == {"svc"}
+    assert [p.name for p in pod.services_root.iterdir() if p.name.startswith("hpcsb-")] == [
+        service.id
+    ]
+    await pod.stop()
+
+
+# As root of a subids service: switch to uid and gid 1000, which the file owners gave /app, and
+# write there.
+WRITE_AS_1000 = (
+    "import os, time; os.setresgid(1000, 1000, 1000); os.setgroups([]); "
+    "os.setresuid(1000, 1000, 1000); open('/app/new', 'w').write('x'); "
+    "open('/tmp/ready', 'w').close(); time.sleep(600)"
+)
+
+
+@on_singularity
+async def test_subids_services_get_the_file_owners_of_their_image(runtime, tmp_path):
+    provider, image = runtime
+    if reason := await subids_unavailable():
+        pytest.skip(reason)
+    owners = owners_manifest(tmp_path, "1000 1000 /app\n1000 1000 /app/hello.txt\n")
+    pod = await provider.start_pod(PodSpec(users="subids"))
+    ids = pod._ids
+    assert ids is not None
+    spec = ServiceSpec(
+        "svc",
+        SandboxSpec(image=image, file_owners=owners),
+        command=[PYTHON, "-c", WRITE_AS_1000],
+        run_as="subids",
+    )
+    service = await pod.start_service(spec)
+    ready = service.session_dir / "tmp" / "ready"
+    await until(lambda: ready.exists() or service.exit_status is not None)
+    assert ready.exists(), (service.exit_status, await pod.logs("svc"))
+    rootfs = service.session_dir / "rootfs"
+    for name in ("app", "app/hello.txt", "app/new"):  # the image's, then what 1000 wrote
+        info = (rootfs / name).lstat()
+        assert (info.st_uid, info.st_gid) == (ids.uids.start + 999, ids.gids.start + 999), name
+    found = await service.exec("stat -c '%u %g' /app /app/hello.txt /app/new")
+    assert found.stdout == "1000 1000\n" * 3
+    path = pod.path
+    await pod.stop()
     assert await provider.wait_for_deletions(30) and not path.exists()
     assert list((provider.pod_root / ".trash").iterdir()) == []

@@ -17,7 +17,10 @@ then chroots into the directory; a shim init runs the command as its child,
 as SingularityCE's does. ``exec --fakeroot DIRECTORY``
 (how a stopped --fakeroot sandbox's files are given back) checks its flags
 and binds and runs nothing: without subordinate ids, everything a sandbox of
-the fake wrote belongs to the caller already.
+the fake wrote belongs to the caller already. An instance started with
+``--fakeroot`` runs in a user namespace of its own that maps root to the
+caller, as Singularity's does where the caller has no subordinate ids, and
+commands entered into it still run on the host.
 
 State lives in $FAKE_SINGULARITY_STATE. Knobs (environment variables):
   FAKE_SINGULARITY_PULL_FAILURES   fail this many pulls first (default 0)
@@ -165,6 +168,17 @@ def build(args: list[str]) -> int:
     return 0
 
 
+def fakeroot_namespace() -> None:
+    """Before a --fakeroot instance's process runs: a user namespace of its own that maps root to
+    the caller. Where user namespaces are unavailable, it runs without one."""
+    uid, gid = os.getuid(), os.getgid()
+    if libc.unshare(CLONE_NEWUSER) != 0:
+        return
+    Path("/proc/self/setgroups").write_text("deny")
+    Path("/proc/self/uid_map").write_text(f"0 {uid} 1")
+    Path("/proc/self/gid_map").write_text(f"0 {gid} 1")
+
+
 def instance_start(args: list[str]) -> int:
     options, (rootfs, name) = parse(args)
     time.sleep(float(os.environ.get("FAKE_SINGULARITY_START_DELAY", "0")))
@@ -184,12 +198,14 @@ def instance_start(args: list[str]) -> int:
     startscript = root / ".singularity.d" / "startscript"
     keeps_running = os.access(startscript, os.X_OK) and "sleep" in startscript.read_text()
     title = f"Singularity instance: {os.environ.get('USER', 'user')} [{name}]"
+    fakeroot = "--fakeroot" in options or "-f" in options
     process = subprocess.Popen(
         [sys.executable, "-c", INSTANCE_LOOP, title],
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        preexec_fn=fakeroot_namespace if fakeroot else None,  # this process runs no threads
     )
     Path(options["--pid-file"][0]).write_text(f"{process.pid}\n")
     INSTANCES.mkdir(exist_ok=True)

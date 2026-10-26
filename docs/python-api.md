@@ -94,10 +94,13 @@ sandbox has a session directory of its own.
 | `cpus` | `None` | Advisory, unless a `SingularityProvider` with `cgroup_limits=True` passes it as `--cpus`. |
 | `memory_mb` | `None` | Arms the memory watchdog; see [Memory limits](#memory-limits). |
 | `labels` | `{}` | String pairs recorded with the sandbox. `reap()` and `hpc-sandbox janitor --label` select sandboxes by them. |
+| `file_owners` | `None` | The path of a manifest of the users and groups that the image gives its files, which a sandbox whose user namespace maps other users applies before any command runs in it; see [File owners](#file-owners). |
 
 An invalid spec raises `ValueError` before anything is created: a relative `workdir`, a `network`
 other than `"host"` and `"none"`, a `memory_mb` or `cpus` that is not positive, an invalid variable
-name, a mount that breaks the rules below, or an image the provider can never run. With
+name, a mount that breaks the rules below, an image the provider can never run, or a
+`file_owners` manifest that cannot be read, that is malformed, or that the provider's sandboxes
+cannot apply. With
 `network="host"`, the host's `/etc/resolv.conf` is bound read-only into the sandbox, unless the
 provider was created with `bind_resolv_conf=False`.
 
@@ -138,6 +141,48 @@ and `cp` and `dirname`, which transfers use.
 A start creates the target in the sandbox's root filesystem when the image lacks it. With
 Singularity, a target whose path crosses a symlink in the image fails the start with
 `SandboxStartError`.
+
+### File owners
+
+An image's layers give each file an owner, and Docker keeps them: in `redis:7-alpine`, `/data`
+belongs to the image's user `redis`, uid 999, and its group, gid 1000. hpc-sandbox extracts every
+image as your uid, which loses them: in a sandbox whose root can switch users, every file is
+root's, and a command that switched to `redis` cannot write in its own data directory.
+`file_owners` gives them back. It names a manifest that you write, with one line for each path that
+the image gives to an owner other than root's user and group, for example from the tar headers of
+the image's layers:
+
+```text
+# redis:7-alpine: some of the owners its layers give, other than 0 0
+0 42 /etc/shadow
+999 1000 /data
+```
+
+Each line is `UID GID PATH`: two decimal ids, then the path in the image, absolute, which runs to
+the end of the line and may hold spaces, but no carriage return: a manifest with CRLF line ends
+raises `ValueError` at its first entry. Blank lines and lines that start with `#` are skipped. Each
+start reads the file, so it must stay readable until the start returns. Only sandboxes whose user
+namespace maps other users take a manifest, and they apply it to their own root filesystem before
+any command runs in them: Singularity sandboxes with `fakeroot=True`
+([Root in a sandbox](singularity.md#root-in-a-sandbox)) and pod services with `run_as="subids"`
+([Users](pods.md#users)). The others raise `ValueError`. Applying it:
+
+- gives each path its uid and gid as root of the sandbox's user namespace, in the manifest's order,
+  so a later line for the same path wins, and keeps a file's set-user-ID and set-group-ID bits,
+  which a change of owner clears;
+- never follows a symbolic link: a link gets the owner itself, and a path below a link or below a
+  file, a path the root filesystem lacks and one on another filesystem name nothing. They are
+  skipped, and a warning names them;
+- skips the paths at or below `/dev`, `/proc`, `/sys`, `/tmp` and `/var/tmp`, which the warning
+  names too: the sandbox mounts its own there, so it never sees what the image has in them;
+- fails the start with `SandboxStartError`, before it changes anything, when the namespace does not
+  map an id that the manifest gives, such as a uid beyond your subordinate ids.
+
+The image, the image cache and the node's templates never change: each start applies the manifest to
+its own copy. A snapshot keeps no owners, so a restore applies its spec's manifest again
+([Snapshots and restores](#snapshots-and-restores)). What the manifest gives to other users belongs
+to your subordinate ids on the host, and is given back to you before the sandbox's files are
+deleted, with what its commands wrote as other users.
 
 ## Running commands
 
@@ -397,6 +442,10 @@ hpcsb-8e522ce924b84854b850e8142d581a09 prepared
   `cp -a --reflink=auto`, which is nearly free on filesystems with reflinks (XFS, Btrfs) and a full
   copy elsewhere. Files written during the copy may be captured partially, so take snapshots while
   the sandbox is quiescent.
+- A snapshot's copies of the files are yours, so it keeps no owners, and a restore applies its
+  spec's `file_owners` again ([File owners](#file-owners)). A Singularity sandbox with
+  `fakeroot=True` is copied as root of its user namespace, which reads the files of every user
+  there whatever their modes, as root inside does.
 - A snapshot lives on the node that took it, in the scratch root's `snapshots` directory, until
   `delete_snapshot()` deletes it. Stops and janitors leave snapshots alone.
 - A restore needs a provider of the same runtime and the same scratch root, on the same node, and a
