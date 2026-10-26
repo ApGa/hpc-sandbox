@@ -136,7 +136,9 @@ _UPLOAD_DIR = 'mkdir -p -- "$2" && cp -pR -- "$1/." "$2/"\n'
 _MISSING_SOURCE = 66
 # Ownership is not copied out: root in a user namespace cannot give the copy an
 # owner the namespace does not map (files on host mounts), and GNU cp -p then
-# fails where busybox cp -p only warns. Busybox has no --preserve=LIST.
+# fails where busybox cp -p only warns. Busybox has no --preserve=LIST, and its
+# -p keeps the owners the namespace maps (a subids service's users), which the
+# host's copy could not read: the copy is given to root, your uid outside, after.
 _DOWNLOAD = f"""\
 if [ ! -e "$1" ]; then
     echo "hpc-sandbox: no such file or directory: $1" >&2
@@ -144,7 +146,7 @@ if [ ! -e "$1" ]; then
 fi
 case "$(cp --help 2>&1)" in
     *--preserve*) exec cp -RH --preserve=mode,timestamps -- "$1" "$2" ;;
-    *) exec cp -pRH -- "$1" "$2" ;;
+    *) cp -pRH -- "$1" "$2" || exit; chown -Rh 0:0 -- "$2" 2>/dev/null || : ;;
 esac
 """
 _PROBE_TIMEOUT_S = 120.0

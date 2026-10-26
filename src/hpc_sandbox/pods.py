@@ -118,21 +118,42 @@ cd -- "$2" || exit 125
 shift 2
 exec "$@"
 """
-# The command of a service without one: it stays up, idle, for exec.
+# The command of a service without one: it stays up, idle, for exec. It is the PID 1 of its PID
+# namespace where the runtime starts no init for it (Singularity's --no-init), so that a kill of
+# every process from a command spares it, and it forks nothing that such a kill would leave it to
+# start again. As PID 1 it reaps no orphan, as Docker's "sleep infinity" does not.
 SERVICE_KEEPALIVE = """\
 trap '' HUP INT QUIT TERM USR1 USR2
 command -v sleep >/dev/null 2>&1 || { echo "hpc-sandbox: the image has no sleep" >&2; exit 127; }
 exec >/dev/null 2>&1
-while :; do sleep 86400 & wait $!; done
+exec sleep 2147483647
 """
 # sh -c GIVE_BACK_SCRIPT hpc-sandbox-give-back TREE, run as root of a user namespace that maps the
 # caller's subordinate ids as a pod's with users="subids" does: give root, the caller outside, every
 # file below TREE that another id of the namespace owns, never following a link or crossing into
 # another filesystem. chown's failures, on owners the namespace does not map, are ignored: the
-# deletion refuses what is left, and names it. It exits with find's status.
+# deletion refuses what is left, and names it. What disappears during the walk is no error: a
+# dropped service's trash entry, which its own deletion empties meanwhile, takes files and
+# directories that find has listed, a directory among them before find could enter it, which
+# -ignore_readdir_race alone does not excuse (GNU findutils 4.8 reports it). So find's errors that
+# say "No such file or directory" (C's messages: give_back runs it with LC_ALL=C) are dropped, and
+# the script fails, with find's status, only on another error, which it prints.
 GIVE_BACK_SCRIPT = r"""
-find "$1" -xdev \( ! -user 0 -o ! -group 0 \) \
-  -exec /bin/sh -c 'chown -h 0:0 -- "$@" 2>/dev/null; exit 0' hpc-sandbox-chown {} +
+errors=$(find "$1" -xdev -ignore_readdir_race \( ! -user 0 -o ! -group 0 \) \
+  -exec /bin/sh -c 'chown -h 0:0 -- "$@" 2>/dev/null; exit 0' hpc-sandbox-chown {} + \
+  2>&1 >/dev/null)
+status=$?
+[ "$status" -eq 0 ] && exit 0
+failed=0
+while IFS= read -r line; do
+  case $line in
+    *": No such file or directory") ;;
+    *) printf '%s\n' "$line" >&2; failed=1 ;;
+  esac
+done <<EOF
+$errors
+EOF
+[ "$failed" -eq 0 ] || exit "$status"
 """
 # How long giving back a pod's files may take: it walks every service's root filesystem.
 _GIVE_BACK_TIMEOUT_S = 600.0
@@ -1167,6 +1188,7 @@ class PodService(SessionSandbox):
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 env=environment,
+                cwd="/",  # never the caller's directory, which nothing in the service needs
                 start_new_session=True,
             )
         anchor = self._service_anchor
@@ -1512,7 +1534,7 @@ async def give_back(
         "hpc-sandbox-give-back",
         str(path),
     ]
-    environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"}
     result = await run_process(argv, timeout_s=timeout_s, env=environment)
     if result.returncode != 0 or result.timed_out:
         raise SandboxError(
