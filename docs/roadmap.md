@@ -11,6 +11,7 @@ hpc-sandbox does not do these things yet. Each row says what happens today inste
 | snapshots | memory snapshots | snapshots hold files (the root filesystem and the private `/tmp` and `/var/tmp`), never processes or memory |
 | snapshots | keeping the owners of files | a snapshot's copies of the files are yours: a restore gives the image's paths their owners again from its spec's `file_owners`, and what commands wrote as other users is root's in the restored sandbox ([Snapshots and restores](python-api.md#snapshots-and-restores)) |
 | sandboxes | separate PID namespaces for groups of commands inside one sandbox | each sandbox has one PID namespace, shared by all its commands |
+| runtimes | a gVisor provider: sandboxes under rootless `runsc`, each with a user-space kernel of its own, where root holds every capability (mounts, namespaces, raw sockets, nested Docker) without holding any on the host | sandboxes share the host's kernel, and root in them is root of a user namespace that maps your uid ([Security model](security.md#what-isolation-does-not-cover)) |
 | images | reading the owners of an image's files from its layers | extraction gives every file to your uid; a manifest that you write gives them their owners, in sandboxes whose user namespace maps other users ([File owners](python-api.md#file-owners)) |
 | pods | snapshots of services | `snapshot()` on a pod service raises `SandboxError` |
 | pods | GPUs | services get no GPUs |
