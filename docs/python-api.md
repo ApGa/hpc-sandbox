@@ -670,9 +670,12 @@ protocol.
 
 `await provider.start_pod(PodSpec(...))` starts a pod: services that share one network, like a
 docker-compose project. It returns a `SessionPod`, whose `start_service(ServiceSpec(...))` returns a
-service: a `SingularityService` or an `EnrootService`, both `PodService` sandboxes with `exec`,
-`upload` and `download`. `HealthCheck`, `PodNetwork`, `PodUsers`, `ServiceHealth` and `ServiceRunAs`
-complete the pod API. [Pods](pods.md) describes all of it.
+service: a `SingularityService`, an `EnrootService` or, for a spec with `runtime="gvisor"` in a pod
+of a provider created with `gvisor=GvisorProvider(...)`, a `GvisorService`, all `PodService`
+sandboxes with `exec`, `upload` and `download`. `HealthCheck`, `PodNetwork`, `PodUsers`,
+`ServiceHealth`, `ServiceRunAs`, `ServiceRuntime`, `ServiceSecurebits` and `GuestCgroups` complete
+the pod API. [Pods](pods.md) describes all of it, and [gVisor services](pods.md#gvisor-services) the
+services in gVisor.
 
 ## Capabilities
 
@@ -685,6 +688,7 @@ complete the pod API. [Pods](pods.md) describes all of it.
 | `pods` | With Singularity and enroot: `start_pod()` works. |
 | `network_none` | With Singularity, when `allow_network_none=True`; with enroot, unless `allow_network_none=False`; always with gVisor. |
 | `gpu` | With Singularity, when `gpu` is set; with enroot, when `gpus` (or `gpu="nv"`) is set. |
+| `gvisor_services` | With Singularity and enroot, when `gvisor` is set: pod services with `runtime="gvisor"` work ([gVisor services](pods.md#gvisor-services)). |
 
 Isolation keeps sandboxes apart from one another and from the host's files and processes. It is not
 a security boundary against hostile code: commands run as your uid, on the host's kernel and, by
@@ -763,7 +767,7 @@ logging configuration, Python prints warnings and errors on stderr;
 | Results | `ExecResult`, `DownloadReport`, `DroppedLink`, `SandboxSnapshot`, `JanitorReport` |
 | Error contract | `CWD_ERROR_EXIT_CODE`, `CWD_ERROR_PREFIX`, `CWD_ERROR_REASONS`, `SandboxError`, `SandboxStartError`, `SandboxLostError` |
 | Protocols | `SandboxProvider`, `Sandbox`, `PodProvider`, `Pod` |
-| Pods | `PodSpec`, `ServiceSpec`, `HealthCheck`, `PodNetwork`, `PodUsers`, `ServiceHealth`, `ServiceRunAs`, `SessionPod`, `PodService`, `SingularityService`, `EnrootService` |
+| Pods | `PodSpec`, `ServiceSpec`, `HealthCheck`, `PodNetwork`, `PodUsers`, `ServiceHealth`, `ServiceRunAs`, `ServiceRuntime`, `ServiceSecurebits`, `GuestCgroups`, `SessionPod`, `PodService`, `SingularityService`, `EnrootService`, `GvisorService` |
 | Images | `ImageStore`, `ImageFormat`, `ResolvedImage`, `SifImages`, `SquashfsImages` |
 | Runtimes | `ContainerRuntime`, `EnrootRuntime` and `RunscRuntime`: the runtime command lines a provider runs, as its `runtime` attribute (a `GvisorProvider`'s `ContainerRuntime`, which pulls and extracts its images, is its `image_runtime`) |
 

@@ -6,6 +6,7 @@
     python -I -S anchor.py PARENT_PID join HOLDER_PID [OPTION...] -- COMMAND [ARG...]
     python -I -S anchor.py PARENT_PID file-owners MANIFEST ROOTFS
     python -I -S anchor.py PARENT_PID exec [--cpus LIST] -- COMMAND [ARG...]
+    python -I -S anchor.py PARENT_PID gvisor-service HOLDER_PID [--cpus LIST] -- COMMAND [ARG...]
 
 The first form starts a sandbox of its own. It
 
@@ -58,6 +59,19 @@ if that already happened, keeps to the CPUs that ``--cpus`` lists
 (``0,2-3``), if given, and then runs COMMAND in its own place: the gVisor
 provider's ``runsc run``, which makes namespaces of its own and whose sandbox
 dies with it (:mod:`hpc_sandbox.gvisor`).
+
+The ``gvisor-service`` form runs a pod service in gVisor. It arranges to be
+SIGKILLed when its parent dies, joins the user and network namespaces of the
+pod's holder, then makes a nested user namespace that maps root alone, as a
+Singularity service's does, keeps to the CPUs that ``--cpus`` lists, and runs
+COMMAND (``runsc --rootless --network=host run ...``) as a child that dies
+with it, with its output through a pipe this process copies to its own, as the
+``join`` form does; it exits with COMMAND's status. runsc starts gVisor's
+kernel in the user namespace it runs in when it holds capabilities there: in
+the holder's own, that kernel's root would hold every capability over the
+pod's network, and could watch the other services' traffic or change their
+loopback. In the nested one it holds none, and its host network stack is the
+pod's, so the service's sockets are on the pod's loopback.
 """
 
 from __future__ import annotations
@@ -74,6 +88,7 @@ import socket
 import stat
 import struct
 import sys
+from collections.abc import Callable
 
 CLONE_NEWNS = 0x00020000
 CLONE_NEWUTS = 0x04000000
@@ -354,30 +369,39 @@ def _join(argv: list[str]) -> int:
     _check(_libc.mount(b"none", b"/", None, MS_REC | MS_PRIVATE, None), "make / private")
     # The service writes to a pipe this process copies to its own output, as
     # Docker's shim does: what the service opens as /dev/stdout is the pipe.
+    # This process copies until everything in the service is gone (no threads
+    # here: it can no longer start any, its children being in another PID
+    # namespace).
+    return _run_piped(lambda: _service_init(hostname, rlimits, shm, userns, command))
+
+
+def _run_piped(child_main: Callable[[], int]) -> int:
+    """Fork a child that dies with this process and runs ``child_main``, with its stdout and
+    stderr on a pipe; copy the pipe to this process's stdout until its end, and return the child's
+    status (128 + the signal if it was killed). An ``OSError`` in the child is reported on the pipe,
+    and the child exits with 1."""
     output_read, output_write = os.pipe()
     alive_read, alive_write = os.pipe()
-    init = os.fork()
-    if init == 0:
+    child = os.fork()
+    if child == 0:
         os.close(alive_write)
         os.close(output_read)
         try:
             _die_with_parent()
             if select.select([alive_read], [], [], 0)[0]:
-                os._exit(1)
+                os._exit(1)  # EOF: this process is already gone
             os.close(alive_read)
             os.dup2(output_write, 1)
             os.dup2(output_write, 2)
             os.close(output_write)
-            os._exit(_service_init(hostname, rlimits, shm, userns, command))
+            os._exit(child_main())
         except OSError as error:
             print(f"hpc-sandbox: {error}", file=sys.stderr)
             os._exit(1)
     os.close(alive_read)
     os.close(output_write)
-    # Until everything in the service is gone (no threads here: this process
-    # can no longer start any, its children being in another PID namespace).
     _copy(output_read, 1)
-    return _wait(init)
+    return _wait(child)
 
 
 def _copy(source: int, target: int) -> None:
@@ -543,9 +567,53 @@ def _exec(parent: int, argv: list[str]) -> int:
     return 127  # not reached: execvp raises when it fails
 
 
+def _gvisor_service(argv: list[str]) -> int:
+    """The ``gvisor-service`` form: COMMAND, runsc, as a service of the pod whose holder is
+    ``argv[0]``, in a nested user namespace that maps root alone."""
+    holder, options, command = argv[0], argv[1 : argv.index("--")], argv[argv.index("--") + 1 :]
+    cpus = None
+    while options:
+        option = options.pop(0)
+        if option == "--cpus" and options:
+            cpus = cpu_list(options.pop(0))
+        else:
+            raise OSError(22, f"unknown option {option}")
+    if not command:
+        raise OSError(22, "no command to run")
+    # The user namespace first: it owns the network namespace.
+    _setns(f"/proc/{holder}/ns/user", CLONE_NEWUSER)
+    _setns(f"/proc/{holder}/ns/net", CLONE_NEWNET)
+    _check(_libc.unshare(CLONE_NEWUSER), "unshare (nested user namespace)")
+    _write("/proc/self/setgroups", "deny")
+    _write("/proc/self/uid_map", "0 0 1")
+    _write("/proc/self/gid_map", "0 0 1")
+    if cpus is not None:
+        os.sched_setaffinity(0, cpus)
+    # runsc writes to a pipe this process copies to its own output, so that the service can
+    # neither truncate its log nor be bound by a file size limit there.
+    return _run_piped(lambda: _execute(command))
+
+
+def _execute(command: list[str]) -> int:
+    """Run COMMAND in this process's place, with the signals Python ignores restored; report a
+    failure and return 127."""
+    for ignored in (signal.SIGPIPE, signal.SIGXFSZ):  # ignored by Python, not by runsc
+        signal.signal(ignored, signal.SIG_DFL)
+    try:
+        os.execvp(command[0], command)
+    except OSError as error:
+        print(f"hpc-sandbox: cannot run {command[0]}: {error}", file=sys.stderr)
+    return 127
+
+
 def main(argv: list[str]) -> int:
     if len(argv) >= 4 and argv[1] == "exec" and "--" in argv[2:]:
         return _exec(int(argv[0]), argv[2:])
+    if len(argv) >= 5 and argv[1] == "gvisor-service" and "--" in argv[3:]:
+        _die_with_parent()
+        if os.getppid() != int(argv[0]):
+            return 1  # the parent died before PR_SET_PDEATHSIG took effect
+        return _gvisor_service(argv[2:])
     if len(argv) >= 5 and argv[1] == "join" and "--" in argv[3:]:
         _die_with_parent()
         if os.getppid() != int(argv[0]):
@@ -564,7 +632,9 @@ def main(argv: list[str]) -> int:
             "usage: anchor.py PARENT_PID host|none -- COMMAND [ARG...]\n"
             "       anchor.py PARENT_PID join HOLDER_PID [OPTION...] -- COMMAND [ARG...]\n"
             "       anchor.py PARENT_PID file-owners MANIFEST ROOTFS\n"
-            "       anchor.py PARENT_PID exec [--cpus LIST] -- COMMAND [ARG...]",
+            "       anchor.py PARENT_PID exec [--cpus LIST] -- COMMAND [ARG...]\n"
+            "       anchor.py PARENT_PID gvisor-service HOLDER_PID [--cpus LIST] -- "
+            "COMMAND [ARG...]",
             file=sys.stderr,
         )
         return 2

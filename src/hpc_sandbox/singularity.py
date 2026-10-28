@@ -76,7 +76,7 @@ import time
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from . import procfs
 from .images import ImageStore, ResolvedImage, SifImages
@@ -101,6 +101,9 @@ from .templates import (
     template_ready,
 )
 from .types import SandboxError, SandboxSnapshot, SandboxStartError
+
+if TYPE_CHECKING:
+    from .gvisor import GvisorProvider
 
 log = logging.getLogger(__name__)
 
@@ -180,7 +183,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     Pods (:meth:`start_pod`) find slirp4netns for egress at ``slirp4netns``,
     else on PATH, else as fetched by ``hpc-sandbox fetch-tools``; their
     services get ``service_stop_grace_s`` between SIGTERM and SIGKILL when
-    their pod stops.
+    their pod stops. ``gvisor``, a :class:`~hpc_sandbox.gvisor.GvisorProvider`,
+    runs the services whose spec says ``runtime="gvisor"`` in gVisor, and adds
+    the ``gvisor_services`` capability.
     """
 
     name = "singularity"
@@ -213,6 +218,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         rootfs_templates: bool | None = None,
         rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
         fakeroot: bool = False,
+        gvisor: GvisorProvider | None = None,
     ) -> None:
         super().__init__(
             scratch_root=scratch_root,
@@ -253,6 +259,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             | ({"network_none"} if allow_network_none else set())
             | ({"gpu"} if gpu else set())
         )
+        self._take_gvisor(gvisor)
         layout = rootfs_layout or os.environ.get("HPC_SANDBOX_ROOTFS_LAYOUT") or "copy"
         if layout not in ROOTFS_LAYOUTS:
             raise ValueError(f"rootfs_layout must be one of {ROOTFS_LAYOUTS}, not {layout!r}")

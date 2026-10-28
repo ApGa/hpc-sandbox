@@ -60,7 +60,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from . import procfs, safefs
 from .images import (
@@ -81,6 +81,9 @@ from .runtime import RUNTIME_CANDIDATES
 from .sandbox import SessionProvider, SessionSandbox, make_owner_writable, poll
 from .sessions import Session, kill_exact, remove_tree, signal_kill
 from .types import SandboxError, SandboxSpec, SandboxStartError
+
+if TYPE_CHECKING:
+    from .gvisor import GvisorProvider
 
 log = logging.getLogger(__name__)
 ANCHOR_SCRIPT = Path(__file__).with_name("anchor.py")
@@ -634,7 +637,9 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     Pods (:meth:`start_pod`) find slirp4netns for egress at ``slirp4netns``,
     else on PATH, else as fetched by ``hpc-sandbox fetch-tools``; their
     services get ``service_stop_grace_s`` between SIGTERM and SIGKILL when
-    their pod stops.
+    their pod stops. ``gvisor``, a :class:`~hpc_sandbox.gvisor.GvisorProvider`,
+    runs the services whose spec says ``runtime="gvisor"`` in gVisor, with its
+    SIF images, and adds the ``gvisor_services`` capability.
     """
 
     network_none_hint = "network 'none' was turned off with allow_network_none=False"
@@ -667,6 +672,7 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
         rootfs_templates: bool | None = None,
         rootfs_layout: Literal["copy", "fuse-overlay"] | None = None,
         fakeroot: bool = False,
+        gvisor: GvisorProvider | None = None,
     ) -> None:
         if gpu is not None:
             if gpus is not None:
@@ -730,6 +736,7 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
             | ({"network_none"} if allow_network_none is not False else set())
             | ({"gpu"} if gpus else set())
         )
+        self._take_gvisor(gvisor)
         self._sysconf: asyncio.Future[None] | None = None
 
     def _session_roots(self) -> list[tuple[Path, bool]]:

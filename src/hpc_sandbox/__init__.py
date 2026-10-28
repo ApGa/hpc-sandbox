@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .enroot import EnrootProvider, EnrootRuntime, EnrootSandbox, EnrootService, SquashfsImages
-from .gvisor import GvisorProvider, GvisorSandbox, RunscRuntime
+from .gvisor import GvisorProvider, GvisorSandbox, GvisorService, RunscRuntime
 from .images import ImageFormat, ImageStore, ResolvedImage, SifImages
 from .pods import PodService, SessionPod
 from .runtime import ContainerRuntime
@@ -21,6 +21,7 @@ from .types import (
     DownloadReport,
     DroppedLink,
     ExecResult,
+    GuestCgroups,
     HealthCheck,
     Mount,
     Pod,
@@ -37,6 +38,8 @@ from .types import (
     SandboxStartError,
     ServiceHealth,
     ServiceRunAs,
+    ServiceRuntime,
+    ServiceSecurebits,
     ServiceSpec,
 )
 
@@ -52,8 +55,10 @@ __all__ = [
     "EnrootSandbox",
     "EnrootService",
     "ExecResult",
+    "GuestCgroups",
     "GvisorProvider",
     "GvisorSandbox",
+    "GvisorService",
     "HealthCheck",
     "ImageFormat",
     "ImageStore",
@@ -76,6 +81,8 @@ __all__ = [
     "SandboxStartError",
     "ServiceHealth",
     "ServiceRunAs",
+    "ServiceRuntime",
+    "ServiceSecurebits",
     "ServiceSpec",
     "SessionPod",
     "SifImages",

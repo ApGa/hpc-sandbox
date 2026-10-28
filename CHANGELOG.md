@@ -4,6 +4,26 @@ What each release of hpc-sandbox changes. Its version is below 1.0: a minor rele
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
 one minor release, require a range such as `hpc-sandbox>=0.6,<0.7`.
 
+## 0.7.0 (unreleased)
+
+### Added
+
+- **Pod services can run in gVisor, while the pod's other services stay on Singularity or
+  enroot**: `ServiceSpec(runtime="gvisor")`, in a pod of a provider created with
+  `gvisor=GvisorProvider(...)`, which adds the `gvisor_services` capability. It is for a service
+  that asks for Docker's `privileged`, such as a judge that sandboxes what it grades: root in it
+  holds every capability towards gVisor's kernel only, and none over the pod's network. Any service
+  may take it, so every service of a pod can run in gVisor. `memory_mb` stops the whole service,
+  and `cpus` keeps it to that many CPUs. `ServiceSpec(securebits="ignore")` makes
+  `prctl(PR_SET_SECUREBITS)` succeed without setting anything, for go-judge, and
+  `ServiceSpec(guest_cgroups=...)` mounts gVisor's cgroups in one service. `run_as="caller"` and
+  file owners manifests raise `ValueError` for such a service. New names: `GvisorService`,
+  `ServiceRuntime`, `ServiceSecurebits` and `GuestCgroups`. See
+  [gVisor services](docs/pods.md#gvisor-services) and
+  [gVisor pod services](docs/security.md#gvisor-pod-services).
+  The gVisor provider still starts no pods of its own (`start_pod()` raises `ValueError`); it runs
+  services of Singularity and enroot pods as their providers' `gvisor=` option.
+
 ## 0.6.0 (2026-10-29)
 
 ### Added

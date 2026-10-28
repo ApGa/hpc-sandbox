@@ -58,10 +58,12 @@ jobs:
       - name: Run tests
         run: uv run pytest -v -ra
 
-  # The gVisor provider against a real runsc (tests/test_gvisor_integration.py, and the integration
-  # tests of every provider), with Apptainer for its SIF images. Both come from their releases,
-  # checked against the checksums pinned here; the runsc release is the one the provider was
-  # measured with. tests/test_gvisor.py runs in the test job.
+  # The gVisor provider against a real runsc (tests/test_gvisor_integration.py, its services in
+  # Apptainer pods in tests/test_gvisor_pods_integration.py, go-judge among them, and the
+  # integration tests of every provider), with Apptainer for its SIF images. runsc, Apptainer and
+  # go-judge come from their releases, checked against the checksums pinned here; the runsc release
+  # is the one the provider was measured with. tests/test_gvisor.py and tests/test_gvisor_pods.py
+  # run in the test job.
   gvisor:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -70,6 +72,8 @@ jobs:
       GVISOR_SHA512: 26e4a327565f5da0f73261a6387e2c20f4695a232e330095a3111b70efd604fdf09d734e8cc8f714dbb5c5607ce8c87ea80b26df549d83a146f2efd5a1af448a
       APPTAINER_VERSION: "1.5.5"
       APPTAINER_SHA256: 25095d3711504b3e8657dbb2e172ef8db9db43c4503d940c9c36b105db8dce77
+      GOJUDGE_VERSION: "1.11.1"
+      GOJUDGE_SHA256: ffb8828f6097b2cc70adfab6781a372f5f58ba77ca06cf22bbfbb6a17c7a2e65
       UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v4
@@ -108,6 +112,16 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q "$RUNNER_TEMP/$deb"
 
+      # The release archive holds the go-judge binary that the go-judge test binds into a service.
+      - name: Install go-judge
+        run: |
+          archive="go-judge_${GOJUDGE_VERSION}_linux_amd64v2.tar.gz"
+          url="https://github.com/criyle/go-judge/releases/download/v$GOJUDGE_VERSION/$archive"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" "$url"
+          echo "$GOJUDGE_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/go-judge"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/go-judge"
+
       - name: Check that rootless runsc runs
         run: |
           runsc --version
@@ -124,4 +138,7 @@ jobs:
         env:
           HPC_SANDBOX_INTEGRATION: "1"
           HPC_SANDBOX_TEST_RUNTIME: gvisor
-        run: uv run pytest tests/test_gvisor_integration.py tests/test_integration.py -v -ra
+          HPC_SANDBOX_TEST_GOJUDGE: ${{ runner.temp }}/go-judge
+        run: >-
+          uv run pytest tests/test_gvisor_integration.py tests/test_gvisor_pods_integration.py
+          tests/test_integration.py -v -ra

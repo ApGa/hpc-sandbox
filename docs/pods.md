@@ -6,7 +6,10 @@ service is a sandbox, with its own image, root filesystem and processes. The pod
 a network of their own: from outside the pod, only the ports you expose to the host reach it, and
 from it the services reach only each other and the host services you relay into it, unless you
 give the pod egress to other hosts. The Singularity and enroot providers run pods (their
-`capabilities` include `pods`), with the same API; the gVisor provider does not yet.
+`capabilities` include `pods`), with the same API. A service that asks for root's privileges, as
+Docker's `privileged` gives them, such as a judge that sandboxes the programs it grades, can run
+in gVisor while the pod's other services stay on Singularity or enroot
+([gVisor services](#gvisor-services)); the gVisor provider starts no pods of its own.
 
 ## An example
 
@@ -277,18 +280,22 @@ HTTP/1.0 200 OK
 ## Services
 
 `await pod.start_service(spec, wait="started")` starts a service for a `ServiceSpec`, and returns
-it: a `SingularityService` or an `EnrootService`, both `PodService` sandboxes with `exec`, `upload`
-and `download` like any other ([Python API](python-api.md)).
+it: a `SingularityService`, an `EnrootService` or, with `runtime="gvisor"`, a `GvisorService`, all
+`PodService` sandboxes with `exec`, `upload` and `download` like any other
+([Python API](python-api.md)).
 
 | Field | Default | Meaning |
 |---|---|---|
 | `name` | required | The service's name and hostname, which every service of the pod resolves to 127.0.0.1: a letter or digit, then up to 62 letters, digits, `_`, `.` or `-`. |
-| `sandbox` | required | A `SandboxSpec`: the image, `workdir`, `env`, `mounts` and `memory_mb`, and with `run_as="subids"` its `file_owners` ([Image file owners](#image-file-owners)). Its `network` is ignored: services share the pod's. `cpus` is advisory. |
+| `sandbox` | required | A `SandboxSpec`: the image, `workdir`, `env`, `mounts` and `memory_mb`, and with `run_as="subids"` its `file_owners` ([Image file owners](#image-file-owners)). Its `network` is ignored: services share the pod's. `cpus` is advisory, except in a gVisor service ([Its limits](#its-limits)). |
 | `command` | `None` | The service's command, a full argv list. Without one, the service stays up, idle, for `exec`, like a sandbox. |
 | `healthcheck` | `None` | A `HealthCheck` ([Health checks](#health-checks)). |
 | `shm_mb` | `None` | The size of the service's `/dev/shm`, in MiB; 64 when `None`, as with Docker. |
 | `ulimits` | `{}` | Resource limits by their docker-compose names, such as `nofile`, `stack` or `core`, each `(soft, hard)`, with `-1` for unlimited. |
 | `run_as` | `"root"` | A `ServiceRunAs`: who the command, and the commands entered into the service, run as: `"root"`, `"caller"` or `"subids"` ([Users](#users)). |
+| `runtime` | `None` | A `ServiceRuntime`: what runs the service. `None`: the pod's provider. `"gvisor"`: gVisor, through the `gvisor` option of the pod's provider ([gVisor services](#gvisor-services)). |
+| `securebits` | `None` | A `ServiceSecurebits`, with `runtime="gvisor"` only: `"ignore"` makes `prctl(PR_SET_SECUREBITS)` succeed without setting anything, for software such as go-judge ([Securebits](#securebits)). |
+| `guest_cgroups` | `None` | A `GuestCgroups`, with `runtime="gvisor"` only: `"v1"` or `"v2"` mounts gVisor's own cgroups at `/sys/fs/cgroup` in the service; `None` takes the `GvisorProvider`'s `guest_cgroups`. |
 
 With `wait="started"`, `start_service()` returns once the service's container runs; with
 `wait="healthy"`, once its health check passed too, which for a service without one is at once. It
@@ -301,8 +308,10 @@ behind, and a start that the pod's stop interrupts raises `SandboxStartError`.
 `start_service()` raises `ValueError` before anything starts for a name that is invalid or taken,
 an empty command, a `shm_mb` that is not positive, an unknown ulimit, a soft limit above its hard
 limit, an invalid health check, a `run_as` that is unknown or that the runtime cannot give, or
-`"subids"` in a pod without `users="subids"`, `file_owners` in a service whose `run_as` is not
-`"subids"`, or a `sandbox` spec that `start()` would refuse.
+`"subids"` in a pod without `users="subids"` (a gVisor service takes it in any pod), `file_owners` in a service whose `run_as` is not
+`"subids"`, or a `sandbox` spec that `start()` would refuse; and for a `runtime` other than `None`
+and `"gvisor"`, `"gvisor"` in a pod whose provider has no `gvisor` option, or `securebits` or
+`guest_cgroups` without it.
 
 Each service gets:
 
@@ -516,7 +525,8 @@ On images based on Debian (those with `/etc/debian_version`), hpc-sandbox lets a
 ## Commands
 
 `exec`, `upload`, `download` and health checks enter a service in two steps: the pod's user and
-network namespaces with `nsenter`, then the container's own namespaces and root directory. They run
+network namespaces with `nsenter`, then the container's own namespaces and root directory. A gVisor
+service's run with `runsc exec` instead ([gVisor services](#gvisor-services)). They run
 like the service's command, as the user its `run_as` gives ([Users](#users)), with its `ulimits`
 (applied with `prlimit`). `exec` follows the rules of every sandbox: the same environment, timeouts, exit codes
 and errors ([Running commands](python-api.md#running-commands)).
@@ -589,6 +599,211 @@ distribution's security fixes; the pinned one gets fixes only when hpc-sandbox m
 Only the holder keeps slirp4netns's exit pipe open, so slirp4netns ends with the pod, even when the
 process that started the pod is killed.
 
+## gVisor services
+
+A service that asks for root's privileges, as Docker's `privileged: true` gives them, can run in
+[gVisor](gvisor.md) while the pod's other services stay on Singularity or enroot. Root in it holds
+every capability, but towards gVisor's kernel only: it can mount file systems, create namespaces,
+switch users and set up cgroups, as a judge that sandboxes the programs it grades does, and none of
+it reaches the host's kernel or the pod's network. Give the pod's provider a `GvisorProvider` as
+its `gvisor` option, and the service `runtime="gvisor"`:
+
+```python
+import asyncio
+
+from hpc_sandbox import (
+    GvisorProvider,
+    HealthCheck,
+    PodSpec,
+    SandboxSpec,
+    ServiceSpec,
+    SingularityProvider,
+)
+
+IMAGE = "docker://python:3.12-slim"
+CHECK = "import urllib.request; urllib.request.urlopen('http://localhost:8081/')"
+FETCH = "import urllib.request; print(urllib.request.urlopen('http://judge:8081/').status)"
+
+JUDGE = ServiceSpec(
+    "judge",
+    SandboxSpec(image=IMAGE, workdir="/srv", memory_mb=2048, cpus=2),
+    command=["python", "-m", "http.server", "8081"],
+    healthcheck=HealthCheck(
+        ["CMD", "python", "-c", CHECK], interval_s=10, start_period_s=60, start_interval_s=0.5
+    ),
+    runtime="gvisor",
+)
+
+
+async def main() -> None:
+    provider = SingularityProvider(gvisor=GvisorProvider())  # or EnrootProvider(gvisor=...)
+    async with await provider.start_pod(PodSpec()) as pod:
+        judge = await pod.start_service(JUDGE, wait="healthy")
+        client = await pod.start_service(ServiceSpec("main", SandboxSpec(image=IMAGE)))
+        print((await client.exec(["python", "-c", FETCH])).stdout, end="")
+        print((await judge.exec("mount -t tmpfs none /mnt && echo mounted")).stdout, end="")
+    await provider.wait_for_deletions()
+
+
+asyncio.run(main())
+```
+
+```text
+200
+mounted
+```
+
+The `gvisor` option adds the `gvisor_services` capability. The `GvisorProvider` gives its services
+runsc and its options (`binary`, `platform`, `guest_cgroups`, `overlay_size_mb`, `host_uds` and
+`extra_start_args`), their images, which are SIF images that Singularity CE or Apptainer pulls even
+in an enroot pod, the node's templates of them, and their CPUs. The pod's provider gives them its
+timeouts, `memory_poll_s` and `service_stop_grace_s`. A gVisor service has the API of the other
+services, and the differences below.
+
+### Every service in gVisor
+
+Any service may take `runtime="gvisor"`, whether it asks for root's privileges or not, so every
+service of a pod can run in gVisor: in the example above, give `main` `runtime="gvisor"` too. The
+services reach each other by name, and `exec`, transfers and health checks work in each. The pod
+itself, its names, exposed ports, upstreams and egress, stays the pod provider's.
+
+Choose it to keep code you do not trust off the host's kernel in every service, such as an agent's
+commands and the programs they build: their system calls then reach gVisor's kernel, and root in
+the service holds nothing outside it. A service on Singularity or enroot runs on the host's kernel,
+as your uid, which keeps it apart from your other work but is no boundary against hostile code
+([Security model](security.md#what-isolation-does-not-cover)). For services whose code you trust,
+such as a database or a server of your own, Singularity and enroot cost less. In each gVisor
+service, the cost is:
+
+- gVisor's overhead: system calls, `fork` and `exec` take several times as long, compiles about
+  1.6 times, CPU-bound programs 1.2 times
+  ([What gVisor gives](gvisor.md#what-gvisor-gives-and-what-it-does-not)), and each command
+  entered with `exec` about 7 ms more for `runsc exec`;
+- memory: a gVisor kernel of its own, about 15 MiB when idle and more after work on many files,
+  which its `memory_mb` counts, and a breach of that limit stops the whole service
+  ([Its limits](#its-limits));
+- what gVisor services lack: images other than SIF images, even in an enroot pod; GPUs;
+  `run_as="caller"` and file owners manifests; raw and packet sockets, firewalls and bridges
+  ([Its network](#its-network)).
+
+### Its network
+
+The service's launcher joins the pod's user and network namespaces, nests a user namespace that
+maps root alone, as a Singularity service's does, and runs `runsc --rootless --network=host run`
+there. gVisor's host network stack is then the pod's network: the service's sockets are on the
+pod's loopback, so the other services reach it by its name, the host through an exposed port, and
+it reaches the other services, the upstreams and, with egress, other hosts, as every service does.
+gVisor's kernel runs in the nested namespace and holds no capability over the pod's network: root
+in the service can neither change it (`ip addr add` fails) nor open raw or packet sockets, even with
+the `GvisorProvider`'s `net_raw`, so it cannot watch the other services' traffic. Without that
+nesting, runsc, which holds every capability in the pod's user namespace, would start gVisor's
+kernel there, and root in the service could do both.
+
+The price is what gVisor's host network stack lacks: firewall rules, raw and packet sockets, veth
+pairs and bridges. A network namespace made in the service has no interfaces, and configuring it
+(`ip link set lo up`) hangs. So Docker with bridge networking does not work in a gVisor service,
+nor do judges that bring the loopback up in a network namespace of their own, as nsjail and
+bubblewrap can; go-judge does work, since its namespaces never configure their loopback. Docker
+itself does work without a bridge: start `dockerd --bridge=none --iptables=false --ip6tables=false`
+(with `guest_cgroups`) and run its containers with `--network host`, which share the pod's
+loopback; with the iptables flags alone, `dockerd` exits as it fails to create its bridge. gVisor's
+own network stack would have all of these, but its loopback would then be gVisor's, not the pod's
+([Roadmap](roadmap.md)).
+
+### Users and files
+
+- Commands run as root of gVisor's kernel, which can switch to any user and give the files of its
+  root filesystem to any user, in a pod with either `users`: `run_as` takes `"root"`, the default,
+  or `"subids"`, which means the same there, and `"caller"` raises `ValueError`. On the host, every
+  process of the service and every file it writes is your uid's.
+- Its root filesystem is the node's gVisor template of its image, under gVisor's overlay, as for a
+  gVisor sandbox ([Root filesystem](gvisor.md#root-filesystem)): a start copies nothing, and
+  `overlay_size_mb` caps what it writes there. File owners manifests raise `ValueError`, as for
+  gVisor sandboxes.
+- Its `mounts` are bound in as a gVisor sandbox's are, so the pod's volumes, directories of the
+  host that you mount into several services, are shared with the other services: what one writes,
+  the others see. A target that the image lacks needs `mkdir` and `mount` in the image.
+- In a mount, your files are root's in the service. In a pod with `users="subids"`, the files that
+  other services wrote there as other users are `nobody`'s (65534) in the service, which can do
+  with them only what their mode allows others: it reads a file of mode 644, not one of mode 600.
+  A `chown` there gives no file another owner on the host, though gVisor reports success: what the
+  service writes stays your uid's.
+- Its `/etc/hosts`, which names the services and host aliases, and `/etc/resolv.conf` are the
+  pod's, bound read-only, and `/dev/shm` is a tmpfs of `shm_mb`. Transfers go through
+  `/.hpc-sandbox/transfer`, as in a gVisor sandbox.
+
+### Its command and commands
+
+- The service's command is the container's PID 1, started with the start protocol of the other
+  services: the image's environment, `HOME` and the spec's `env` reach it through its stdin, it
+  runs in its working directory with `/dev/null` as stdin, and its output goes through a pipe into
+  the service's log. A command's `kill -9 -1` spares it, as gVisor sandboxes' PID 1.
+- `exec`, transfers and health checks run with `runsc exec` from the host, with the service's
+  `ulimits`. A timeout kills the process groups of the command inside gVisor
+  ([Commands](gvisor.md#commands)).
+- When the command exits, runsc and the launcher exit with its status: `health()` says `exited`,
+  `exit_status` holds the status, and `exec` raises `SandboxLostError`.
+
+### Its limits
+
+- **`memory_mb`** arms the watchdog of gVisor sandboxes for the service: when gVisor's memory for
+  it exceeds the limit, the whole service stops, `memory_kills` records why, and `exec` raises
+  `SandboxLostError` ([Limits](gvisor.md#limits)). For a judge, that memory includes every program
+  it runs, its `/dev/shm` and gVisor's own, so size the limit for the judge's parallel runs.
+- **`cpus`** keeps the service to that many CPUs, which it sees as its own, chosen among those your
+  gVisor sandboxes and services on the node use least: unlike for the other services, it is not
+  advisory.
+- **`ulimits`** are the resource limits of the command and of every command entered with `exec`;
+  `nproc` and `locks` are accepted but not applied, as for the other services.
+- **`guest_cgroups`** (`"v1"` or `"v2"`, by default the `GvisorProvider`'s) mounts gVisor's own
+  cgroups for software that manages cgroups itself. They limit nothing on the host, and `"v2"`
+  enforces their `pids` limits.
+
+### Stopping
+
+With `service_stop_grace_s`, a pod's stop sends SIGTERM to the command with `runsc kill`. As in a
+Docker container, the command, which is PID 1, gets it only when it handles SIGTERM, as a shell
+with a `trap` does; otherwise it is killed when the grace period is over. The stop then kills the
+launcher, which takes runsc, its gofer and gVisor's kernel with it, and any process of yours whose
+arguments name the service's runsc state directory. A gVisor service dies with the process that
+started its pod. When only the pod's holder dies, gVisor's kernel keeps running, and keeps the
+pod's network, until the pod stops; meanwhile new calls raise `SandboxLostError`, while
+`memory_mb` still stops the service and a command that times out is still killed, as in the
+pod's other services. A janitor stops what
+runs of an abandoned gVisor service, whose owner record says `runtime: "gvisor"`, by the recorded
+identities of its launcher and of gVisor's kernel, without runsc.
+
+### Securebits
+
+Some judges set securebits before each program they run. go-judge sets `SECBIT_NOROOT`,
+`SECBIT_NO_SETUID_FIXUP`, their locks and `SECBIT_KEEP_CAPS_LOCKED`, so that the program cannot
+regain the capabilities it dropped by running as root or by running a set-user-ID-root file.
+gVisor accepts `SECBIT_KEEP_CAPS` and `SECBIT_NO_SETUID_FIXUP` alone and refuses the others with
+`EPERM`, so every program fails: `keep_capability: operation not permitted`.
+
+`securebits="ignore"` gives the service's container a seccomp filter, which runsc enforces with
+`--oci-seccomp`: `prctl(PR_SET_SECUREBITS, ...)` returns 0 and sets nothing. What it weakens,
+exactly:
+
+- In the service's gVisor kernel, a program that sets securebits believes they are set, and none
+  is. Without the filter, none is set either: the call fails, and so does the program. A process
+  that runs as root, or that runs a set-user-ID-root file, then regains every capability of its
+  user namespace when it runs a program, unless it set `no_new_privs`, as on Linux without these
+  bits. So the loss matters to software that relies on `SECBIT_NOROOT` without `no_new_privs`.
+  go-judge sets `no_new_privs` before each program: its programs, root of go-judge's own
+  namespaces inside gVisor, were measured without effective capabilities, with `no_new_privs` and
+  a seccomp filter, and what they run gets no capability back, so for them nothing measurable
+  changes.
+- `SECBIT_KEEP_CAPS` and `SECBIT_NO_SETUID_FIXUP`, which gVisor supports, are not set through
+  `PR_SET_SECUREBITS` either: software that sets them that way keeps fewer capabilities when it
+  switches users. `PR_SET_KEEPCAPS` and every other system call work as before.
+- The filter applies to the service's command, to what it starts, and to the commands entered with
+  `exec`. Nothing outside gVisor's kernel changes: gVisor's boundary with the host, and the
+  service's lack of capabilities over the pod's network, stay as they are.
+
+Set it only on the service whose software needs it. go-judge as root also needs cgroups to run:
+give its service `guest_cgroups="v2"`, which also enforces its programs' process limits.
+
 ## Lifetime
 
 `await pod.stop()`:
@@ -597,9 +812,10 @@ process that started the pod is killed.
 2. stops the health checks, and refuses new commands in the services; commands still running raise
    `SandboxError` when their service stops;
 3. when the provider's `service_stop_grace_s` is above 0 (it is 0 by default), sends SIGTERM to the
-   commands of the services that have one, through their inits, and waits up to that long for them
-   to exit;
-4. kills each service's init, which takes every process of the service with it;
+   commands of the services that have one, through their inits, or for a gVisor service with
+   `runsc kill`, and waits up to that long for them to exit;
+4. kills each service's init, which takes every process of the service with it, or a gVisor
+   service's launcher, which takes runsc and gVisor's kernel with it;
 5. in a pod with `users="subids"`, gives back to your uid what the services wrote as other users
    ([Subordinate ids](#subordinate-ids));
 6. stops slirp4netns and the holder;
@@ -613,8 +829,9 @@ stopped, it raises `SandboxError` and keeps the pod's files for a janitor, and a
 tries again. Services stop with their pod; a command that ends early ends only its service.
 
 Pods die with the process that started them, with either runtime: the kernel kills the holder, and
-each service's launcher and init, when that process exits, even by SIGKILL. What remains are files,
-which a janitor removes, giving back first what a `users="subids"` pod's other users left: a
+each service's launcher and init, or a gVisor service's runsc, when that process exits, even by
+SIGKILL. What remains are files, which a janitor removes, giving back first what a
+`users="subids"` pod's other users left: a
 provider's first start that finds the janitor lock free, `await provider.reap()`, or
 `hpc-sandbox janitor`; the last two take labels to limit the sweep to the pods that carry them ([Reaping and janitors](python-api.md#reaping-and-janitors)). With labels,
 `reap()` also stops the provider's own live pods whose labels include them. A pod's files are on the
@@ -631,6 +848,7 @@ scratch root, in `pods-singularity/` or `pods-enroot/`
 | slirp4netns ([Egress](#egress)), and a `/dev/net/tun` that users may open, as it usually is | egress |
 | a range of subordinate ids for your user in `/etc/subuid` and `/etc/subgid`, and shadow-utils' `newuidmap` and `newgidmap` (the `uidmap` package on Debian and Ubuntu) | pods with `users="subids"`, with Singularity CE and Apptainer ([Subordinate ids](#subordinate-ids)) |
 | `/bin/sh` in the image and, for a service without a command, what a sandbox needs in its image ([Image references](python-api.md#image-references)) | every service |
+| runsc and Singularity CE or Apptainer, as the gVisor provider needs them ([gVisor](gvisor.md#requirements)) | gVisor services ([gVisor services](#gvisor-services)) |
 
 `hpc-sandbox doctor` shows on its `pods: egress` line which slirp4netns pods would use, and, with
 Singularity, on its `pods: subordinate ids` line the ranges that pods with `users="subids"` would

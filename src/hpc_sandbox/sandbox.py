@@ -69,10 +69,12 @@ from .types import (
     SandboxSnapshot,
     SandboxSpec,
     SandboxStartError,
+    ServiceSpec,
 )
 
 if TYPE_CHECKING:
-    from .pods import SessionPod
+    from .gvisor import GvisorProvider
+    from .pods import PodService, SessionPod
     from .subids import SubordinateIds
 
 log = logging.getLogger(__name__)
@@ -232,7 +234,9 @@ class SessionProvider(Generic[S]):
 
     Subclasses set ``name``, ``capabilities``, ``images`` and ``sandbox_type``
     and implement :meth:`_extract` and :meth:`_stop_abandoned`; providers with
-    pods set ``service_type`` and list ``"pods"`` among their capabilities.
+    pods set ``service_type`` and list ``"pods"`` among their capabilities, and
+    run services with ``runtime="gvisor"`` through ``gvisor``, a
+    :class:`~hpc_sandbox.gvisor.GvisorProvider`, when they have one.
     """
 
     name: str
@@ -243,6 +247,8 @@ class SessionProvider(Generic[S]):
     # Each provider keeps its sessions apart: janitors only know their own runtime.
     sessions_directory = "sessions"
     service_type: Any = None
+    # What runs the pod services with runtime="gvisor": None for none.
+    gvisor: GvisorProvider | None = None
     # How long pod services get between SIGTERM and SIGKILL when their pod stops.
     service_stop_grace_s = 0.0
     slirp4netns_path: str | None = None
@@ -361,6 +367,32 @@ class SessionProvider(Generic[S]):
         if "pods" not in self.capabilities or self.service_type is None:
             raise ValueError(f"the {self.name} provider does not run pods")
 
+    def _take_gvisor(self, gvisor: GvisorProvider | None) -> None:
+        """Keep a pod provider's ``gvisor`` option, which runs its services with
+        ``runtime="gvisor"``: ``None``, or a :class:`~hpc_sandbox.gvisor.GvisorProvider`, which adds
+        the ``gvisor_services`` capability. Anything else raises ``TypeError``."""
+        from .gvisor import GvisorProvider
+
+        if gvisor is not None and not isinstance(gvisor, GvisorProvider):
+            raise TypeError(f"gvisor must be None or a GvisorProvider, not {type(gvisor).__name__}")
+        self.gvisor = gvisor
+        if gvisor is not None:
+            self.capabilities = self.capabilities | {"gvisor_services"}
+
+    def _service_type_for(self, spec: ServiceSpec) -> type[PodService]:
+        """The class of the pod services that run ``spec``: the provider's own, or gVisor's for
+        ``runtime="gvisor"``, which needs the provider's ``gvisor`` (else ``ValueError``)."""
+        if spec.runtime is None:
+            return self.service_type  # type: ignore[no-any-return]
+        if self.gvisor is None:
+            raise ValueError(
+                f"service {spec.name!r} asks for runtime='gvisor', but the {self.name} provider "
+                "has no gVisor to run it: create the provider with gvisor=GvisorProvider(...)"
+            )
+        from .gvisor import GvisorService
+
+        return GvisorService
+
     def _subordinate_ids(self) -> SubordinateIds:
         """Your subordinate ids and the tools that map them, for a pod with ``users="subids"``."""
         from . import subids
@@ -460,6 +492,10 @@ class SessionProvider(Generic[S]):
     async def _stop_abandoned_service(self, path: Path, record: dict[str, Any] | None) -> bool:
         if record is None:
             return False
+        if record.get("runtime") == "gvisor":  # a service of gVisor's (GvisorService)
+            from .gvisor import stop_abandoned
+
+            return await stop_abandoned(path, record)
         processes = []
         for role in ("init", "anchor"):  # the init first, so its parent can reap it
             pid, started = record.get(f"{role}_pid"), record.get(f"{role}_start_time")

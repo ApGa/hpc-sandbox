@@ -123,6 +123,27 @@ The provider keeps its host side to the same rules as the others, and:
   time) still matches and whose command line names the sandbox, or whose arguments name the
   session's own state directory.
 
+### gVisor pod services
+
+A pod service with `runtime="gvisor"` ([gVisor services](pods.md#gvisor-services)) gets what a
+gVisor sandbox gets, in the pod's network:
+
+- **No hold on the pod's network.** Its launcher runs runsc in a user namespace nested in the
+  pod's, which maps root alone, as a Singularity service's runtime runs: gVisor's kernel, and so
+  root in the service, holds no capability over the pod's network namespace. It can neither
+  reconfigure that network nor open raw or packet sockets there, even with `net_raw`, so it cannot
+  watch the other services' traffic. Without that namespace, runsc would start gVisor's kernel in
+  the pod's user namespace, which owns the network, and the service could do both: hpc-sandbox
+  always nests it.
+- **The shared loopback stays.** Its sockets are on the pod's loopback: the other services reach
+  every port it listens on, a judge's administration ports included, and it reaches theirs, as for
+  any two services of a pod ([Exposed ports](pods.md#exposed-ports)).
+- **`securebits="ignore"`** weakens what a program in the service locks in with securebits, inside
+  gVisor's kernel only: a process that runs as root, or runs a set-user-ID-root file, can regain
+  capabilities that the bits would have kept dropped, unless it set `no_new_privs`, as go-judge
+  does for its programs. The boundary between gVisor and the host does not change
+  ([Securebits](pods.md#securebits)).
+
 ## Reducing exposure
 
 - Use `network="none"` for code that needs no network, or a pod whose `upstreams` relay only the
@@ -133,7 +154,9 @@ The provider keeps its host side to the same rules as the others, and:
 - Give each job its own scratch root on job-local disk, so that what a job's sandboxes leave goes
   with the job.
 - For code that asks for root, mounts or other kernel features, prefer a
-  [gVisor](gvisor.md) sandbox to granting them on the host's kernel.
+  [gVisor](gvisor.md) sandbox, or a [gVisor service](pods.md#gvisor-services) in a pod, to granting
+  them on the host's kernel. For code you trust little, a pod can run every service in gVisor
+  ([Every service in gVisor](pods.md#every-service-in-gvisor)).
 - For code you do not trust at all, run it under an account that holds nothing else of value, or
   behind a stronger boundary, such as a virtual machine.
 

@@ -22,7 +22,7 @@ the [security model](security.md).
 | template | Singularity and gVisor: an image extracted once per node, which sandboxes copy, or use as an overlay's lower layer |
 | trash | a session root's `.trash/` directory, where stopped sessions wait for their deletion |
 | janitor | the sweep that stops and deletes the sessions of processes that died |
-| launcher | the small process (`anchor.py`) that creates the namespaces of an enroot sandbox or a pod service and runs its init, or that runs a gVisor sandbox's `runsc run` in its place |
+| launcher | the small process (`anchor.py`) that creates the namespaces of an enroot sandbox or a pod service and runs its init, or that runs a gVisor sandbox's `runsc run` in its place, or a gVisor pod service's in the pod's namespaces |
 | pod, holder | a group of services sharing one network; the holder is the process that owns that network |
 
 ## Overview
@@ -481,7 +481,8 @@ A sweep's result is a `JanitorReport`: the sessions it `stopped` (something stil
 A pod reuses this machinery. Its session, in `pods-singularity/` or `pods-enroot/`, holds the logs
 of its holder and of slirp4netns, in `services/` the session root of its services, and in
 `exposed/` the sockets through which the host reaches the ports it exposes: each service is a
-sandbox, started by the launcher in the pod's user and network namespaces. Stopping a pod stops
+sandbox, started by the launcher in the pod's user and network namespaces, on the pod's runtime or,
+with `runtime="gvisor"`, on gVisor ([gVisor services](pods.md#gvisor-services)). Stopping a pod stops
 its services, slirp4netns and the holder, then moves the pod's session, services and all, into the
 trash, to be deleted in the background like a sandbox's; a pod with `users="subids"` first gives
 back to your uid what its services wrote as other users. Janitors stop and remove abandoned pods
@@ -508,7 +509,7 @@ The package is in `src/hpc_sandbox/`:
 | `templates.py` | the node's templates, which Singularity and gVisor sandboxes start from: extraction, the users lock, and the deletion of abandoned extractions |
 | `gvisor.py` | `GvisorProvider`: the runsc command line, the bundle and its mount points, gVisor's overlay of the template, CPU choice, and its memory watchdog |
 | `enroot.py` | `EnrootProvider`: imports, the system configuration, and containers entered with `nsenter` |
-| `anchor.py` | the launcher, run as a script: the namespaces and the init of an enroot sandbox or a pod service, a gVisor sandbox's `runsc run`, and the owners that a file owners manifest gives an image's files |
+| `anchor.py` | the launcher, run as a script: the namespaces and the init of an enroot sandbox or a pod service, the `runsc run` of a gVisor sandbox or pod service, and the owners that a file owners manifest gives an image's files |
 | `pods.py` | pods and their services |
 | `holder.py` | the process that holds a pod's user and network namespaces, relays its upstreams and serves its exposed ports |
 | `subids.py` | your subordinate ids, and mapping them into a pod's user namespace with `newuidmap` and `newgidmap` |

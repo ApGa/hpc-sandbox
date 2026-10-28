@@ -42,6 +42,10 @@ only an up loopback, plus one container per service:
   process that started them; the pod's session directory holds the services'
   session directories, so the janitor removes pods whole, giving back what a
   ``subids`` pod's other users left first.
+- **gVisor services.** A service with ``runtime="gvisor"`` runs in gVisor,
+  through the ``gvisor`` option of the pod's provider, in the pod's network
+  (:class:`hpc_sandbox.gvisor.GvisorService`); the other services run as
+  above.
 """
 
 from __future__ import annotations
@@ -61,10 +65,11 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import AsyncIterator, Callable, Container, Mapping
+from collections.abc import AsyncIterator, Callable, Container, Coroutine, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Literal, Self, get_args
 
 from . import procfs, subids
 from .anchor import FILE_OWNERS_REPORT
@@ -72,6 +77,7 @@ from .process import kill_tree, run_process
 from .sandbox import SessionSandbox, check_env, check_file_owners, environment_script, poll
 from .sessions import Session, create_session, new_instance_name, trash_session_awaiting
 from .types import (
+    GUEST_CGROUPS,
     HealthCheck,
     PodNetwork,
     PodSpec,
@@ -80,6 +86,8 @@ from .types import (
     SandboxSnapshot,
     SandboxStartError,
     ServiceHealth,
+    ServiceRuntime,
+    ServiceSecurebits,
     ServiceSpec,
 )
 
@@ -159,6 +167,8 @@ EOF
 _GIVE_BACK_TIMEOUT_S = 600.0
 POD_USERS = ("single", "subids")
 RUN_AS = ("root", "caller", "subids")
+SERVICE_RUNTIMES: tuple[str, ...] = get_args(ServiceRuntime)
+SECUREBITS: tuple[str, ...] = get_args(ServiceSecurebits)
 APT_DROP_IN = 'APT::Sandbox::User "root";\n'
 APT_DROP_IN_NAME = "99hpc-sandbox-aptfix"
 _SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
@@ -264,6 +274,20 @@ def check_service(spec: ServiceSpec) -> None:
         raise ValueError("shm_mb must be positive")
     if spec.run_as not in RUN_AS:
         raise ValueError(f"run_as must be one of {RUN_AS}, not {spec.run_as!r}")
+    if spec.runtime is not None and spec.runtime not in SERVICE_RUNTIMES:
+        raise ValueError(f"runtime must be None or one of {SERVICE_RUNTIMES}, not {spec.runtime!r}")
+    if spec.securebits is not None and spec.securebits not in SECUREBITS:
+        raise ValueError(f"securebits must be None or one of {SECUREBITS}, not {spec.securebits!r}")
+    if spec.guest_cgroups is not None and spec.guest_cgroups not in GUEST_CGROUPS:
+        raise ValueError(
+            f"guest_cgroups must be None or one of {GUEST_CGROUPS}, not {spec.guest_cgroups!r}"
+        )
+    if spec.runtime is None:
+        for name in ("securebits", "guest_cgroups"):
+            if getattr(spec, name) is not None:
+                raise ValueError(
+                    f"{name} is a setting of gVisor services: it needs runtime='gvisor'"
+                )
     if spec.sandbox.file_owners is not None and spec.run_as != "subids":
         raise ValueError(
             "file_owners need run_as='subids': a service that runs as root alone or as your uid "
@@ -461,22 +485,15 @@ class SessionPod:
             raise ValueError(f"wait must be 'started' or 'healthy', not {wait!r}")
         if spec.name in self._names:
             raise ValueError(f"pod {self.id} already has a service named {spec.name!r}")
-        if spec.run_as not in self._provider.service_type.run_modes:
-            raise ValueError(
-                f"the {self._provider.name} provider runs services with run_as in "
-                f"{self._provider.service_type.run_modes}, not {spec.run_as!r}: its containers "
-                "map one id"
-            )
-        if spec.run_as == "subids" and self.spec.users != "subids":
-            raise ValueError("run_as='subids' needs a pod started with PodSpec(users='subids')")
-        self._provider._check(spec.sandbox, service=True)
+        service_type = self._provider._service_type_for(spec)
+        service_type._check_start(self, spec)
         if spec.sandbox.file_owners is not None:
             await asyncio.to_thread(check_file_owners, spec.sandbox.file_owners)
             self._require_running()
             if spec.name in self._names:  # taken while the manifest was read
                 raise ValueError(f"pod {self.id} already has a service named {spec.name!r}")
         self._names.append(spec.name)
-        task = asyncio.ensure_future(self._start_service(spec, wait))
+        task = asyncio.ensure_future(self._start_service(service_type, spec, wait))
         self._starting.add(task)
         try:
             return await task
@@ -791,12 +808,13 @@ class SessionPod:
 
     # Services.
 
-    async def _start_service(self, spec: ServiceSpec, wait: str) -> PodService:
+    async def _start_service(
+        self, service_type: type[PodService], spec: ServiceSpec, wait: str
+    ) -> PodService:
         provider = self._provider
-        service = provider.service_type(provider, self, spec)
+        service = service_type(provider, self, spec)
         await asyncio.to_thread(self._announce, spec.name)
-        image = await provider.images.resolve(spec.sandbox.image)
-        await service._boot(lambda session: provider._extract_service(image, session))
+        await service._boot(await service._populate())
         health = self._health[spec.name] = _Health()
         self._services[spec.name] = service
         try:
@@ -952,8 +970,12 @@ class SessionPod:
         grace = self._provider.service_stop_grace_s
         commands = [s for s in self._services.values() if s.service.command is not None]
         if grace > 0 and commands:  # an idle loop has nothing to finish
-            for service in commands:
-                service.terminate()
+            asked = await asyncio.gather(
+                *(service._terminate() for service in commands), return_exceptions=True
+            )
+            for service, outcome in zip(commands, asked, strict=True):
+                if isinstance(outcome, Exception):
+                    log.warning("pod %s: could not stop %s: %s", self.id, service.name, outcome)
             deadline = time.monotonic() + grace
             # Until the launchers report the statuses: the command exits before its status gets
             # up through the runtime's processes and the init, which a stop would kill.
@@ -1011,6 +1033,19 @@ class PodService(SessionSandbox):
     _tracked = False  # the pod tracks its services
     #: The ``run_as`` modes that the runtime can give a service.
     run_modes: tuple[str, ...] = RUN_AS
+
+    @classmethod
+    def _check_start(cls, pod: SessionPod, spec: ServiceSpec) -> None:
+        """Refuse, with ``ValueError``, a service that this runtime cannot start in ``pod``."""
+        provider = pod._provider
+        if spec.run_as not in cls.run_modes:
+            raise ValueError(
+                f"the {provider.name} provider runs services with run_as in {cls.run_modes}, not "
+                f"{spec.run_as!r}: its containers map one id"
+            )
+        if spec.run_as == "subids" and pod.spec.users != "subids":
+            raise ValueError("run_as='subids' needs a pod started with PodSpec(users='subids')")
+        provider._check(spec.sandbox, service=True)
 
     def __init__(self, provider: SessionProvider[Any], pod: SessionPod, service: ServiceSpec):
         super().__init__(provider, service.sandbox)  # type: ignore[arg-type]
@@ -1121,11 +1156,22 @@ class PodService(SessionSandbox):
     def _session_root(self) -> Path:
         return self.pod.services_root
 
+    async def _populate(self) -> Callable[[Session], Coroutine[Any, Any, None]]:
+        """Resolve the service's image; return what fills its session from it."""
+        provider = self._provider
+        image = await provider.images.resolve(self.spec.image)
+        return partial(provider._extract_service, image)
+
+    @property
+    def _writes_as_other_users(self) -> bool:
+        """Whether the service may leave files that your subordinate ids own on the host."""
+        return self.service.run_as == "subids"
+
     async def _discard(self, session: Session) -> None:
         if self.pod._stop_task is not None:  # the pod's deletion takes these files too
             session.release()
             return
-        if self.service.run_as == "subids":  # only such a service writes as other users
+        if self._writes_as_other_users:
             await self.pod._give_back(session.path)
         await super()._discard(session)
 
@@ -1220,7 +1266,7 @@ class PodService(SessionSandbox):
             }
             assert anchor.stdin is not None
             line = environment_script({"HOME": "/root", **self.spec.env})
-            await asyncio.to_thread(_write_and_close, anchor.stdin, line)
+            await asyncio.to_thread(write_and_close, anchor.stdin, line)
         finally:
             if anchor.stdin is not None and not anchor.stdin.closed:
                 anchor.stdin.close()
@@ -1384,7 +1430,7 @@ class PodService(SessionSandbox):
             "run_as": self.service.run_as,
         }
 
-    def terminate(self) -> None:
+    async def _terminate(self) -> None:
         """Ask the command to stop: SIGTERM to the init, which passes it on."""
         init = self._service_init
         if init is not None and procfs.owned_live_start_time(init) == self._service_init_start:
@@ -1645,7 +1691,7 @@ def _limit(value: int) -> str:
     return "unlimited" if value < 0 else str(value)
 
 
-def _write_and_close(stream: Any, data: bytes) -> None:
+def write_and_close(stream: Any, data: bytes) -> None:
     try:
         stream.write(data)
         stream.flush()
