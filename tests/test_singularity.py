@@ -195,6 +195,9 @@ async def test_spec_validation(provider, sif, tmp_path):
         await provider.start(SandboxSpec(image=str(sif), network="none"))
     with pytest.raises(ValueError, match="reserved"):
         await provider.start(SandboxSpec(image=str(sif), mounts=[Mount(str(tmp_path), "/tmp/x")]))
+    for target in ("//tmp/x", "//opt/x"):  # Linux reads '//tmp' as '/tmp'; PurePosixPath does not
+        with pytest.raises(ValueError, match="invalid mount target"):
+            await provider.start(SandboxSpec(image=str(sif), mounts=[Mount(str(tmp_path), target)]))
     with pytest.raises(ValueError, match="does not exist"):
         await provider.start(SandboxSpec(image=str(sif), mounts=[Mount("/nonexistent", "/data")]))
     with pytest.raises(ValueError, match="environment variable name"):

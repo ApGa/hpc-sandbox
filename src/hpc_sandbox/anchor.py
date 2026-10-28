@@ -5,6 +5,7 @@
     python -I -S anchor.py PARENT_PID NETWORK -- COMMAND [ARG...]
     python -I -S anchor.py PARENT_PID join HOLDER_PID [OPTION...] -- COMMAND [ARG...]
     python -I -S anchor.py PARENT_PID file-owners MANIFEST ROOTFS
+    python -I -S anchor.py PARENT_PID exec [--cpus LIST] -- COMMAND [ARG...]
 
 The first form starts a sandbox of its own. It
 
@@ -51,6 +52,12 @@ extraction gives every file to the caller, and a file owners manifest
 (:func:`read_file_owners`, which the package also uses to check one before
 anything starts) says which paths the image gives to other users
 (:func:`apply_file_owners`).
+
+The ``exec`` form arranges to be SIGKILLed when its parent dies, exits at once
+if that already happened, keeps to the CPUs that ``--cpus`` lists
+(``0,2-3``), if given, and then runs COMMAND in its own place: the gVisor
+provider's ``runsc run``, which makes namespaces of its own and whose sandbox
+dies with it (:mod:`hpc_sandbox.gvisor`).
 """
 
 from __future__ import annotations
@@ -502,7 +509,43 @@ def _wait(child: int) -> int:
     return os.WEXITSTATUS(status)
 
 
+def cpu_list(text: str) -> set[int]:
+    """The CPUs that a list such as ``0,2-3`` names; ``ValueError`` for anything else."""
+    cpus: set[int] = set()
+    for part in text.split(","):
+        first, dash, last = part.partition("-")
+        if not first.isdigit() or (dash and not last.isdigit()):
+            raise ValueError(f"invalid CPU list {text!r}")
+        cpus.update(range(int(first), int(last if dash else first) + 1))
+    return cpus
+
+
+def _exec(parent: int, argv: list[str]) -> int:
+    """The ``exec`` form: COMMAND in this process's place, dying with ``parent``."""
+    options, command = argv[: argv.index("--")], argv[argv.index("--") + 1 :]
+    cpus = None
+    while options:
+        option = options.pop(0)
+        if option == "--cpus" and options:
+            cpus = cpu_list(options.pop(0))
+        else:
+            raise OSError(22, f"unknown option {option}")
+    if not command:
+        raise OSError(22, "no command to run")
+    _die_with_parent()
+    if os.getppid() != parent:
+        return 1  # the parent died before PR_SET_PDEATHSIG took effect
+    if cpus is not None:
+        os.sched_setaffinity(0, cpus)
+    for ignored in (signal.SIGPIPE, signal.SIGXFSZ):  # ignored by Python, not by runtimes
+        signal.signal(ignored, signal.SIG_DFL)
+    os.execvp(command[0], command)
+    return 127  # not reached: execvp raises when it fails
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) >= 4 and argv[1] == "exec" and "--" in argv[2:]:
+        return _exec(int(argv[0]), argv[2:])
     if len(argv) >= 5 and argv[1] == "join" and "--" in argv[3:]:
         _die_with_parent()
         if os.getppid() != int(argv[0]):
@@ -520,7 +563,8 @@ def main(argv: list[str]) -> int:
         print(
             "usage: anchor.py PARENT_PID host|none -- COMMAND [ARG...]\n"
             "       anchor.py PARENT_PID join HOLDER_PID [OPTION...] -- COMMAND [ARG...]\n"
-            "       anchor.py PARENT_PID file-owners MANIFEST ROOTFS",
+            "       anchor.py PARENT_PID file-owners MANIFEST ROOTFS\n"
+            "       anchor.py PARENT_PID exec [--cpus LIST] -- COMMAND [ARG...]",
             file=sys.stderr,
         )
         return 2

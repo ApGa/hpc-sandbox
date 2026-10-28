@@ -25,6 +25,7 @@ from typing import Any
 
 from . import subids
 from .enroot import ANCHOR_SCRIPT, STANDARD_HOOKS, EnrootProvider
+from .gvisor import GvisorProvider
 from .images import DIGEST
 from .paths import in_batch_job
 from .process import run_process
@@ -55,7 +56,7 @@ _ENROOT_KEYS = (
     "ENROOT_TEMP_PATH",
 )
 _SHARED_FILESYSTEMS = {"lustre", "nfs", "nfs4", "gpfs", "beegfs", "cifs", "fuse.sshfs"}
-RUNTIMES = ("auto", "singularity", "enroot")
+RUNTIMES = ("auto", "singularity", "enroot", "gvisor")
 # How long a command waits for the deletions of the sessions it stopped before it exits.
 _DELETION_WAIT_S = 60.0
 
@@ -90,7 +91,8 @@ def _parser() -> argparse.ArgumentParser:
         # Empty counts as unset, as with the other HPC_SANDBOX_* variables.
         default=os.environ.get("HPC_SANDBOX_RUNTIME") or "auto",
         help="container runtime (default: $HPC_SANDBOX_RUNTIME, else auto: the one --binary "
-        "names, else the first of singularity, apptainer and enroot on PATH)",
+        "names, else the first of singularity, apptainer and enroot on PATH; gvisor runs only "
+        "when chosen)",
     )
     common.add_argument(
         "--binary", help="the runtime's executable, a name on PATH or a path (default: detect)"
@@ -109,7 +111,8 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="hpc-sandbox",
-        description="Rootless sandboxes for HPC clusters, on Singularity/Apptainer or enroot.",
+        description="Rootless sandboxes for HPC clusters, on Singularity/Apptainer, enroot or "
+        "gVisor.",
         epilog="Run 'hpc-sandbox COMMAND --help' for the options of a command.",
     )
     parser.add_argument(
@@ -143,8 +146,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "image",
         metavar="IMAGE",
-        help="a remote reference such as docker://alpine:3.20, or a local .sif (Singularity) or "
-        ".sqsh (enroot) file; @sha256:<hex> pins it",
+        help="a remote reference such as docker://alpine:3.20, or a local .sif (Singularity, "
+        "gVisor) or .sqsh (enroot) file; @sha256:<hex> pins it",
     )
     run.add_argument(
         "--workdir", default="/app", help="the command's working directory (default: /app)"
@@ -179,7 +182,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--allow-network-none",
         action="store_true",
-        help="let Singularity use --network none (enroot always can)",
+        help="let Singularity use --network none (enroot and gVisor always can)",
     )
     run.add_argument(
         "--memory-mb", type=int, help="memory limit in MiB, which the memory watchdog enforces"
@@ -227,8 +230,8 @@ def _parser() -> argparse.ArgumentParser:
         help="stop and remove abandoned sessions on this node",
         description="Stop and remove the sandboxes and pods that dead processes left on this "
         "node, and print a JSON report; exit with status 1 if it lists errors. Unless --runtime, "
-        "$HPC_SANDBOX_RUNTIME or --binary selects one runtime, it sweeps enroot's sessions, and "
-        "Singularity's when singularity or apptainer is on PATH.",
+        "$HPC_SANDBOX_RUNTIME or --binary selects one runtime, it sweeps enroot's and gVisor's "
+        "sessions, and Singularity's when singularity or apptainer is on PATH.",
     )
     janitor.add_argument(
         "--label",
@@ -242,11 +245,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def resolve_runtime(choice: str, binary: str | None = None) -> str:
-    """``singularity`` or ``enroot``: the explicit choice, else what ``binary`` or PATH has."""
+    """``singularity``, ``enroot`` or ``gvisor``: the explicit choice, else what ``binary`` names,
+    else what PATH has (never gVisor, which is opt-in)."""
     if choice != "auto":
         return choice
     if binary:
-        return "enroot" if Path(binary).name.startswith("enroot") else "singularity"
+        name = Path(binary).name
+        if name.startswith("runsc"):
+            return "gvisor"
+        return "enroot" if name.startswith("enroot") else "singularity"
     if any(shutil.which(candidate) for candidate in RUNTIME_CANDIDATES):
         return "singularity"
     return "enroot" if shutil.which("enroot") else "singularity"
@@ -260,8 +267,11 @@ def _provider(
         "scratch_root": args.scratch_root,
         "image_cache": args.image_cache,
     }
-    if resolve_runtime(args.runtime, args.binary) == "enroot":
+    runtime = resolve_runtime(args.runtime, args.binary)
+    if runtime == "enroot":
         return EnrootProvider(**common)
+    if runtime == "gvisor":
+        return GvisorProvider(**common)
     return SingularityProvider(**common, allow_network_none=allow_network_none)
 
 
@@ -355,13 +365,13 @@ def _janitor_runtimes(args: argparse.Namespace) -> list[str]:
     """The runtimes whose sessions a janitor sweeps, unless one is chosen.
 
     Singularity's when it is installed (stopping its instances needs it), and
-    always enroot's: its sandboxes die with their owners, so sweeping them
-    needs no enroot binary.
+    always enroot's and gVisor's: their sandboxes die with their owners, so
+    sweeping them needs neither enroot nor runsc.
     """
     if args.runtime != "auto" or args.binary:
         return [resolve_runtime(args.runtime, args.binary)]
     singularity = any(shutil.which(binary) for binary in RUNTIME_CANDIDATES)
-    return [*(["singularity"] if singularity else []), "enroot"]
+    return [*(["singularity"] if singularity else []), "enroot", "gvisor"]
 
 
 class _Report:
@@ -395,6 +405,8 @@ async def _doctor(args: argparse.Namespace) -> int:
     ]
     if isinstance(provider, EnrootProvider):
         await _enroot_checks(report, provider)
+    elif isinstance(provider, GvisorProvider):
+        await _gvisor_checks(report, provider)
     else:
         assert isinstance(runtime, ContainerRuntime)
         for key, value in (await site_config(runtime)).items():
@@ -415,12 +427,13 @@ async def _doctor(args: argparse.Namespace) -> int:
         if _reflink_works(provider.scratch_root)
         else "no (snapshots copy data)",
     )
-    try:
-        report.line("ok", "pods: egress", f"slirp4netns {provider.slirp4netns()}")
-    except SandboxError as error:
-        report.line("warn", "pods: egress", str(error))
-    if "subids" in provider.service_type.run_modes:  # enroot's containers map one id
-        report.line(*_subids_check())
+    if "pods" in provider.capabilities:
+        try:
+            report.line("ok", "pods: egress", f"slirp4netns {provider.slirp4netns()}")
+        except SandboxError as error:
+            report.line("warn", "pods: egress", str(error))
+        if "subids" in provider.service_type.run_modes:  # enroot's containers map one id
+            report.line(*_subids_check())
     if args.image:
         await _smoke(report, provider, args.image)
     return 1 if report.failures else 0
@@ -462,6 +475,57 @@ async def _enroot_checks(report: _Report, provider: EnrootProvider) -> None:
         report.line("warn", "sandbox hooks", f"{detail}; not enabled, so skipped: {missing}")
     else:
         report.line("ok", "sandbox hooks", detail)
+
+
+async def _gvisor_checks(report: _Report, provider: GvisorProvider) -> None:
+    helpers = provider.runtime.helpers
+    if helpers.is_dir():
+        report.line("ok", "runsc helpers", str(helpers))
+    else:
+        report.line(
+            "info",
+            "runsc helpers",
+            f"no {helpers}: releases that ship gvisor.tar need its gvisor-bin/ beside runsc",
+        )
+    images = provider.image_runtime
+    try:
+        report.line("ok", "images", f"{images.path} ({await images.version()})")
+    except SandboxError as error:
+        report.line("FAIL", "images", f"pulling and extracting SIF images needs: {error}")
+    argv = [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid()), "none", "--", "true"]
+    try:
+        probe = await run_process(argv, timeout_s=60)
+    except OSError as error:  # such as a fork refused at the process limit
+        report.line("FAIL", "user namespaces", f"could not run the probe: {error}")
+    else:
+        if probe.returncode == 0:
+            report.line("ok", "user namespaces", "unprivileged, as rootless runsc needs")
+        else:
+            report.line("FAIL", "user namespaces", probe.detail() or f"exit {probe.returncode}")
+    report.line(*await _runsc_do(provider))
+
+
+async def _runsc_do(provider: GvisorProvider) -> tuple[str, str, str]:
+    """Whether rootless runsc runs a command here, on the provider's platform: ``runsc do true``,
+    with a state directory of its own on the scratch root."""
+    where = provider.scratch_root if provider.scratch_root.is_dir() else None
+    with tempfile.TemporaryDirectory(prefix="doctor-runsc-", dir=where) as state:
+        try:
+            result = await provider.runtime.run(
+                "--rootless",
+                f"--root={state}",
+                f"--platform={provider.platform}",
+                "--network=none",
+                "do",
+                "true",
+                timeout_s=120,
+            )
+        except SandboxError as error:
+            return "FAIL", "rootless runsc", str(error)
+    if result.returncode != 0 or result.timed_out:
+        detail = result.detail() or f"exit {result.returncode}"
+        return "FAIL", "rootless runsc", f"runsc do true on {provider.platform}: {detail}"
+    return "ok", "rootless runsc", f"runsc do true on {provider.platform}"
 
 
 def _subids_check() -> tuple[str, str, str]:

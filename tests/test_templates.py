@@ -12,7 +12,7 @@ import pytest
 
 from conftest import make_provider
 from hpc_sandbox import SandboxSpec, procfs
-from hpc_sandbox.singularity import TEMPLATE_DIR, TEMPLATE_MARKER
+from hpc_sandbox.templates import TEMPLATE_DIR, TEMPLATE_MARKER
 
 
 async def test_sandboxes_of_one_image_share_one_extraction(tmp_path, sif, fake_runtime):

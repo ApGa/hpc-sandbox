@@ -90,14 +90,24 @@ class ImageFormat(Protocol):
 
 
 class SifImages:
-    """SIF images, validated with ``sif list`` and pulled by Singularity or Apptainer."""
+    """SIF images, validated with ``sif list`` and pulled by Singularity or Apptainer.
+
+    ``provider`` names the provider that runs them, in the error that refuses a squashfs image.
+    """
 
     name = "SIF"
     suffix = ".sif"
 
-    def __init__(self, runtime: ContainerRuntime, *, validate_timeout_s: float = 120.0) -> None:
+    def __init__(
+        self,
+        runtime: ContainerRuntime,
+        *,
+        validate_timeout_s: float = 120.0,
+        provider: str = "Singularity",
+    ) -> None:
         self.runtime = runtime
         self.validate_timeout_s = validate_timeout_s
+        self.provider = provider
 
     @property
     def tool(self) -> str:
@@ -111,11 +121,12 @@ class SifImages:
             path = local_path(reference)
             if path.suffix in SQUASHFS_SUFFIXES or file_magic(path, 0, 4) == SQUASHFS_MAGIC:
                 raise ValueError(
-                    f"{reference!r} is a squashfs image; the Singularity provider runs SIF images"
+                    f"{reference!r} is a squashfs image; the {self.provider} provider runs SIF "
+                    "images"
                 )
         elif DIGEST.sub("", reference).endswith(SQUASHFS_SUFFIXES):
             raise ValueError(
-                f"{reference!r} is a squashfs image; the Singularity provider runs SIF images"
+                f"{reference!r} is a squashfs image; the {self.provider} provider runs SIF images"
             )
         elif "://" in reference and not reference.startswith(_REMOTE_SCHEMES):
             scheme = reference.split("://", 1)[0]

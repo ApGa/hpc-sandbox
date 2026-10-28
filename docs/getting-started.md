@@ -14,11 +14,11 @@ this table list; the other rows are needed only for what they name:
 | Requirement | Needed for |
 |---|---|
 | Linux and Python 3.11 or later | everything |
-| Singularity CE or Apptainer, installed setuid or in user-namespace mode, or enroot 3.x | every sandbox: one of these runtimes on the compute nodes ([Singularity CE and Apptainer](singularity.md#requirements), [enroot](enroot.md#requirements)) |
+| Singularity CE or Apptainer, installed setuid or in user-namespace mode, or enroot 3.x, or gVisor's `runsc` with Singularity CE or Apptainer for its images | every sandbox: one of these runtimes on the compute nodes ([Singularity CE and Apptainer](singularity.md#requirements), [enroot](enroot.md#requirements), [gVisor](gvisor.md#requirements)) |
 | a directory on the node's local disk | every sandbox: the scratch root, which holds each sandbox's root filesystem ([Put the sandboxes on local disk](#put-the-sandboxes-on-local-disk)) |
 | an image with `/bin/sh` and the basic tools `sleep`, `mkdir`, `rmdir`, `rm`, `cp` and `dirname` | every sandbox ([Image references](python-api.md#image-references)) |
 | GNU coreutils and `find` | every sandbox: deleting it once it stopped, with `find` and `rm --one-file-system`, in the background under `nice -n 19`; and copies with `cp -a --reflink=auto` (snapshots, restores and Singularity's templates) |
-| unprivileged user namespaces | enroot sandboxes, pods with either runtime, and Singularity's fuse-overlay layout |
+| unprivileged user namespaces | enroot and gVisor sandboxes, pods, and Singularity's fuse-overlay layout |
 | enroot's `+caps` package, whose `enroot-aufs2ovlfs` converts layer whiteouts | importing images with enroot; local `.sqsh` files need none |
 | util-linux `nsenter` | every command in an enroot sandbox or a pod service, and a Singularity `fakeroot` sandbox's file owners manifest and snapshots ([File owners](python-api.md#file-owners)) |
 | util-linux `prlimit` | commands in pod services that set `ulimits` |
@@ -27,8 +27,9 @@ this table list; the other rows are needed only for what they name:
 | a range of subordinate ids for your user in `/etc/subuid` and `/etc/subgid`, and shadow-utils' `newuidmap` and `newgidmap` | pods with `users="subids"`, whose services can switch users, with Singularity CE and Apptainer ([Pods](pods.md#subordinate-ids)) |
 | `fuse-overlayfs`, `fusermount3` or `fusermount`, and `/dev/fuse` | Singularity's fuse-overlay layout; janitors need only `fusermount3` or `fusermount` ([Singularity CE and Apptainer](singularity.md#the-fuse-overlay-layout)) |
 
-`hpc-sandbox doctor` checks the runtime, the scratch root and the image cache on a node, and with
-enroot also the namespaces, `nsenter` and image imports
+`hpc-sandbox doctor` checks the runtime, the scratch root and the image cache on a node, with
+enroot also the namespaces, `nsenter` and image imports, and with gVisor also runsc's helpers, the
+runtime that pulls its images and user namespaces
 ([Check the installation](#check-the-installation)).
 
 ## Install

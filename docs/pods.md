@@ -5,8 +5,8 @@ sandbox next to the databases, tool servers or graders it reaches by name on fix
 service is a sandbox, with its own image, root filesystem and processes. The pod gives the services
 a network of their own: from outside the pod, only the ports you expose to the host reach it, and
 from it the services reach only each other and the host services you relay into it, unless you
-give the pod egress to other hosts. Both providers run pods (their `capabilities` include `pods`),
-with the same API.
+give the pod egress to other hosts. The Singularity and enroot providers run pods (their
+`capabilities` include `pods`), with the same API; the gVisor provider does not yet.
 
 ## An example
 

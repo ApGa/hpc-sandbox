@@ -25,7 +25,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from functools import partial
@@ -575,7 +575,14 @@ class SessionProvider(Generic[S]):
         check_env(spec.env)
         for mount in spec.mounts:
             target = PurePosixPath(mount.target)
-            if not target.is_absolute() or ".." in target.parts or target == PurePosixPath("/"):
+            # PurePosixPath keeps a leading '//', which Linux reads as '/': '//tmp' would pass
+            # the checks of reserved targets below and land on /tmp.
+            if (
+                not target.is_absolute()
+                or mount.target.startswith("//")
+                or ".." in target.parts
+                or target == PurePosixPath("/")
+            ):
                 raise ValueError(f"invalid mount target {mount.target!r}")
             if any(
                 target == PurePosixPath(r) or PurePosixPath(r) in target.parents
@@ -671,11 +678,14 @@ class SessionSandbox:
     Subclasses implement :meth:`_prepare_rootfs`, :meth:`_start_container`,
     :meth:`_spawn`, :meth:`_container_alive`, :meth:`_stop_container` and
     :meth:`_identity`, and may override :meth:`_watch_root`,
-    :meth:`_apply_file_owners` and :meth:`_snapshot_copy`.
+    :meth:`_apply_file_owners`, :meth:`_snapshot_copy` and
+    :meth:`_memory_watchdog`.
     """
 
     probe_hint = ""
     _tracked = True  # listed in the provider's sandboxes
+    #: Where the sandbox sees the session's transfer directory (``tmp/.hpc-sandbox-transfer``).
+    _transfer_target = f"/tmp/{TRANSFER_DIR}"
 
     def __init__(self, provider: SessionProvider[Any], spec: SandboxSpec) -> None:
         self.id = new_instance_name()
@@ -992,16 +1002,21 @@ class SessionSandbox:
             provider._sandboxes.add(self)
         if self.spec.memory_mb:
             self._watchdog = asyncio.create_task(
-                memory.watch(
-                    self.spec.memory_mb * 1024 * 1024,
-                    instance_pid=self._watch_root,
-                    exec_roots=self._exec_roots,
-                    on_kill=self._on_memory_kill,
-                    interval_s=provider.memory_poll_s,
-                    container_pid=self._container_pid,
-                    protected=lambda: self._protected,
-                )
+                self._memory_watchdog(self.spec.memory_mb * 1024 * 1024)
             )
+
+    def _memory_watchdog(self, limit_bytes: int) -> Coroutine[Any, Any, None]:
+        """What the watchdog task of a sandbox whose spec sets ``memory_mb`` runs: by default the
+        watchdog that kills the branch of processes holding the memory (:func:`memory.watch`)."""
+        return memory.watch(
+            limit_bytes,
+            instance_pid=self._watch_root,
+            exec_roots=self._exec_roots,
+            on_kill=self._on_memory_kill,
+            interval_s=self._provider.memory_poll_s,
+            container_pid=self._container_pid,
+            protected=lambda: self._protected,
+        )
 
     def _record(self) -> None:
         assert self._session is not None
@@ -1094,10 +1109,11 @@ class SessionSandbox:
 
     @asynccontextmanager
     async def _transfer(self) -> AsyncIterator[tuple[int, str]]:
-        """A fresh directory in the sandbox's /tmp: a host descriptor and its path inside.
+        """A fresh directory in the transfer directory: a host descriptor and its path inside.
 
-        Code in the sandbox can replace anything below its /tmp at any time,
-        so the host side only works through descriptors (see :mod:`safefs`).
+        Code in the sandbox can replace that directory, or anything in it, at
+        any time, so the host side only works through descriptors (see
+        :mod:`safefs`).
         """
         assert self._session is not None
         tmp, token = self._session.tmp, uuid.uuid4().hex
@@ -1111,7 +1127,7 @@ class SessionSandbox:
                 f"sandbox {self.id}: could not prepare a transfer: {error}"
             ) from error
         try:
-            yield staging, f"/tmp/{TRANSFER_DIR}/{token}"
+            yield staging, f"{self._transfer_target}/{token}"
         finally:
             os.close(staging)
             try:

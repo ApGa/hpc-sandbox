@@ -57,3 +57,71 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -v -ra
+
+  # The gVisor provider against a real runsc (tests/test_gvisor_integration.py, and the integration
+  # tests of every provider), with Apptainer for its SIF images. Both come from their releases,
+  # checked against the checksums pinned here; the runsc release is the one the provider was
+  # measured with. tests/test_gvisor.py runs in the test job.
+  gvisor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GVISOR_RELEASE: "20261026.0"
+      GVISOR_SHA512: 26e4a327565f5da0f73261a6387e2c20f4695a232e330095a3111b70efd604fdf09d734e8cc8f714dbb5c5607ce8c87ea80b26df549d83a146f2efd5a1af448a
+      APPTAINER_VERSION: "1.5.5"
+      APPTAINER_SHA256: 25095d3711504b3e8657dbb2e172ef8db9db43c4503d940c9c36b105db8dce77
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Rootless runsc makes a user namespace, which Ubuntu 24.04 restricts with AppArmor.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # gvisor.tar holds runsc and the gvisor-bin/ helpers it needs beside it. The published
+      # SHA-512 must match, and so must the one pinned above.
+      - name: Install runsc
+        run: |
+          directory="$RUNNER_TEMP/gvisor"
+          url="https://storage.googleapis.com/gvisor/releases/release/$GVISOR_RELEASE/x86_64"
+          mkdir -p "$directory"
+          cd "$directory"
+          curl -fsSL -o gvisor.tar.bz2 "$url/gvisor.tar.bz2"
+          curl -fsSL -o gvisor.tar.bz2.sha512 "$url/gvisor.tar.bz2.sha512"
+          sha512sum -c gvisor.tar.bz2.sha512
+          echo "$GVISOR_SHA512  gvisor.tar.bz2" | sha512sum -c -
+          tar -xjf gvisor.tar.bz2
+          echo "$directory" >> "$GITHUB_PATH"
+
+      - name: Install Apptainer
+        run: |
+          deb="apptainer_${APPTAINER_VERSION}_amd64.deb"
+          url="https://github.com/apptainer/apptainer/releases/download/v$APPTAINER_VERSION/$deb"
+          curl -fsSL -o "$RUNNER_TEMP/$deb" "$url"
+          echo "$APPTAINER_SHA256  $RUNNER_TEMP/$deb" | sha256sum -c -
+          sudo apt-get update -q
+          sudo apt-get install -y -q "$RUNNER_TEMP/$deb"
+
+      - name: Check that rootless runsc runs
+        run: |
+          runsc --version
+          runsc --rootless --network=none --root "$RUNNER_TEMP/runsc-state" do true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # Starts a sandbox with runsc run, as the provider does, beyond runsc do.
+      - name: Check the node with doctor
+        run: uv run hpc-sandbox doctor --runtime gvisor --image docker://alpine:3.20
+
+      - name: Run the integration tests with gVisor
+        env:
+          HPC_SANDBOX_INTEGRATION: "1"
+          HPC_SANDBOX_TEST_RUNTIME: gvisor
+        run: uv run pytest tests/test_gvisor_integration.py tests/test_integration.py -v -ra

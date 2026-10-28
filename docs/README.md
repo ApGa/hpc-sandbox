@@ -18,6 +18,8 @@ sandbox and batch scripts.
   layouts and templates, and site notes.
 - [enroot](enroot.md): `EnrootProvider`: imports, namespaces, what enroot may add, restores, and
   site notes.
+- [gVisor](gvisor.md): `GvisorProvider`, opt-in: root that stays in gVisor's kernel, what works in
+  a sandbox and what does not, its overlay, limits and site notes.
 
 ## Reference
 

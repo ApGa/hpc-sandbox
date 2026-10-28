@@ -6,10 +6,12 @@ sandboxes on the job's local disk, and pulled images in a cache below your home 
 
 ## Provider options
 
-`SingularityProvider(**options)` and `EnrootProvider(**options)` take keyword arguments only, and
-every option has a default. `EnrootProvider` also accepts the option names of `SingularityProvider`,
-so one set of options works for both runtimes; see
-[Singularity option names on enroot](#singularity-option-names-on-enroot).
+`SingularityProvider(**options)`, `EnrootProvider(**options)` and `GvisorProvider(**options)` take
+keyword arguments only, and every option has a default. `EnrootProvider` also accepts the option
+names of `SingularityProvider`, so one set of options works for both runtimes; see
+[Singularity option names on enroot](#singularity-option-names-on-enroot). `GvisorProvider` takes
+the options of its own table and some of the shared ones, and raises `TypeError` for the others,
+such as `allow_network_none` or `fakeroot`; see [`GvisorProvider` options](#gvisorprovider-options).
 
 ### Options of both providers
 
@@ -53,6 +55,27 @@ copy layout.
 | `remap_root` | `True` | Run commands as root of the sandbox's user namespace (enroot's `--root`), which is your uid outside it. `False` runs them as your uid. |
 | `gpus` | `None` | Enables enroot's NVIDIA hook and adds the `gpu` capability. `"all"` passes every GPU this process may use (inside a Slurm allocation, the allocated ones); a list such as `"0,1"` selects GPUs numbered as the job sees them, like `CUDA_VISIBLE_DEVICES`, not by the host's indices. The installation's `98-nvidia.sh` hook must be enabled, or a start raises `SandboxError`. |
 | `import_env` | `()` | Extra variables passed to `enroot import`: names, or prefixes ending in `*` such as `"AWS_*"`. Imports get only the variables pulling needs otherwise; see [enroot](enroot.md). |
+
+### `GvisorProvider` options
+
+`GvisorProvider` takes `scratch_root`, `image_cache`, `stage_images`, `default_timeout_s`,
+`start_timeout_s`, `stop_timeout_s`, `bind_resolv_conf`, `output_limit_bytes` and `memory_poll_s` as
+the table of [options of both providers](#options-of-both-providers) describes them, and these:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `binary` | `runsc` | runsc, a name on `PATH` or a path, with its release's `gvisor-bin/` beside it. It is looked up when first needed, and never downloaded ([Installing runsc](gvisor.md#installing-runsc)). |
+| `singularity_binary` | `singularity`, else `apptainer` | The Singularity CE or Apptainer that pulls SIF images and extracts them into the node's templates. |
+| `platform` | `"systrap"` | gVisor's platform: `"systrap"`, `"ptrace"`, or `"kvm"` where the job may open `/dev/kvm`. Any other value raises `ValueError`. |
+| `host_uds` | `None` | Let sandboxes use the Unix sockets of the host on their mounts: `"open"` connects to them, `"create"` makes ones that host processes connect to, `"all"` allows both. |
+| `net_raw` | `False` | Allow raw and packet sockets in sandboxes (`--net-raw --allow-packet-socket-write`), and keep `CAP_NET_RAW`, for tools such as `ping` and packet capture. |
+| `guest_cgroups` | `None` | `"v1"` or `"v2"` mounts gVisor's own cgroups at `/sys/fs/cgroup` in each sandbox, for software that manages cgroups, such as Docker; they enforce no memory or CPU limit, and `"v2"` enforces their `pids` limits. |
+| `overlay_size_mb` | `None` | Caps what each sandbox writes to its root filesystem, `/tmp` and `/var/tmp` included, in MiB (gVisor's `--overlay2=...,size=`); writes past it fail with `ENOSPC`. `None` leaves it to the scratch filesystem. It does not cap writes to the transfer directory or to read-write mounts, which are directories of the host. A value that is not a positive integer raises `ValueError`. |
+| `extra_start_args` | `()` | Extra runsc options for each `runsc run`, after the provider's own. |
+
+A start on a scratch root whose path contains `,` or `:`, which runsc's options would misread,
+raises `ValueError`; janitors sweep such a root. `cpus` keeps each sandbox to as many CPUs, and
+`memory_mb` stops a sandbox whole ([gVisor](gvisor.md#limits)).
 
 ### Singularity option names on enroot
 
@@ -102,16 +125,18 @@ records.
 |---|---|---|
 | `sessions/` | One directory per Singularity sandbox, `hpcsb-` and 32 hexadecimal digits, with its root filesystem, its `/tmp` and `/var/tmp`, and an owner record. | By `stop()` or a janitor. |
 | `sessions-enroot/` | The same, for enroot sandboxes. | By `stop()` or a janitor. |
+| `sessions-gvisor/` | The same, for gVisor sandboxes, whose root filesystem is an overlay of the node's gVisor template ([gVisor](gvisor.md#root-filesystem)). | By `stop()` or a janitor. |
 | `pods-singularity/`, `pods-enroot/` | One directory per pod, holding its services' sessions and the sockets of its exposed ports. | By `pod.stop()` or a janitor. |
 | `snapshots/` | One directory per snapshot, `snap-` and 32 hexadecimal digits. | By `delete_snapshot()`. |
 | `images/` | Staged image files; see [Image staging](#image-staging). | Never. |
 | `templates/` | Root filesystems extracted once per image, for Singularity's templates. | Never; janitors delete extractions cut short. |
+| `templates-gvisor/` | The same for gVisor sandboxes, whose read-only lower layers they are, with the provider's mount points in `.hpc-sandbox/` ([gVisor](gvisor.md#root-filesystem)). | Never; janitors delete extractions cut short. |
 | `runtime-tmp/`, `runtime-cache/` | The runtime's temporary and cache files; see [The runtime's temporary and cache directories](#the-runtimes-temporary-and-cache-directories). | Never. |
 | `enroot-config/`, `enroot-sysconf/`, `enroot-tools/` | The enroot configuration sandboxes start with, and a helper that imports run. | Never. |
 
-Each session root (`sessions/`, `sessions-enroot/` and the pod directories) also holds a janitor
-lock, a deletion lock and a `.trash` directory, through which stopped sessions pass on their way to
-deletion; [Architecture](architecture.md) describes them.
+Each session root (`sessions/`, `sessions-enroot/`, `sessions-gvisor/` and the pod directories)
+also holds a janitor lock, a deletion lock and a `.trash` directory, through which stopped sessions
+pass on their way to deletion; [Architecture](architecture.md) describes them.
 
 A scratch root that belongs to a job goes with the job. One that outlives jobs keeps staged images
 and templates for every image version used on the node: remove them when no job of yours uses the
@@ -196,21 +221,22 @@ containers even with `--cleanenv`, and whose URLs may hold credentials. Give the
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `HPC_SANDBOX_SCRATCH` | Both providers, every command but `fetch-tools` | The scratch root when no `scratch_root` or `--scratch-root` is given; see [The scratch root](#the-scratch-root). |
-| `HPC_SANDBOX_IMAGE_CACHE` | Both providers, every command but `fetch-tools` | The image cache when no `image_cache` or `--image-cache` is given. |
-| `HPC_SANDBOX_RUNTIME` | The command line | The default of `--runtime`: `auto`, `singularity` or `enroot`. An empty value counts as unset; with any other value, `doctor`, `run`, `pull` and `janitor` exit with status 2 unless `--runtime` is given. The Python API does not read it. |
+| `HPC_SANDBOX_SCRATCH` | Every provider, every command but `fetch-tools` | The scratch root when no `scratch_root` or `--scratch-root` is given; see [The scratch root](#the-scratch-root). |
+| `HPC_SANDBOX_IMAGE_CACHE` | Every provider, every command but `fetch-tools` | The image cache when no `image_cache` or `--image-cache` is given. |
+| `HPC_SANDBOX_RUNTIME` | The command line | The default of `--runtime`: `auto`, `singularity`, `enroot` or `gvisor`. An empty value counts as unset; with any other value, `doctor`, `run`, `pull` and `janitor` exit with status 2 unless `--runtime` is given. The Python API does not read it. |
 | `HPC_SANDBOX_ROOTFS_LAYOUT` | `SingularityProvider` | The default of `rootfs_layout`, for a whole job: `copy` or `fuse-overlay`. Another value raises `ValueError`. A provider whose options need the copy layout stays on it, and `EnrootProvider` ignores the variable. |
 | `HPC_SANDBOX_TOOLS` | Pods, `hpc-sandbox fetch-tools` | Where `fetch-tools` puts the slirp4netns it downloads, and where pods look for it; default `${XDG_CACHE_HOME:-~/.cache}/hpc-sandbox/tools`. |
 | `HPC_SANDBOX_REAL_AUFS2OVLFS` | Internal | Set by `EnrootProvider` in the environment of `enroot import`, for the whiteout converter it wraps. Never read from yours. |
 | `HPC_SANDBOX_INTEGRATION` | Tests only | `1` runs the integration tests, which need a compute node with a container runtime. |
-| `HPC_SANDBOX_TEST_RUNTIME` | Tests only | The runtime of the integration tests: `singularity`, `enroot`, or `auto` (the default). |
+| `HPC_SANDBOX_TEST_RUNTIME` | Tests only | The runtime of the integration tests: `singularity`, `enroot`, `gvisor`, or `auto` (the default, which never picks gVisor). gVisor's own integration tests are a file of their own, which runs where `runsc` is on `PATH`. |
+| `HPC_SANDBOX_TEST_GVISOR_PLATFORM` | Tests only | The platform of the integration tests with gVisor; default `systrap`. |
 | `HPC_SANDBOX_TEST_IMAGE` | Tests only | The image of the integration tests; default `docker://alpine:3.20`. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | Tests only | `1` also tests `network="none"` with Singularity, where the site allows it. enroot always tests it. |
 | `HPC_SANDBOX_TEST_FAKEROOT` | Tests only | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user. |
 | `HPC_SANDBOX_TEST_FILE_OWNERS_IMAGE` | Tests only | The image of the integration tests of file owners manifests, which run with `HPC_SANDBOX_TEST_FAKEROOT=1` or `HPC_SANDBOX_TEST_SUBIDS=1` and list the owners that the layers of `node:20-alpine` give; default `docker://node:20-alpine`. |
 | `HPC_SANDBOX_TEST_GPUS` | Tests only | Tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | Tests only | The image of the pod integration tests' services; default `docker://alpine:3.20`. |
-| `HPC_SANDBOX_TEST_APT_IMAGE` | Tests only | The image of the pod integration test that runs apt; default `docker://python:3.12-slim`. |
+| `HPC_SANDBOX_TEST_APT_IMAGE` | Tests only | The image of the integration tests that run apt, of pods and of gVisor, and of gVisor's test of host Unix sockets; default `docker://python:3.12-slim`. |
 | `HPC_SANDBOX_TEST_REDIS_IMAGE`, `HPC_SANDBOX_TEST_POSTGRES_IMAGE` | Tests only | The database images that the pod integration tests run as each `run_as`, with their entrypoints; default `docker://redis:7-alpine` and `docker://postgres:16-alpine`. |
 | `HPC_SANDBOX_TEST_SUBIDS` | Tests only | `1` also tests pods with `users="subids"`, with Singularity, where your user has subordinate ids that `newuidmap` and `newgidmap` map. |
 | `HPC_SANDBOX_TEST_PODS` | Tests only | How many pods the pod integration tests start at once; default 16. |

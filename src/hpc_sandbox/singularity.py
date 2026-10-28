@@ -73,7 +73,6 @@ import signal
 import stat
 import sys
 import time
-import uuid
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path, PurePosixPath
@@ -91,10 +90,16 @@ from .sandbox import (
     SNAPSHOT_FORMAT,
     SessionProvider,
     SessionSandbox,
-    make_owner_writable,
     poll,
 )
-from .sessions import Session, leased, remove_tree
+from .sessions import Session, leased
+from .templates import (
+    TEMPLATE_DIR,
+    extract_image,
+    remove_abandoned_extractions,
+    rootfs_template,
+    template_ready,
+)
 from .types import SandboxError, SandboxSnapshot, SandboxStartError
 
 log = logging.getLogger(__name__)
@@ -111,8 +116,6 @@ done
 """
 PID_FILE = "instance.pid"
 CONTROL_LOCK = ".instance-control.lock"
-TEMPLATE_DIR = "templates"
-TEMPLATE_MARKER = ".complete"
 ROOTFS_LAYOUTS = ("copy", "fuse-overlay")
 # How extra_start_args may ask for --fakeroot.
 _FAKEROOT_FLAGS = ("--fakeroot", "-f")
@@ -130,10 +133,6 @@ OVERLAY_SNAPSHOT_FORMAT = "hpc-sandbox/fuse-overlay-v1"
 OVERLAY_FSTYPE = "fuse.fuse-overlayfs"
 OVERLAY_DAEMON = "fuse-overlayfs"
 _SESSION_ROOTFS = re.compile(r".*/hpcsb-[0-9a-f]{32}(\.[0-9]+-[0-9]+\.[0-9a-f]{8})?/rootfs")
-# An extraction of a template, or a damaged template moved aside, by process PID started at START.
-_EXTRACTION = re.compile(
-    r"\.(?P<key>.+)\.(?P<pid>[0-9]+)-(?P<start>[0-9]+)\.[0-9a-f]{8}(?P<damaged>\.damaged)?"
-)
 _PID_WAIT_S = 5.0
 _UNMOUNT_TIMEOUT_S = 30.0
 # How long giving back the files of a stopped --fakeroot sandbox may take: it walks the whole
@@ -335,7 +334,7 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
         if (
             lower.name != "rootfs"
             or lower.parent.parent != templates
-            or not _template_ready(lower.parent)
+            or not template_ready(lower.parent)
         ):
             raise ValueError(
                 f"snapshot {snapshot.id} lies over {str(lower)!r}, which is not a template of this "
@@ -351,66 +350,21 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
             await self.copy_tree(source / name, target)
 
     async def _extract_into(self, image: ResolvedImage, rootfs: Path) -> None:
-        result = await self.runtime.run(
-            "build",
-            "--sandbox",
-            "--fix-perms",
-            str(rootfs),
-            str(image.path),
-            timeout_s=self.start_timeout_s,
-        )
-        if result.returncode != 0 or result.timed_out:
-            raise SandboxStartError(f"could not extract {image.path}: {result.detail()}")
-        await asyncio.to_thread(make_owner_writable, rootfs)
+        await extract_image(self.runtime, image, rootfs, timeout_s=self.start_timeout_s)
 
     async def _rootfs_template(self, image: ResolvedImage) -> Path:
-        """This node's extracted root filesystem of ``image``, which copy layout
-        sandboxes copy and fuse-overlay sandboxes mount as their lower layer.
-
-        Extracted once per image file, under a lock per image, and published by
-        a rename once complete. Like a staged image, a template is trusted later
-        when it is a private directory of this uid holding its marker; one that
-        lost it (to an age-based cleaner, or a removal cut short) is moved aside
-        and extracted again. No sandbox writes to a template: a copy (reflinked
-        where the filesystem can) is the sandbox's own, and an overlay writes
-        to its upper layer.
-        """
-        key = f"sha256-{image.sha256}" if image.sha256 else _stat_name(image.path)
-        root = self.scratch_root / TEMPLATE_DIR
-        final = root / key
-        if _template_ready(final):
-            return final / "rootfs"
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        damaged = None
-        async with locked(root / f"{key}.lock"):
-            if _template_ready(final):
-                return final / "rootfs"
-            if os.path.lexists(final):
-                damaged = root / f"{_extraction_name(key)}.damaged"
-                os.rename(final, damaged)
-            work = root / _extraction_name(key)
-            work.mkdir(mode=0o700)
-            try:
-                await self._extract_into(image, work / "rootfs")
-                marker = {
-                    "image": str(image.path),
-                    "reference": image.reference,
-                    "sha256": image.sha256,
-                }
-                (work / TEMPLATE_MARKER).write_text(json.dumps(marker, sort_keys=True) + "\n")
-                os.rename(work, final)
-            except BaseException:
-                await asyncio.shield(asyncio.to_thread(remove_tree, work))
-                raise
-        if damaged is not None:  # unless an overlay still uses it: then a janitor deletes it later
-            for error in await asyncio.to_thread(_remove_extractions, [damaged]):
-                log.warning("hpc-sandbox: %s", error)
-        return final / "rootfs"
+        """This node's extracted root filesystem of ``image``, which copy layout sandboxes copy and
+        fuse-overlay sandboxes mount as their lower layer (:func:`rootfs_template`)."""
+        return await rootfs_template(
+            image, self.scratch_root / TEMPLATE_DIR, self._extract_into, in_use=_overlay_layers
+        )
 
     async def _sweep_node(self) -> list[str]:
         errors = await unmount_dead_overlays()
         templates = self.scratch_root / TEMPLATE_DIR
-        return errors + await asyncio.to_thread(_remove_abandoned_extractions, templates)
+        return errors + await asyncio.to_thread(
+            remove_abandoned_extractions, templates, _overlay_layers
+        )
 
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
         if record is not None and record.get("instance_pid_file") != str(path / PID_FILE):
@@ -960,44 +914,6 @@ def _overlay_layers() -> list[Path]:
     return layers
 
 
-def _extraction_name(key: str) -> str:
-    """A name for an extraction of template ``key`` by this process, or a damaged template it moved
-    aside."""
-    return f".{key}.{os.getpid()}-{procfs.start_time(os.getpid())}.{uuid.uuid4().hex[:8]}"
-
-
-def _remove_abandoned_extractions(root: Path) -> list[str]:
-    """Delete the extractions in ``root`` whose process died, and the damaged templates; returns
-    errors."""
-    try:
-        names = [entry.name for entry in os.scandir(root)]
-    except OSError:
-        return []
-    abandoned = []
-    for name in names:  # damaged templates once unused, whoever moved them aside
-        match = _EXTRACTION.fullmatch(name)
-        if match and (
-            match["damaged"] or not procfs.identity_matches(int(match["pid"]), match["start"])
-        ):
-            abandoned.append(root / name)
-    return _remove_extractions(abandoned) if abandoned else []
-
-
-def _remove_extractions(paths: list[Path]) -> list[str]:
-    """Delete these extractions, but none that a fuse-overlayfs still uses; returns errors."""
-    layers = _overlay_layers()
-    errors = []
-    for path in paths:
-        real = Path(os.path.realpath(path))  # as /proc names open directories
-        if any(layer == real or real in layer.parents for layer in layers):
-            continue
-        try:
-            remove_tree(path)
-        except (OSError, SandboxError) as error:
-            errors.append(f"could not delete {path}: {error}")
-    return errors
-
-
 class SingularityService(PodService, SingularitySandbox):
     """A pod service as a long-lived ``singularity exec``; start it with ``pod.start_service``.
 
@@ -1063,27 +979,6 @@ class SingularityService(PodService, SingularitySandbox):
     def _runtime_environment(self) -> dict[str, str]:
         environment = self._runtime.environment()
         return {k: v for k, v in environment.items() if k not in PASSED_DESPITE_CLEANENV}
-
-
-def _template_ready(path: Path) -> bool:
-    """Whether ``path`` is a complete template: a private directory of this uid with its marker."""
-    try:
-        info = path.lstat()
-    except OSError:
-        return False
-    return (
-        stat.S_ISDIR(info.st_mode)
-        and info.st_uid == os.getuid()
-        and not stat.S_IMODE(info.st_mode) & 0o077
-        and (path / TEMPLATE_MARKER).is_file()
-        and (path / "rootfs").is_dir()
-    )
-
-
-def _stat_name(path: Path) -> str:
-    """A template name for an image file whose digest is unknown: its stat identity."""
-    info = path.stat()  # a rewrite in place can keep the size and mtime; the ctime changes
-    return f"stat-{info.st_dev}-{info.st_ino}-{info.st_size}-{info.st_mtime_ns}-{info.st_ctime_ns}"
 
 
 def make_mount_point(rootfs: Path, target: str, *, directory: bool) -> None:

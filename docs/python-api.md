@@ -36,21 +36,21 @@ the files afterwards, and `wait_for_deletions()` waits for it (see
 
 ## Providers
 
-A provider starts, restores and reaps sandboxes on one container runtime. Both providers take
+A provider starts, restores and reaps sandboxes on one container runtime. Every provider takes
 keyword arguments only, and their defaults suit a batch job;
 [Configuration](configuration.md#provider-options) lists every option.
 
-| | `SingularityProvider` | `EnrootProvider` |
-|---|---|---|
-| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x, unprivileged |
-| Images | SIF files, pulled with `singularity pull` | squashfs files, imported with `enroot import` |
-| Commands run as | your uid | root of the sandbox's user namespace, which is your uid outside (`remap_root=False`: your uid) |
-| Each command | one `singularity exec` | `nsenter` into the running container |
-| `network="none"` | with `allow_network_none=True`, where the site lets users create network namespaces | always, unless `allow_network_none=False` |
-| When the process that started them dies | instances keep running until a janitor stops them | everything in them is killed at once; a janitor removes the files |
+| | `SingularityProvider` | `EnrootProvider` | `GvisorProvider` |
+|---|---|---|---|
+| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x, unprivileged | rootless `runsc`, opt-in |
+| Images | SIF files, pulled with `singularity pull` | squashfs files, imported with `enroot import` | SIF files, as the Singularity provider's |
+| Commands run as | your uid | root of the sandbox's user namespace, which is your uid outside (`remap_root=False`: your uid) | root of gVisor's kernel, with every capability; your uid outside |
+| Each command | one `singularity exec` | `nsenter` into the running container | one `runsc exec` |
+| `network="none"` | with `allow_network_none=True`, where the site lets users create network namespaces | always, unless `allow_network_none=False` | always |
+| When the process that started them dies | instances keep running until a janitor stops them | everything in them is killed at once; a janitor removes the files | as with enroot |
 
-[Singularity CE and Apptainer](singularity.md) and [enroot](enroot.md) describe how each provider
-builds a sandbox.
+[Singularity CE and Apptainer](singularity.md), [enroot](enroot.md) and [gVisor](gvisor.md) describe
+how each provider builds a sandbox.
 
 ### Provider methods and attributes
 
@@ -63,7 +63,7 @@ builds a sandbox.
 | `await map_subordinate_ids()` | Maps your subordinate ids for pods with `users="subids"` now, once per process, rather than at the first such pod; see [Subordinate ids](pods.md#subordinate-ids). |
 | `await reap(labels=None)` | Stops this provider's sandboxes and pods that carry `labels`, sweeps abandoned sessions on the node and returns a `JanitorReport`; see [Reaping and janitors](#reaping-and-janitors). |
 | `await wait_for_deletions(timeout_s=300.0)` | Waits until the files of the sandboxes and pods that this process stopped are deleted; returns `False` on timeout. |
-| `name` | `"singularity"` or `"enroot"`. |
+| `name` | `"singularity"`, `"enroot"` or `"gvisor"`. |
 | `capabilities` | A frozenset of strings; see [Capabilities](#capabilities). |
 | `images` | The provider's `ImageStore`; see [Images](#images). |
 | `scratch_root` | The absolute path of the [scratch root](configuration.md#the-scratch-root). |
@@ -87,12 +87,12 @@ sandbox has a session directory of its own.
 | Field | Default | Meaning |
 |---|---|---|
 | `image` | required | The image to start from; see [Image references](#image-references). |
-| `workdir` | `"/app"` | The working directory of commands, an absolute path. A start creates it when the image lacks it, with your umask, or with mode 755 in a `--fakeroot` sandbox ([Root in a sandbox](singularity.md#root-in-a-sandbox)). |
+| `workdir` | `"/app"` | The working directory of commands, an absolute path. A start creates it when the image lacks it, with your umask, or with mode 755 in a `--fakeroot` sandbox ([Root in a sandbox](singularity.md#root-in-a-sandbox)) and a gVisor sandbox. |
 | `env` | `{}` | Variables every command gets; see [Environment](#environment). |
 | `mounts` | `[]` | Host paths bound into the sandbox, as `Mount` objects; see [Mounts](#mounts). |
 | `network` | `"host"` | `"host"` shares the host's network. `"none"` gives the sandbox only a loopback interface, and needs the `network_none` capability. |
-| `cpus` | `None` | Advisory, unless a `SingularityProvider` with `cgroup_limits=True` passes it as `--cpus`. |
-| `memory_mb` | `None` | Arms the memory watchdog; see [Memory limits](#memory-limits). |
+| `cpus` | `None` | Advisory, unless a `SingularityProvider` with `cgroup_limits=True` passes it as `--cpus`, or a `GvisorProvider` keeps the sandbox to that many CPUs, rounded up ([gVisor](gvisor.md#limits)). |
+| `memory_mb` | `None` | Arms the memory watchdog; see [Memory limits](#memory-limits). A `GvisorProvider`'s stops the whole sandbox. |
 | `labels` | `{}` | String pairs recorded with the sandbox. `reap()` and `hpc-sandbox janitor --label` select sandboxes by them. |
 | `file_owners` | `None` | The path of a manifest of the users and groups that the image gives its files, which a sandbox whose user namespace maps other users applies before any command runs in it; see [File owners](#file-owners). |
 
@@ -117,8 +117,9 @@ provider was created with `bind_resolv_conf=False`.
 | A local file with `@sha256:<hex>` appended | the file, checked against that digest before use | the file, checked against that digest before use |
 | An image of the other provider's format | `ValueError` | `ValueError` |
 
-Both providers also accept enroot's `registry#repo` spelling, in `docker://` references and in
-references without a scheme.
+Every provider also accepts enroot's `registry#repo` spelling, in `docker://` references and in
+references without a scheme. `GvisorProvider` takes the references that `SingularityProvider` takes,
+and pulls them with Singularity CE or Apptainer.
 
 A remote image is pulled once into the image cache. A tag keeps the image it named when it was first
 pulled until you refresh it (see [Images](#images)), so pin images by digest, or use local files
@@ -134,8 +135,8 @@ and `cp` and `dirname`, which transfers use.
 `ValueError`:
 
 - `source` exists on the host. It is resolved, symlinks included, when the sandbox starts.
-- `target` is an absolute path without `..`, other than `/`, and neither `/tmp` nor `/var/tmp` nor a
-  path below them: those are the sandbox's own.
+- `target` is an absolute path that does not start with `//`, without `..`, other than `/`, and
+  neither `/tmp` nor `/var/tmp` nor a path below them: those are the sandbox's own.
 - Neither path contains `:` or `,`. With enroot, neither contains whitespace either.
 
 A start creates the target in the sandbox's root filesystem when the image lacks it. With
@@ -166,7 +167,8 @@ start reads the file, so it must stay readable until the start returns. Only san
 namespace maps other users take a manifest, and they apply it to their own root filesystem before
 any command runs in them: Singularity sandboxes with `fakeroot=True`
 ([Root in a sandbox](singularity.md#root-in-a-sandbox)) and pod services with `run_as="subids"`
-([Users](pods.md#users)). The others raise `ValueError`. Applying it:
+([Users](pods.md#users)). The others raise `ValueError`; so does a `GvisorProvider`, whose root
+can switch users but does not apply manifests yet. Applying it:
 
 - gives each path its uid and gid as root of the sandbox's user namespace, in the manifest's order,
   so a later line for the same path wins, and keeps a file's set-user-ID and set-group-ID bits,
@@ -457,6 +459,9 @@ hpcsb-8e522ce924b84854b850e8142d581a09 prepared
 - A snapshot of a sandbox with Singularity's fuse-overlay layout holds only what the sandbox wrote,
   and restores over the same node's template of the image, with that layout (see
   [Singularity CE and Apptainer](singularity.md)).
+- A snapshot of a gVisor sandbox holds only what the sandbox wrote, `/tmp` and `/var/tmp` included,
+  as gVisor archives it, with the owners and modes of its files, and restores over the same node's
+  template of the image ([gVisor](gvisor.md#snapshots-and-restores)).
 - Pod services cannot be snapshotted yet: their `snapshot()` raises `SandboxError`.
 
 | `SandboxSnapshot` field | Meaning |
@@ -465,7 +470,7 @@ hpcsb-8e522ce924b84854b850e8142d581a09 prepared
 | `provider` | The name of the provider that took it. |
 | `path` | Its directory on the node. |
 | `image` | The image of the sandbox it was taken from. |
-| `metadata` | `format`, `created_at` (a Unix time), `source_sandbox` (the sandbox's id), `workdir`, `labels`, and `remap_root` and `container_uid` (who commands ran as). A fuse-overlay snapshot adds `lower`, the template it lies over. |
+| `metadata` | `format`, `created_at` (a Unix time), `source_sandbox` (the sandbox's id), `workdir`, `labels`, and `remap_root` and `container_uid` (who commands ran as). A fuse-overlay or gVisor snapshot adds `lower`, the template it lies over. |
 
 ## Stopping and deleting
 
@@ -604,8 +609,15 @@ hpc-sandbox: memory limit exceeded (PSS 555880448 > 268435456 bytes); killed pid
 ```
 
 `memory_kills` is a list of `hpc_sandbox.memory.MemoryKill` records, oldest first. It is an
-attribute of the concrete sandbox classes (`SingularitySandbox`, `EnrootSandbox` and pod services),
-not of the `Sandbox` protocol.
+attribute of the concrete sandbox classes (`SingularitySandbox`, `EnrootSandbox`, `GvisorSandbox`
+and pod services), not of the `Sandbox` protocol.
+
+A gVisor sandbox's processes run on gVisor's kernel, not as host processes, so its watchdog cannot
+pick one: it samples the memory that gVisor's kernel, the Sentry, holds for the sandbox (its memory
+files and its own memory, not PSS), and stops the whole sandbox when that exceeds the limit. The
+running command and every later call then raise `SandboxLostError`, whose message is the
+watchdog's report ("memory limit exceeded (gVisor's memory ...)"), and `memory_kills` records the
+kill, with the Sentry's PID and `measure="gVisor's memory"` ([gVisor](gvisor.md#limits)).
 
 | `MemoryKill` field | Meaning |
 |---|---|
@@ -617,6 +629,7 @@ not of the `Sandbox` protocol.
 | `processes` | How many processes the branch held. |
 | `tmpfs_bytes` | What files on the sandbox's tmpfs mounts held, or `None` when unknown. |
 | `pids` | The host PIDs of the branch's processes as sampled, root first. |
+| `measure` | What `pss_bytes` and `total_bytes` measure: `"PSS"`, or `"gVisor's memory"` for a gVisor sandbox, where both are what gVisor held for the whole sandbox. |
 
 `kill.message()` returns the line appended to `stderr`.
 
@@ -669,8 +682,8 @@ complete the pod API. [Pods](pods.md) describes all of it.
 |---|---|
 | `snapshot` | Always: `snapshot()` and `restore()` work. |
 | `isolation` | Always: each sandbox has private PID and IPC namespaces, root filesystem, `/tmp` and environment. |
-| `pods` | Always: `start_pod()` works. |
-| `network_none` | With Singularity, when `allow_network_none=True`; with enroot, unless `allow_network_none=False`. |
+| `pods` | With Singularity and enroot: `start_pod()` works. |
+| `network_none` | With Singularity, when `allow_network_none=True`; with enroot, unless `allow_network_none=False`; always with gVisor. |
 | `gpu` | With Singularity, when `gpu` is set; with enroot, when `gpus` (or `gpu="nv"`) is set. |
 
 Isolation keeps sandboxes apart from one another and from the host's files and processes. It is not
@@ -744,15 +757,15 @@ logging configuration, Python prints warnings and errors on stderr;
 
 | Area | Names in `hpc_sandbox` |
 |---|---|
-| Providers | `SingularityProvider`, `EnrootProvider` |
-| Sandboxes | `SingularitySandbox`, `EnrootSandbox` |
+| Providers | `SingularityProvider`, `EnrootProvider`, `GvisorProvider` |
+| Sandboxes | `SingularitySandbox`, `EnrootSandbox`, `GvisorSandbox` |
 | Specs | `SandboxSpec`, `Mount` |
 | Results | `ExecResult`, `DownloadReport`, `DroppedLink`, `SandboxSnapshot`, `JanitorReport` |
 | Error contract | `CWD_ERROR_EXIT_CODE`, `CWD_ERROR_PREFIX`, `CWD_ERROR_REASONS`, `SandboxError`, `SandboxStartError`, `SandboxLostError` |
 | Protocols | `SandboxProvider`, `Sandbox`, `PodProvider`, `Pod` |
 | Pods | `PodSpec`, `ServiceSpec`, `HealthCheck`, `PodNetwork`, `PodUsers`, `ServiceHealth`, `ServiceRunAs`, `SessionPod`, `PodService`, `SingularityService`, `EnrootService` |
 | Images | `ImageStore`, `ImageFormat`, `ResolvedImage`, `SifImages`, `SquashfsImages` |
-| Runtimes | `ContainerRuntime` and `EnrootRuntime`: the runtime command lines a provider runs, as its `runtime` attribute |
+| Runtimes | `ContainerRuntime`, `EnrootRuntime` and `RunscRuntime`: the runtime command lines a provider runs, as its `runtime` attribute (a `GvisorProvider`'s `ContainerRuntime`, which pulls and extracts its images, is its `image_runtime`) |
 
 The public API is the names in `hpc_sandbox.__all__`, listed above, with the behaviour these docs
 describe, and the command-line output that [Command line](cli.md) documents. Other names, such as

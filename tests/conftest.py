@@ -14,12 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from hpc_sandbox import EnrootProvider, SingularityProvider, subids
+from hpc_sandbox import EnrootProvider, GvisorProvider, SingularityProvider, subids
 from hpc_sandbox.enroot import ANCHOR_SCRIPT
 from hpc_sandbox.sandbox import _DELETIONS
 
 FAKE = Path(__file__).with_name("fake_singularity.py")
 FAKE_ENROOT = Path(__file__).with_name("fake_enroot.py")
+FAKE_RUNSC = Path(__file__).with_name("fake_runsc.py")
 MAGIC = b"FAKESIF\n"
 SQUASHFS_MAGIC = b"hsqs"
 _ISOLATED_ENV = (
@@ -317,6 +318,77 @@ def make_enroot_provider(tmp_path: Path, **options: object) -> EnrootProvider:
 @pytest.fixture
 async def enroot_provider(tmp_path: Path, fake_enroot: FakeEnroot) -> AsyncIterator[EnrootProvider]:
     provider = make_enroot_provider(tmp_path)
+    yield provider
+    for sandbox in provider.sandboxes:
+        await sandbox.stop()
+
+
+class FakeRunsc:
+    """Handle on the fake ``runsc`` installed first on PATH."""
+
+    def __init__(self, state: Path) -> None:
+        self.state = state
+
+    def calls(self, *subcommand: str) -> list[dict]:
+        """The recorded calls whose subcommand and arguments, after runsc's global options,
+        start with ``subcommand``: ``argv`` (all of it) and ``env`` (the variables' names)."""
+        path = self.state / "calls.jsonl"
+        calls = (
+            [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        )
+        found = []
+        for call in calls:
+            rest = call["argv"]
+            while rest and rest[0].startswith("-"):
+                rest = rest[1:]
+            if rest[: len(subcommand)] == list(subcommand):
+                found.append(call)
+        return found
+
+    def set(self, knob: str) -> None:
+        (self.state / knob).write_text("1")
+
+    def set_value(self, knob: str, value: str) -> None:
+        (self.state / knob).write_text(value)
+
+
+@pytest.fixture
+def fake_runsc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_runtime: FakeRuntime
+) -> FakeRunsc:
+    """A fake ``runsc`` first on PATH, beside the fake ``singularity`` that gVisor providers pull
+    and extract images with."""
+    if reason := namespaces_unavailable():
+        pytest.skip(reason)
+    bin_dir = tmp_path / "runsc-bin"
+    bin_dir.mkdir()
+    state = tmp_path / "fake-runsc-state"
+    state.mkdir()
+    wrapper = bin_dir / "runsc"
+    wrapper.write_text(
+        f'#!/bin/sh\nFAKE_RUNSC_STATE="{state}" exec "{sys.executable}" "{FAKE_RUNSC}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    return FakeRunsc(state)
+
+
+def make_gvisor_provider(tmp_path: Path, **options: object) -> GvisorProvider:
+    settings: dict[str, object] = {
+        "scratch_root": tmp_path / "scratch",
+        "image_cache": tmp_path / "cache",
+        "stage_images": False,
+        "default_timeout_s": 30.0,
+        "start_timeout_s": 60.0,
+        "memory_poll_s": 0.1,
+    }
+    settings.update(options)
+    return GvisorProvider(**settings)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+async def gvisor_provider(tmp_path: Path, fake_runsc: FakeRunsc) -> AsyncIterator[GvisorProvider]:
+    provider = make_gvisor_provider(tmp_path)
     yield provider
     for sandbox in provider.sandboxes:
         await sandbox.stop()

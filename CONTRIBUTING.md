@@ -102,6 +102,7 @@ memory watchdog, timeouts and cancellation are exercised for real:
 | `tests/fake_singularity.py` | `singularity`: it records every call and simulates the commands hpc-sandbox uses; its instances are host processes with the runtime's process title |
 | `tests/fake_enroot.py` | `enroot`: it builds containers from real user and mount namespaces, bind mounts and `chroot`, so the enroot provider's launcher and its `nsenter` calls run for real |
 | `tests/fake_fuse.py` | `fuse-overlayfs` and `fusermount3`, for Singularity's fuse-overlay layout |
+| `tests/fake_runsc.py` | `runsc`: its processes are titled as runsc's (`runsc-gofer`, `runsc-sandbox`) and die with their parents, it creates missing mount points in the template as runsc's gofer does, its Sentry holds a memory file and runs commands in real user, mount and PID namespaces, and its overlay is a copy of the template |
 
 `-ra` ends the run with a summary line for each test that did not pass, with the reason of each
 skip. The integration tests always skip in this run (see [Integration tests](#integration-tests)),
@@ -121,7 +122,7 @@ uv run pytest tests/test_memory.py -q -k oom_score    # the tests whose names ma
 | Need | Without it |
 |---|---|
 | Linux and Python 3.11 or later | Nothing runs. |
-| Unprivileged user namespaces and util-linux `nsenter` | The enroot provider's tests, the pod tests, and the tests that mount file systems in a namespace skip. `unshare --user --map-root-user --mount --pid --ipc --net --fork true` succeeds where user namespaces work. Ubuntu 24.04 and later restrict them with AppArmor; `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts that until the next boot. |
+| Unprivileged user namespaces and util-linux `nsenter` | The enroot provider's tests, the gVisor provider's tests, the pod tests, and the tests that mount file systems in a namespace skip. `unshare --user --map-root-user --mount --pid --ipc --net --fork true` succeeds where user namespaces work. Ubuntu 24.04 and later restrict them with AppArmor; `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` lifts that until the next boot. |
 | util-linux `unshare` | The tests that mount file systems in a namespace skip (in `tests/test_trash.py` and `tests/test_fuse_overlay.py`). |
 | `/usr/bin/python3` | The pod tests (`tests/test_pods.py`) skip, and so do the memory watchdog tests that run Python in a fake sandbox. |
 | `newuidmap` and `newgidmap`, and subordinate ids for your user in `/etc/subuid` and `/etc/subgid` | The pod tests that switch users in a pod with `users="subids"` skip. The other tests of such pods use stand-ins for the tools and the ranges. |
@@ -140,7 +141,14 @@ they start containers and fill node-local disk.
 ```bash
 HPC_SANDBOX_INTEGRATION=1 uv run pytest tests/test_integration.py -v
 HPC_SANDBOX_INTEGRATION=1 uv run pytest tests/test_pods_integration.py -v
+HPC_SANDBOX_INTEGRATION=1 uv run pytest tests/test_gvisor_integration.py -v
 ```
+
+The last runs what is the gVisor provider's own, which needs `runsc` on `PATH` (with its release's
+`gvisor-bin/` beside it) and Singularity CE or Apptainer for its images, and skips without them.
+`HPC_SANDBOX_TEST_RUNTIME=gvisor` runs the first file with gVisor too, but for its tests of the
+per-process memory watchdog, which gVisor's whole-sandbox limit replaces; the pod tests skip with
+it, since the gVisor provider runs no pods yet.
 
 Their sandboxes live under the default scratch root
 ([The scratch root](docs/configuration.md#the-scratch-root)): where that is not on the node's local
@@ -151,13 +159,14 @@ choose what they test:
 | Variable | Default | Meaning |
 |---|---|---|
 | `HPC_SANDBOX_INTEGRATION` | unset | `1` runs the integration tests; without it, they skip. |
-| `HPC_SANDBOX_TEST_RUNTIME` | `auto` | `singularity`, `enroot`, or `auto`: Singularity when `singularity` or `apptainer` is on `PATH`, else enroot. |
+| `HPC_SANDBOX_TEST_RUNTIME` | `auto` | `singularity`, `enroot`, `gvisor`, or `auto`: Singularity when `singularity` or `apptainer` is on `PATH`, else enroot (never gVisor). |
 | `HPC_SANDBOX_TEST_IMAGE` | `docker://alpine:3.20` | The image of `tests/test_integration.py`: any image that hpc-sandbox can start ([Image references](docs/python-api.md#image-references)) and that has the usual command-line tools, as BusyBox or a distribution's base system provides them: the tests use `tail`, `find`, `xargs`, `stat` and others. A local `.sif` or `.sqsh` file works too. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | unset | `1` also tests `network="none"` with Singularity, where the site lets users create network namespaces. With enroot it is always tested. |
 | `HPC_SANDBOX_TEST_FAKEROOT` | unset | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user (subordinate ids in `/etc/subuid` and `/etc/subgid`): commands that switch users, the owners of an image's files, and that nothing they leave stays behind after a stop or a janitor's sweep. |
 | `HPC_SANDBOX_TEST_GPUS` | unset | On a GPU node, tests GPU passthrough: `all` with enroot, `nv` or `rocm` with Singularity, with an image in which the runtime makes `nvidia-smi` or `rocm-smi` available. |
 | `HPC_SANDBOX_TEST_POD_IMAGE` | `docker://alpine:3.20` | The image of the pod tests' services; its busybox serves and fetches HTTP. |
-| `HPC_SANDBOX_TEST_APT_IMAGE` | `docker://python:3.12-slim` | The image of the pod test that runs apt. |
+| `HPC_SANDBOX_TEST_APT_IMAGE` | `docker://python:3.12-slim` | The image of the pod test and the gVisor test that run apt, and of the gVisor tests that run Python (host Unix sockets, memory). |
+| `HPC_SANDBOX_TEST_GVISOR_PLATFORM` | `systrap` | gVisor's platform in `tests/test_gvisor_integration.py`, and in `tests/test_integration.py` with `HPC_SANDBOX_TEST_RUNTIME=gvisor`: `systrap`, `ptrace` or `kvm`. |
 | `HPC_SANDBOX_TEST_REDIS_IMAGE` | `docker://redis:7-alpine` | The Redis image that the pod tests run as each `run_as`, with its entrypoint. |
 | `HPC_SANDBOX_TEST_POSTGRES_IMAGE` | `docker://postgres:16-alpine` | The PostgreSQL image that the pod tests run as each `run_as`, with its entrypoint. |
 | `HPC_SANDBOX_TEST_SUBIDS` | unset | `1` also tests pods with `users="subids"`, with Singularity, where your user has subordinate ids (`/etc/subuid` and `/etc/subgid`) and `newuidmap` and `newgidmap` map them: services that switch users, the owners of an image's files, and that nothing they leave stays behind after a stop or a janitor's sweep. |
@@ -178,8 +187,10 @@ they ran on.
 ### Write tests
 
 - Test against the fakes: the fixtures in `tests/conftest.py` give you a provider on each fake
-  runtime (`provider` and `enroot_provider`) and an image for it (`sif` and `sqsh`). Only the
-  integration tests use a real runtime, and they run only with `HPC_SANDBOX_INTEGRATION=1`.
+  runtime (`provider`, `enroot_provider` and `gvisor_provider`, whose `fake_runsc` fixture records
+  runsc's calls and sets its knobs) and an image for it (`sif` and `sqsh`; gVisor's take SIF
+  images too). Only the integration tests use a real runtime, and they run only with
+  `HPC_SANDBOX_INTEGRATION=1`.
 - Put a test with the tests of the code it covers, such as `tests/test_enroot.py` for the enroot
   provider. The test directory has no `__init__.py`, and test files import each other by their
   bare names (`from conftest import make_provider`), so give every test file a unique name.
@@ -311,17 +322,20 @@ that commit's subject too, because GitHub suggests it for the squashed commit. T
 whenever you edit the title.
 
 **What CI runs on a pull request.** These jobs run on GitHub's Ubuntu runners for every pull
-request into `main`; the `lint` and `test` jobs also run for every push to `main`:
+request into `main`; the `lint`, `test` and `gvisor` jobs also run for every push to `main`:
 
 | Job | Runs | Fails when |
 |---|---|---|
 | `pr-title` | On pull requests only | The title, or the subject of a single commit, is not a Conventional Commit in the form above |
 | `lint` | `uvx pre-commit run --all-files --show-diff-on-failure` | A hook fails or changes a file |
 | `test` | On Python 3.11, 3.12 and 3.13: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, then `uv sync --group dev` and `uv run pytest -v -ra` | Unprivileged user namespaces do not work, or a test fails |
+| `gvisor` | On Python 3.12: the same sysctl, runsc from its release and Apptainer from its, each checked against a pinned checksum, `runsc --rootless do true`, `hpc-sandbox doctor --runtime gvisor --image docker://alpine:3.20` (which starts a sandbox as the provider does), then, with `HPC_SANDBOX_INTEGRATION=1`, `tests/test_gvisor_integration.py` and `tests/test_integration.py` with `HPC_SANDBOX_TEST_RUNTIME=gvisor` (`tests/test_gvisor.py` runs in the `test` job) | A download's checksum differs, rootless runsc does not run, `doctor` fails, or a test fails |
 | `build` (the release workflow) | The build and the checks of [Cut a release](#cut-a-release), without publishing | The sdist or the wheel does not build or does not pass `twine check --strict`, or the wheel's `hpc-sandbox --version` fails |
 
 The `test` job has no container runtime and no `sshfs`: the fakes stand in for the runtimes, the
-test that needs `sshfs` skips, and the integration tests never run there.
+test that needs `sshfs` skips, and the integration tests never run there. The `gvisor` job runs
+the integration tests with gVisor, which pull their images from Docker Hub; the others need a
+compute node.
 
 **The pull request itself.** The [pull request template](.github/pull_request_template.md) asks
 for each of these:
