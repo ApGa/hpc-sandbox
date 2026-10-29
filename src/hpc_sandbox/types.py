@@ -30,16 +30,16 @@ class SandboxSpec:
 
     ``image`` is a remote reference (``docker://repo:tag``, or another one the
     runtime can pull), which is pulled once into the image cache, or a local
-    image file: ``.sif`` for Singularity/Apptainer, ``.sqsh`` for enroot. An
-    ``@sha256:<hex>`` suffix pins it: to a remote image's digest, or to a local
-    file's SHA-256. ``cpus`` is advisory unless the provider enables cgroup
-    limits; ``memory_mb`` arms the PSS watchdog. ``labels`` (a run, a task,
-    ...) select sandboxes for janitors. ``file_owners`` is the path of a
-    manifest of the owners that the image gives its files (``UID GID PATH``
-    lines), which extraction loses: a sandbox whose user namespace maps other
-    users (Singularity's ``fakeroot``, a pod service with ``run_as="subids"``)
-    gives those paths their owners before any command runs in it, and the
-    others refuse one.
+    image file: ``.sif`` for Singularity/Apptainer and gVisor, ``.sqsh`` for
+    enroot. An ``@sha256:<hex>`` suffix pins it: to a remote image's digest, or
+    to a local file's SHA-256. ``cpus`` is advisory unless the provider enables
+    cgroup limits, or keeps a gVisor sandbox to that many CPUs; ``memory_mb``
+    arms the memory watchdog. ``labels`` (a run, a task, ...) select sandboxes
+    for janitors. ``file_owners`` is the path of a manifest of the owners that
+    the image gives its files (``UID GID PATH`` lines), which extraction loses:
+    a sandbox whose user namespace maps other users (Singularity's
+    ``fakeroot``, a pod service with ``run_as="subids"``) gives those paths
+    their owners before any command runs in it, and the others refuse one.
     """
 
     image: str

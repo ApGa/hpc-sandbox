@@ -4,8 +4,11 @@ Run on a compute node (never a login node) with::
 
     HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_integration.py -v
 
-``HPC_SANDBOX_TEST_RUNTIME`` picks the runtime (``singularity``, ``enroot``, or
-``auto``: the first of singularity, apptainer and enroot on PATH).
+``HPC_SANDBOX_TEST_RUNTIME`` picks the runtime (``singularity``, ``enroot``,
+``gvisor``, or ``auto``: the first of singularity, apptainer and enroot on
+PATH); with ``gvisor``, ``HPC_SANDBOX_TEST_GVISOR_PLATFORM`` picks gVisor's
+platform (default ``systrap``), and the tests of the per-process memory
+watchdog skip: ``tests/test_gvisor_integration.py`` tests gVisor's own.
 ``HPC_SANDBOX_TEST_IMAGE`` picks the image (default ``docker://alpine:3.20``;
 any image hpc-sandbox can start that has the usual command-line tools of
 BusyBox or a distribution's base system works, including a local .sif or
@@ -36,7 +39,7 @@ from typing import Any
 
 import pytest
 
-from hpc_sandbox import EnrootProvider, SandboxSpec, SingularityProvider
+from hpc_sandbox import EnrootProvider, GvisorProvider, SandboxSpec, SingularityProvider
 from hpc_sandbox.cli import resolve_runtime
 from hpc_sandbox.paths import default_scratch_root
 from hpc_sandbox.process import run_process
@@ -54,10 +57,19 @@ pytestmark = [
 IMAGE = os.environ.get("HPC_SANDBOX_TEST_IMAGE", "docker://alpine:3.20")
 FILE_OWNERS_IMAGE = os.environ.get("HPC_SANDBOX_TEST_FILE_OWNERS_IMAGE", "docker://node:20-alpine")
 RUNTIME = resolve_runtime(os.environ.get("HPC_SANDBOX_TEST_RUNTIME", "auto"))
-NETWORK_NONE = RUNTIME == "enroot" or os.environ.get("HPC_SANDBOX_TEST_NETWORK_NONE") == "1"
-FAKEROOT = RUNTIME != "enroot" and os.environ.get("HPC_SANDBOX_TEST_FAKEROOT") == "1"
+NETWORK_NONE = RUNTIME in ("enroot", "gvisor") or (
+    os.environ.get("HPC_SANDBOX_TEST_NETWORK_NONE") == "1"
+)
+FAKEROOT = RUNTIME == "singularity" and os.environ.get("HPC_SANDBOX_TEST_FAKEROOT") == "1"
+GVISOR_PLATFORM = os.environ.get("HPC_SANDBOX_TEST_GVISOR_PLATFORM", "systrap")
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 enroot_only = pytest.mark.skipif(RUNTIME != "enroot", reason="enroot provider behavior")
+# gVisor's memory limit stops the whole sandbox: tests/test_gvisor_integration.py tests it.
+process_watchdog = pytest.mark.skipif(
+    RUNTIME == "gvisor", reason="the gvisor provider's memory limit stops the whole sandbox"
+)
+# Where a sandbox sees its transfer directory.
+TRANSFER = "/.hpc-sandbox/transfer" if RUNTIME == "gvisor" else "/tmp/.hpc-sandbox-transfer"
 fakeroot_only = pytest.mark.skipif(
     not FAKEROOT,
     reason="set HPC_SANDBOX_TEST_FAKEROOT=1 where Singularity's --fakeroot works (subordinate ids)",
@@ -118,6 +130,9 @@ NODE_OWNED = ["0:42 /etc/shadow", f"1000:1000 {NODE_HOME}", f"1000:1000 {NODE_HO
 def make_provider(scratch: Path) -> SessionProvider[Any]:
     if RUNTIME == "enroot":
         return EnrootProvider(scratch_root=scratch)
+    if RUNTIME == "gvisor":
+        platform: Any = GVISOR_PLATFORM
+        return GvisorProvider(scratch_root=scratch, platform=platform)
     return SingularityProvider(scratch_root=scratch, allow_network_none=NETWORK_NONE)
 
 
@@ -148,12 +163,15 @@ async def test_lifecycle_keeps_the_uid_and_isolates_tmp(provider):
     assert session is not None
     result = await sandbox.exec('id -u; printf "%s\\n" "$WORDS"; pwd')
     assert result.exit_code == 0, result.stderr
-    uid = "0" if RUNTIME == "enroot" else str(os.getuid())  # enroot maps root to this uid
+    # enroot maps root to this uid; gVisor's root is root of gVisor's kernel.
+    uid = "0" if RUNTIME in ("enroot", "gvisor") else str(os.getuid())
     assert result.stdout.splitlines() == [uid, "a b; $(c)", "/app"]
     marker = f"hpc-sandbox-{uuid.uuid4().hex}"
     assert (await sandbox.exec(f"touch /etc/{marker} /tmp/{marker} && echo ok")).stdout == "ok\n"
-    assert (session / "tmp" / marker).exists() and not Path("/tmp", marker).exists()
-    assert (session / "rootfs" / "etc" / marker).stat().st_uid == os.getuid()
+    assert not Path("/tmp", marker).exists()
+    if RUNTIME != "gvisor":  # whose /tmp and root filesystem are an overlay in a file
+        assert (session / "tmp" / marker).exists()
+        assert (session / "rootfs" / "etc" / marker).stat().st_uid == os.getuid()
     assert (await sandbox.exec(["cat"], stdin=b"piped")).stdout == "piped"
     await sandbox.stop()
     assert not session.exists()
@@ -237,6 +255,7 @@ async def test_a_restore_shows_what_the_sandbox_deleted_renamed_and_replaced(pro
     await provider.delete_snapshot(snapshot)
 
 
+@process_watchdog
 async def test_memory_watchdog_kills_the_hog_and_keeps_the_sandbox(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=128))
     # tail buffers its last 600 MB and never sees EOF; reading a pipe keeps GNU tail from
@@ -389,14 +408,15 @@ async def test_janitor_leaves_nothing_of_an_abandoned_fakeroot_sandbox(scratch):
 
 CRASH = """\
 import asyncio, os, signal, sys
-from hpc_sandbox import EnrootProvider, SandboxSpec, SingularityProvider
+from hpc_sandbox import EnrootProvider, GvisorProvider, SandboxSpec, SingularityProvider
 
 async def main():
     runtime, scratch, image = sys.argv[1:]
     providers = {"enroot": EnrootProvider, "singularity": SingularityProvider}
-    provider = providers[runtime](scratch_root=scratch)
+    provider = providers.get(runtime, GvisorProvider)(scratch_root=scratch)
     sandbox = await provider.start(SandboxSpec(image=image, labels={'t': 'j'}))
-    pid = sandbox._init_pid if runtime == "enroot" else sandbox._instance_pid
+    pids = {"enroot": "_init_pid", "gvisor": "_sentry_pid", "singularity": "_instance_pid"}
+    pid = getattr(sandbox, pids[runtime])
     print(pid, sandbox.id, flush=True)
     os.kill(os.getpid(), signal.SIGKILL)
 
@@ -412,7 +432,7 @@ async def test_janitor_recovers_an_abandoned_sandbox(provider, scratch):
     )
     assert result.returncode == 137, result.detail()
     pid, name = result.stdout.decode().split()
-    if RUNTIME == "enroot":
+    if RUNTIME in ("enroot", "gvisor"):
         # The container dies with its owner; only its files are left.
         for _ in range(100):
             if owned_live_start_time(int(pid)) is None:
@@ -533,9 +553,8 @@ async def test_transfers_ignore_symlinks_the_sandbox_plants(provider, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     sandbox = await provider.start(SandboxSpec(image=IMAGE))
-    planted = await sandbox.exec(
-        f"rm -rf /tmp/.hpc-sandbox-transfer && ln -s {outside} /tmp/.hpc-sandbox-transfer"
-    )
+    # gVisor's transfer directory is a mount point, which stays: the link goes in it.
+    planted = await sandbox.exec(f"rm -rf {TRANSFER} 2>/dev/null; ln -sfn {outside} {TRANSFER}")
     assert planted.exit_code == 0, planted.stderr
     source = tmp_path / "in.txt"
     source.write_text("payload\n")
@@ -627,6 +646,7 @@ POOL_AS_THE_COMMAND = (
 )
 
 
+@process_watchdog
 async def test_memory_watchdog_explains_a_command_killed_with_its_children(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=100))
     for _ in range(3):
@@ -646,6 +666,7 @@ FORKER = """while :; do
 done"""
 
 
+@process_watchdog
 async def test_memory_watchdog_leaves_nothing_a_forking_command_started(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=100))
     for _ in range(3):
@@ -662,6 +683,7 @@ SURVIVORS = """for p in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < "$p" 2>/dev/null
 """
 
 
+@process_watchdog
 async def test_memory_watchdog_spares_what_other_commands_leave_running(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=100))
     detach = "for i in $(seq 100); do (sleep 1000 &); sleep 0.02; done; echo made"
@@ -674,6 +696,7 @@ async def test_memory_watchdog_spares_what_other_commands_leave_running(provider
     assert (await sandbox.exec(count)).stdout.strip() == "100"
 
 
+@process_watchdog
 async def test_memory_watchdog_kills_a_runaway_pool_and_spares_the_harness(provider):
     sandbox = await provider.start(SandboxSpec(image=IMAGE, memory_mb=200))
     result = await sandbox.exec(["/bin/sh", "-c", POOL_UNDER_A_HARNESS], timeout_s=120)

@@ -1,4 +1,4 @@
-"""Rootless sandboxes for HPC clusters, on Singularity/Apptainer or enroot.
+"""Rootless sandboxes for HPC clusters, on Singularity/Apptainer, enroot or gVisor.
 
 The names in ``__all__`` are the public API. ``hpc_sandbox.__version__`` is the running
 hpc-sandbox's version: a source checkout's ``pyproject.toml``, else the installed distribution's.
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .enroot import EnrootProvider, EnrootRuntime, EnrootSandbox, EnrootService, SquashfsImages
+from .gvisor import GvisorProvider, GvisorSandbox, RunscRuntime
 from .images import ImageFormat, ImageStore, ResolvedImage, SifImages
 from .pods import PodService, SessionPod
 from .runtime import ContainerRuntime
@@ -51,6 +52,8 @@ __all__ = [
     "EnrootSandbox",
     "EnrootService",
     "ExecResult",
+    "GvisorProvider",
+    "GvisorSandbox",
     "HealthCheck",
     "ImageFormat",
     "ImageStore",
@@ -63,6 +66,7 @@ __all__ = [
     "PodSpec",
     "PodUsers",
     "ResolvedImage",
+    "RunscRuntime",
     "Sandbox",
     "SandboxError",
     "SandboxLostError",

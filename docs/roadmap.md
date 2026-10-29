@@ -18,6 +18,11 @@ hpc-sandbox does not do these things yet. Each row says what happens today inste
 | pods | services that switch to other users on enroot, or without subordinate ids | enroot maps one id into a container, and a pod without `users="subids"` maps only your uid: their services run as root or as your uid ([Users](pods.md#users)) |
 | pods | host networking | a pod's network is loopback only, or egress through slirp4netns |
 | pods | egress allowlists | egress reaches every host that slirp4netns can reach, except the host's loopback |
+| gVisor | pods, with services in gVisor | `start_pod()` raises `ValueError` on a `GvisorProvider` ([Pods](gvisor.md#pods)) |
+| gVisor | egress without host networking, through slirp4netns into gVisor's network stack | a sandbox has the host's network, or loopback only ([Networking](gvisor.md#networking)) |
+| gVisor | a memory limit that kills one process | `memory_mb` stops the whole sandbox, and counts the Sentry's own memory ([Limits](gvisor.md#limits)) |
+| gVisor | file owners manifests | `file_owners` raises `ValueError`; root in the sandbox can give files their owners itself |
+| gVisor | GPUs (gVisor's `nvproxy`) and squashfs images | sandboxes get no GPUs, and start from SIF images |
 
 ## Next steps
 

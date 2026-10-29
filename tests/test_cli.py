@@ -197,7 +197,8 @@ def test_every_command_with_a_runtime_refuses_an_unknown_one_from_the_environmen
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == (
-        "hpc-sandbox: HPC_SANDBOX_RUNTIME must be one of auto, singularity, enroot, not 'Enroot'\n"
+        "hpc-sandbox: HPC_SANDBOX_RUNTIME must be one of auto, singularity, enroot, gvisor, not "
+        "'Enroot'\n"
     )
     assert not (tmp_path / "scratch").exists()  # the command did not start
 

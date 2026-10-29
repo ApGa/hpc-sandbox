@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _INSTANCE_TITLES = ("Singularity instance:", "Apptainer instance:")
+_PF_EXITING = 0x4  # in /proc/<pid>/stat's flags: the process is exiting
 
 
 def _stat_fields(pid: int) -> list[str] | None:
@@ -65,6 +66,13 @@ def owned_live_start_time(pid: int, also: Container[int] = ()) -> str | None:
     if (owner != os.getuid() and owner not in also) or fields is None or fields[0] == "Z":
         return None
     return fields[19]
+
+
+def exiting(pid: int) -> bool:
+    """Whether ``pid`` is on its way out: a zombie, gone, or a process that the kernel is tearing
+    down (``PF_EXITING``), which may already have closed its files."""
+    fields = _stat_fields(pid)
+    return fields is None or fields[0] == "Z" or bool(int(fields[6]) & _PF_EXITING)
 
 
 def instance_start_time(pid: int, name: str) -> str | None:

@@ -34,7 +34,8 @@ from hpc_sandbox import (
     procfs,
 )
 from hpc_sandbox import singularity as singularity_module
-from hpc_sandbox.singularity import OVERLAY_RECORD, OVERLAY_SNAPSHOT_FORMAT, TEMPLATE_DIR
+from hpc_sandbox.singularity import OVERLAY_RECORD, OVERLAY_SNAPSHOT_FORMAT
+from hpc_sandbox.templates import TEMPLATE_DIR
 from test_janitor import crashed_sandboxes
 
 FAKE_FUSE = Path(__file__).with_name("fake_fuse.py")

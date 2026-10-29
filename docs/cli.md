@@ -33,8 +33,8 @@ the image cache can be reached, and `fetch-tools` wherever there is internet acc
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--runtime {auto,singularity,enroot}` | `$HPC_SANDBOX_RUNTIME`, else `auto` | The container runtime, and with it the provider. `auto` takes the first of `singularity`, `apptainer` and `enroot` found on `PATH`. A `$HPC_SANDBOX_RUNTIME` that is none of the three ends the command with status 2. |
-| `--binary BINARY` | detected | The runtime's executable, a name on `PATH` or a path. With `--runtime auto`, a file name that starts with `enroot` selects enroot, and any other Singularity. |
+| `--runtime {auto,singularity,enroot,gvisor}` | `$HPC_SANDBOX_RUNTIME`, else `auto` | The container runtime, and with it the provider. `auto` takes the first of `singularity`, `apptainer` and `enroot` found on `PATH`, and never gVisor, which runs only when it is chosen. A `$HPC_SANDBOX_RUNTIME` that is none of the four ends the command with status 2. |
+| `--binary BINARY` | detected | The runtime's executable, a name on `PATH` or a path: runsc for gVisor. With `--runtime auto`, a file name that starts with `enroot` selects enroot, one that starts with `runsc` gVisor, and any other Singularity. |
 | `--scratch-root SCRATCH_ROOT` | `$HPC_SANDBOX_SCRATCH`, else `hpc-sandbox` in the PBS job's local directory, else `$TMPDIR/hpc-sandbox-<uid>` | Node-local scratch for sessions, snapshots, staged images and the runtime's temporary files; see [The scratch root](configuration.md#the-scratch-root). |
 | `--image-cache IMAGE_CACHE` | `$HPC_SANDBOX_IMAGE_CACHE`, else `${XDG_CACHE_HOME:-~/.cache}/hpc-sandbox/images` | Where pulled images, SIF or squashfs files, are cached; see [The image cache](configuration.md#the-image-cache). |
 
@@ -59,22 +59,26 @@ compute node of a new site, with the image you plan to use.
 
 | Check | Runtime | What it reports |
 |---|---|---|
-| `runtime` | both | The runtime's path and version. `FAIL` when it cannot be run, which ends the report. |
+| `runtime` | all | The runtime's path and version. `FAIL` when it cannot be run, which ends the report. |
+| `runsc helpers` | gVisor | The `gvisor-bin/` directory beside runsc, or `info` that there is none, which releases that ship `gvisor.tar` need. |
+| `images` | gVisor | The Singularity CE or Apptainer that pulls and extracts the images, and its version. `FAIL` when it cannot be run. |
+| `user namespaces` | gVisor | Whether unprivileged user namespaces can be created, as rootless runsc needs. `FAIL` if not. |
+| `rootless runsc` | gVisor | Whether `runsc --rootless do true` runs, on the default platform (`systrap`), with a state directory on the scratch root. `FAIL` with runsc's output if not. |
 | `nsenter` | enroot | util-linux `nsenter`, which every command uses. `FAIL` when it is missing. |
 | `namespaces` | enroot | Whether new user, mount, PID, IPC and network namespaces can be created. `FAIL` if not. |
 | `user namespace` | enroot | `warn` when this process runs inside a container's user namespace, where `enroot import` cannot use its file capabilities. |
 | `image imports` | enroot | Whether `enroot-aufs2ovlfs` can convert layer whiteouts on the scratch root, as imports need. `warn` when it cannot, so that only local `.sqsh` images work, or when the scratch root does not let `doctor` test it. |
-| `site: <setting>` | both | Singularity CE and Apptainer: `allow setuid`, `allow user ns`, `sessiondir max size`, `max loop devices`, `enable overlay`, `enable underlay` and `mount home` from the installation's configuration file; a `sessiondir max size` below 1024 is shown as `warn`. enroot: the `enroot.conf` settings the provider overrides for every sandbox, such as `ENROOT_MOUNT_HOME`. |
+| `site: <setting>` | Singularity, enroot | Singularity CE and Apptainer: `allow setuid`, `allow user ns`, `sessiondir max size`, `max loop devices`, `enable overlay`, `enable underlay` and `mount home` from the installation's configuration file; a `sessiondir max size` below 1024 is shown as `warn`. enroot: the `enroot.conf` settings the provider overrides for every sandbox, such as `ENROOT_MOUNT_HOME`. |
 | `site hooks` | enroot | The hooks the enroot installation runs. |
 | `sandbox hooks` | enroot | Which of the hooks sandboxes use (`10-aptfix.sh`, `10-shadow.sh` and `98-nvidia.sh`) the installation has enabled. `warn` names those it lacks, which sandboxes start without. |
-| `batch job` | both | `$PBS_JOBID` or `$SLURM_JOB_ID`, or none. |
-| `scratch root` | both | Its path, filesystem type and free space. `FAIL` when it cannot be created or written, or belongs to another user; inside a batch job, `warn` when it is on a shared filesystem or a tmpfs. |
-| `image cache` | both | Its path, filesystem type and free space. `FAIL` when it cannot be created or written. |
-| `image staging` | both | The directory images are staged to, or `off`. |
-| `reflink on scratch` | both | Whether the scratch root's filesystem makes reflink copies: snapshots are cheap with them, and full copies without. |
-| `pods: egress` | both | The slirp4netns that pods with egress would run, or `warn` with how to get one. |
+| `batch job` | all | `$PBS_JOBID` or `$SLURM_JOB_ID`, or none. |
+| `scratch root` | all | Its path, filesystem type and free space. `FAIL` when it cannot be created or written, or belongs to another user; inside a batch job, `warn` when it is on a shared filesystem or a tmpfs. |
+| `image cache` | all | Its path, filesystem type and free space. `FAIL` when it cannot be created or written. |
+| `image staging` | all | The directory images are staged to, or `off`. |
+| `reflink on scratch` | all | Whether the scratch root's filesystem makes reflink copies: snapshots are cheap with them, and full copies without. |
+| `pods: egress` | Singularity, enroot | The slirp4netns that pods with egress would run, or `warn` with how to get one. |
 | `pods: subordinate ids` | Singularity | The uids and gids that pods with `users="subids"` would map, from your first ranges in `/etc/subuid` and `/etc/subgid`, and the `newuidmap` and `newgidmap` that map them. `info` when your user has no range, `warn` when either tool is missing: other pods need neither ([Pods](pods.md#subordinate-ids)). |
-| `sandbox start`, `exec`, `upload/download`, `sandbox stop` | both | With `--image` only: the steps above, each `ok` or `FAIL`. |
+| `sandbox start`, `exec`, `upload/download`, `sandbox stop` | all | With `--image` only: the steps above, each `ok` or `FAIL`. |
 
 Once it has found the runtime, `doctor` creates the scratch root, with mode 0700, and the image
 cache when they do not exist, as a start does. One that cannot be created or written is a `[FAIL]`
@@ -90,10 +94,10 @@ example from an enroot node:
 [  ok] sandbox hooks: 10-aptfix.sh, 10-shadow.sh, 98-nvidia.sh
 [info] batch job: 123456
 [  ok] scratch root: /local/scratch/hpc-sandbox (xfs, 850 GiB free)
-[  ok] image cache: /home/user/.cache/hpc-sandbox/images (nfs4, 120 GiB free)
+[  ok] image cache: /home/<user>/.cache/hpc-sandbox/images (nfs4, 120 GiB free)
 [info] image staging: to /local/scratch/hpc-sandbox/images
 [info] reflink on scratch: yes (snapshots are cheap)
-[  ok] pods: egress: slirp4netns /home/user/.cache/hpc-sandbox/tools/slirp4netns-1.3.6-x86_64
+[  ok] pods: egress: slirp4netns /home/<user>/.cache/hpc-sandbox/tools/slirp4netns-1.3.6-x86_64
 [  ok] sandbox start: hpcsb-b6a17d7363c2477bb9c675b4dc1371f6 in 0.4 s
 [  ok] exec: exit 0
 [  ok] upload/download: round trip
@@ -116,8 +120,8 @@ status. Use it to try an image or a site; programs use the [Python API](python-a
 | `--bind SRC:DST[:ro\|rw]` | none | Bind the host path SRC at DST, read-only unless `:rw`. SRC is resolved from the current directory, symlinks included. Repeat it for more. |
 | `--label KEY=VALUE` | none | A label recorded with the sandbox, which `janitor --label` selects by. Repeat it for more. |
 | `--network {host,none}` | `host` | `none` gives the sandbox only a loopback interface. |
-| `--allow-network-none` | off | Let Singularity use `--network none`, where the site lets users create network namespaces. enroot always can. |
-| `--memory-mb MEMORY_MB` | none | Arm the memory watchdog with this limit, in MiB. |
+| `--allow-network-none` | off | Let Singularity use `--network none`, where the site lets users create network namespaces. enroot and gVisor always can. |
+| `--memory-mb MEMORY_MB` | none | Arm the memory watchdog with this limit, in MiB. A gVisor sandbox is stopped whole when it exceeds it. |
 | `--timeout TIMEOUT` | `600` | Seconds after which the command is killed. |
 
 Everything after the first `--` is the command, run as an argv without a shell; the options and
@@ -138,7 +142,8 @@ notes, such as the timeout note or a report of the memory watchdog, are on stder
 
 `run` exits with the command's own status: `124` when `--timeout` killed it, `126` when the
 working directory could not be entered, `137` when the memory watchdog killed it, and whatever the
-command returned otherwise (see [Exit codes](python-api.md#exit-codes)). When the sandbox cannot
+command returned otherwise (see [Exit codes](python-api.md#exit-codes)). With gVisor, the memory
+watchdog stops the whole sandbox instead, and `run` exits with status 2. When the sandbox cannot
 start or the command cannot run, it prints `hpc-sandbox: ` and the reason on stderr, and exits with
 status 2, which a command can return too: that message tells the two apart.
 
@@ -172,7 +177,7 @@ hpc-sandbox pull docker://alpine:3.20
 ```
 
 ```text
-{"reference": "docker://alpine:3.20", "path": "/home/user/.cache/hpc-sandbox/images/sha256-ca08dbe62eacd34c6e75dc30f23c4c508277b23073e9607ca6430e09834931f9.sqsh", "sha256": "ca08dbe62eacd34c6e75dc30f23c4c508277b23073e9607ca6430e09834931f9", "manifest_digest": null}
+{"reference": "docker://alpine:3.20", "path": "/home/<user>/.cache/hpc-sandbox/images/sha256-ca08dbe62eacd34c6e75dc30f23c4c508277b23073e9607ca6430e09834931f9.sqsh", "sha256": "ca08dbe62eacd34c6e75dc30f23c4c508277b23073e9607ca6430e09834931f9", "manifest_digest": null}
 ```
 
 - `pull` stops at the first image that fails, with status 2; the lines it printed before stay valid.
@@ -205,7 +210,7 @@ such as `https_proxy`.
 It prints one JSON line on stdout, with the keys `tool`, `version` and `path`:
 
 ```text
-{"tool": "slirp4netns", "version": "1.3.6", "path": "/home/user/.cache/hpc-sandbox/tools/slirp4netns-1.3.6-x86_64"}
+{"tool": "slirp4netns", "version": "1.3.6", "path": "/home/<user>/.cache/hpc-sandbox/tools/slirp4netns-1.3.6-x86_64"}
 ```
 
 It exits with status 2 when no release is pinned for the architecture, or when the file's digest
@@ -225,13 +230,14 @@ is gone. Sessions of live processes are never touched: the report lists them as 
 |---|---|
 | `--label KEY=VALUE` | Only sessions whose labels include this pair. Repeat it for more pairs. |
 
-- With `--runtime singularity` or `--runtime enroot` (or `$HPC_SANDBOX_RUNTIME`), or with
-  `--binary`, it sweeps that runtime's sessions only. Otherwise it sweeps Singularity's sessions
-  when `singularity` or `apptainer` is on `PATH`, and enroot's always: enroot sandboxes die with
-  their owners, so sweeping them needs no enroot binary.
+- With `--runtime singularity`, `--runtime enroot` or `--runtime gvisor` (or
+  `$HPC_SANDBOX_RUNTIME`), or with `--binary`, it sweeps that runtime's sessions only. Otherwise it
+  sweeps Singularity's sessions when `singularity` or `apptainer` is on `PATH`, and enroot's and
+  gVisor's always: their sandboxes die with their owners, so sweeping them needs neither enroot nor
+  runsc.
 - It finishes the deletions that killed processes left in a trash. With Singularity's sessions, it
-  also unmounts the fuse-overlays that killed jobs left dead on the node, and deletes the
-  extractions of templates whose process died.
+  also unmounts the fuse-overlays that killed jobs left dead on the node, and, with Singularity's or
+  gVisor's, deletes the extractions of templates whose process died.
 - It waits for other janitors of the same scratch root, as `reap()` does and unlike the sweep at a
   provider's first start, and it deletes what it removes before it exits.
 

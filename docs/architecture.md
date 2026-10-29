@@ -1,17 +1,17 @@
 # Architecture
 
 This page explains how hpc-sandbox builds a sandbox, runs commands in it and tears it down: the
-mechanics that both providers share. It is for contributors, and for users who want to know what
+mechanics that its providers share. It is for contributors, and for users who want to know what
 happens on the node. What is specific to each runtime is in
-[Singularity CE and Apptainer](singularity.md) and [enroot](enroot.md), the contract your code
-relies on is in the [Python API](python-api.md), and what isolation means is in the
-[security model](security.md).
+[Singularity CE and Apptainer](singularity.md), [enroot](enroot.md) and [gVisor](gvisor.md), the
+contract your code relies on is in the [Python API](python-api.md), and what isolation means is in
+the [security model](security.md).
 
 ## Terms
 
 | Term | Meaning |
 |---|---|
-| provider | `SingularityProvider` or `EnrootProvider`: starts, restores and reaps sandboxes on one container runtime |
+| provider | `SingularityProvider`, `EnrootProvider` or `GvisorProvider`: starts, restores and reaps sandboxes on one container runtime |
 | sandbox | one running container with its own writable root filesystem, returned by `provider.start(spec)` |
 | scratch root | the node-local directory that holds sessions, snapshots, staged images and templates |
 | session | a sandbox's private directory: its root filesystem, its `/tmp` and `/var/tmp`, its lease and its owner record |
@@ -19,10 +19,10 @@ relies on is in the [Python API](python-api.md), and what isolation means is in 
 | lease | an `flock` that the process that started a sandbox holds on the sandbox's session |
 | owner record | `owner.json` in a session: who started the sandbox, and which processes make up its container |
 | image cache | where remote images are kept after their first pull, under their SHA-256; it may be on shared storage |
-| template | Singularity only: an image extracted once per node, which sandboxes copy or mount as an overlay's lower layer |
+| template | Singularity and gVisor: an image extracted once per node, which sandboxes copy, or use as an overlay's lower layer |
 | trash | a session root's `.trash/` directory, where stopped sessions wait for their deletion |
 | janitor | the sweep that stops and deletes the sessions of processes that died |
-| launcher | the small process (`anchor.py`) that creates the namespaces of an enroot sandbox or a pod service and runs its init |
+| launcher | the small process (`anchor.py`) that creates the namespaces of an enroot sandbox or a pod service and runs its init, or that runs a gVisor sandbox's `runsc run` in its place |
 | pod, holder | a group of services sharing one network; the holder is the process that owns that network |
 
 ## Overview
@@ -42,11 +42,12 @@ Starting a sandbox takes these steps:
 4. **Open a session** on node-local scratch, lease it and write its owner record
    ([Sessions](#sessions)).
 5. **Fill the root filesystem** from the image: an extraction, a copy of a template, or a FUSE
-   overlay.
-6. **Start the container**: a Singularity CE or Apptainer instance, or one long-lived
-   `enroot start`. The provider records the identities of the container's processes in the owner
-   record. A sandbox whose user namespace maps other users then gives the image's files the owners
-   of its spec's `file_owners` manifest, if it has one ([File owners](python-api.md#file-owners)).
+   overlay; a gVisor sandbox's is gVisor's own overlay of the template.
+6. **Start the container**: a Singularity CE or Apptainer instance, one long-lived
+   `enroot start`, or one long-lived `runsc run`. The provider records the identities of the
+   container's processes in the owner record. A sandbox whose user namespace maps other users then
+   gives the image's files the owners of its spec's `file_owners` manifest, if it has one
+   ([File owners](python-api.md#file-owners)).
 7. **Probe** that the root filesystem and the working directory are writable, creating the working
    directory if it is missing.
 
@@ -66,10 +67,11 @@ Everything a sandbox writes is on node-local scratch, below the scratch root:
 |---|---|
 | `sessions/` | the sessions of Singularity sandboxes |
 | `sessions-enroot/` | the sessions of enroot sandboxes |
+| `sessions-gvisor/` | the sessions of gVisor sandboxes |
 | `pods-singularity/`, `pods-enroot/` | one session per pod, holding its services' sessions in `services/` and the sockets of its exposed ports in `exposed/` |
 | `snapshots/` | snapshots, one `snap-<32 hex digits>` directory each |
 | `images/` | images staged from an image cache on another filesystem, and the remembered digests of local images |
-| `templates/` | Singularity templates |
+| `templates/`, `templates-gvisor/` | the templates of Singularity sandboxes, and those of gVisor sandboxes |
 | `runtime-tmp/`, `runtime-cache/` | the runtime's temporary and cache directories |
 | `enroot-config/`, `enroot-sysconf/`, `enroot-tools/` | enroot's empty user configuration, the system configurations the provider writes, and its import wrapper |
 
@@ -78,11 +80,11 @@ owns. [Configuration](configuration.md) says how the scratch root is chosen.
 
 ## Images and the image cache
 
-Each provider serves one image format: SIF files for Singularity CE and Apptainer, squashfs files
-for enroot. A reference names either a local image file or a remote image; each runtime page lists
-the forms it accepts. A reference the provider can never run (a SIF image for enroot, a squashfs
-image for Singularity, a scheme the runtime cannot pull) raises `ValueError` before anything is
-created.
+Each provider serves one image format: SIF files for Singularity CE and Apptainer, and for gVisor,
+whose images Singularity CE or Apptainer pulls, and squashfs files for enroot. A reference names
+either a local image file or a remote image; each runtime page lists the forms it accepts. A
+reference the provider can never run (a SIF image for enroot, a squashfs image for Singularity or
+gVisor, a scheme the runtime cannot pull) raises `ValueError` before anything is created.
 
 A remote reference is pulled once into the image cache:
 
@@ -140,10 +142,11 @@ Each sandbox owns one session directory in its provider's session root, named af
 ```
 
 Each runtime adds files of its own ([Singularity CE and Apptainer](singularity.md),
-[enroot](enroot.md)). A session is created and leased under the session root's janitor lock, so a
-janitor never sees a session between its creation and its lease. The process that started the
-sandbox holds the lease until the session has left the session root. The janitor lock is awaited on
-the event loop, never in a worker thread: a sweep that holds it needs worker threads to finish.
+[enroot](enroot.md), [gVisor](gvisor.md#root-filesystem)). A session is created and leased under
+the session root's janitor lock, so a janitor never sees a session between its creation and its
+lease. The process that started the sandbox holds the lease until the session has left the session
+root. The janitor lock is awaited on the event loop, never in a worker thread: a sweep that holds it
+needs worker threads to finish.
 
 The owner record is written atomically, with mode 0600, as soon as the session exists, and again
 once the container's processes are known:
@@ -153,10 +156,10 @@ once the container's processes are known:
 | `schema` | `hpc-sandbox/session-v1` |
 | `instance_name`, `session_directory`, `hostname` | the session the record belongs to; janitors use a record only when all three match |
 | `owner_pid`, `owner_start_time` | the process that started the sandbox |
-| `provider` | `singularity` or `enroot` |
+| `provider` | `singularity`, `enroot` or `gvisor` |
 | `labels`, `image` | from the spec |
 | `remap_root`, `container_uid` | who commands run as: root mapped to your uid (`true` and `0`), or your own uid |
-| process identities | the container's processes: the instance's PID file, PID and start time on Singularity; the PIDs and start times of the launcher and the init on enroot |
+| process identities | the container's processes: the instance's PID file, PID and start time on Singularity; the PIDs and start times of the launcher and the init on enroot, and of the launcher and gVisor's Sentry on gVisor |
 
 A PID alone is not an identity: it can be reused as soon as its process is reaped. Everything that
 signals a process it did not just start first proves the identity (PID, start time), reading the
@@ -211,7 +214,8 @@ the results and the errors as your code sees them.
 ## Transfers
 
 `upload` and `download` go through a fresh directory in the sandbox's private `/tmp`
-(`/tmp/.hpc-sandbox-transfer/<random>`), which is a directory of the session on the host. So they
+(`/tmp/.hpc-sandbox-transfer/<random>`; in a gVisor sandbox, `/.hpc-sandbox/transfer/<random>`),
+which is a directory of the session on the host. So they
 work for binary files of any size and see the container's view of paths, its mounts included. Inside
 the sandbox, `cp` runs from `/`, so transfers work once the working directory is gone; relative
 paths still resolve from the working directory, as a relative `cwd` of `exec` does.
@@ -254,7 +258,9 @@ default) and, when the sandbox holds more than the limit, kills one branch of it
 process with all its descendants. Most sites give users no cgroups, so this is a sampled guard, not
 a cgroup: usage can overshoot between samples. Where rootless cgroups work, Singularity's
 `cgroup_limits` also turns `memory_mb` into a real limit
-([Singularity CE and Apptainer](singularity.md#site-notes)).
+([Singularity CE and Apptainer](singularity.md#site-notes)). A gVisor sandbox's processes are not
+host processes, so its watchdog samples gVisor's kernel instead and stops the whole sandbox
+([gVisor](gvisor.md#limits)); the rest of this section is about the other providers.
 
 ### What it measures
 
@@ -443,7 +449,7 @@ A sweep holds the janitor lock of a session root while it looks at each `hpcsb-<
 there:
 
 1. It reports and keeps a session that is not yours, or that others may enter (mode bits beyond
-   0700). It skips the sessions of the other provider, which only that provider knows how to stop.
+   0700). It skips the sessions of other providers, which only their provider knows how to stop.
 2. A session whose lease is held, or whose owner process still runs (the same PID and start time),
    is live and left alone. With labels, a session whose recorded labels do not include them is left
    alone too.
@@ -488,7 +494,7 @@ The package is in `src/hpc_sandbox/`:
 | Module | What it does |
 |---|---|
 | `types.py` | the public data types and protocols: `SandboxSpec`, `Mount`, `ExecResult`, `Sandbox`, `SandboxProvider`, the pod types and the exceptions |
-| `sandbox.py` | what both providers share: spec checks, the start sequence, commands and their prologue, transfers, snapshots, the watchdog's wiring and teardown |
+| `sandbox.py` | what every provider shares: spec checks, the start sequence, commands and their prologue, transfers, snapshots, the watchdog's wiring and teardown |
 | `sessions.py` | session directories, leases, owner records, the trash and janitor sweeps |
 | `images.py` | image references, the image cache and its pointers, refreshes and staging |
 | `memory.py` | the memory watchdog |
@@ -498,9 +504,11 @@ The package is in `src/hpc_sandbox/`:
 | `locks.py` | `flock` helpers that never block the event loop |
 | `paths.py` | the default scratch root and image cache, and when to stage images |
 | `runtime.py` | the Singularity CE and Apptainer command line and its environment |
-| `singularity.py` | `SingularityProvider`: instances, templates and the fuse-overlay layout |
+| `singularity.py` | `SingularityProvider`: instances, its templates and the fuse-overlay layout |
+| `templates.py` | the node's templates, which Singularity and gVisor sandboxes start from: extraction, the users lock, and the deletion of abandoned extractions |
+| `gvisor.py` | `GvisorProvider`: the runsc command line, the bundle and its mount points, gVisor's overlay of the template, CPU choice, and its memory watchdog |
 | `enroot.py` | `EnrootProvider`: imports, the system configuration, and containers entered with `nsenter` |
-| `anchor.py` | the launcher, run as a script: the namespaces and the init of an enroot sandbox or a pod service, and the owners that a file owners manifest gives an image's files |
+| `anchor.py` | the launcher, run as a script: the namespaces and the init of an enroot sandbox or a pod service, a gVisor sandbox's `runsc run`, and the owners that a file owners manifest gives an image's files |
 | `pods.py` | pods and their services |
 | `holder.py` | the process that holds a pod's user and network namespaces, relays its upstreams and serves its exposed ports |
 | `subids.py` | your subordinate ids, and mapping them into a pod's user namespace with `newuidmap` and `newgidmap` |
@@ -512,6 +520,7 @@ The package is in `src/hpc_sandbox/`:
 - [Singularity CE and Apptainer](singularity.md): instances, templates, the fuse-overlay layout and
   site notes.
 - [enroot](enroot.md): imports, namespaces, the system configuration and site notes.
+- [gVisor](gvisor.md): runsc, gVisor's overlay, its limits and site notes.
 - [Security model](security.md): what isolation covers, and which problems to report.
 - [Python API](python-api.md): the contract of `exec`, transfers, snapshots and errors.
 - [Contributing](../CONTRIBUTING.md): set up a checkout and run the tests.

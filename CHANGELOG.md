@@ -4,6 +4,51 @@ What each release of hpc-sandbox changes. Its version is below 1.0: a minor rele
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
 one minor release, require a range such as `hpc-sandbox>=0.5,<0.6`.
 
+## 0.6.0 (unreleased)
+
+### Added
+
+- **An opt-in gVisor provider, `GvisorProvider`, whose sandboxes run on gVisor's kernel with
+  rootless `runsc`.** Root in such a sandbox holds every capability, but only towards gVisor's
+  kernel: it can mount file systems, create namespaces, switch users (`useradd`, `su`, apt's
+  `_apt`), trace processes, set firewall rules with `network="none"`, and run Docker, as workloads
+  ask Docker's privileged mode for, and none of it reaches the host's kernel. A sandbox runs the
+  node's gVisor template of its SIF image (`templates-gvisor/` on the scratch root), which
+  Singularity CE or Apptainer pulls and extracts, as the read-only lower layer of gVisor's overlay,
+  so a start copies nothing; `/tmp` and `/var/tmp` are part of that overlay, and
+  `overlay_size_mb` caps it. runsc never writes to a template: a bind whose target the image lacks
+  goes through a mount point of the provider's own directory, `/.hpc-sandbox`, and is bound at its
+  target inside the sandbox, which needs `mkdir` and `mount` in the image. Transfers go through
+  `/.hpc-sandbox/transfer`, so they work after root mounts over `/tmp`. Sandboxes die with the
+  process that started them, as enroot's do, whichever of its threads started them. A snapshot is
+  the overlay's upper layer, as `runsc tar rootfs-upper` writes it, and a restore keeps the owners
+  of its files. `memory_mb` stops the whole sandbox when gVisor's memory for it (the memory files
+  its Sentry holds, and the Sentry's own) exceeds the limit, and the commands then raise
+  `SandboxLostError`; `cpus` keeps a sandbox to that many CPUs, which it sees as its own, chosen
+  among those your gVisor sandboxes on the node use least. hpc-sandbox finds runsc as `binary`
+  names it, or on `PATH`, before it pulls an image, and never downloads it. Its options are
+  `platform`, `host_uds`, `net_raw`, `guest_cgroups`, `overlay_size_mb`, `singularity_binary` and
+  `extra_start_args`. It runs no pods yet. `hpc-sandbox doctor`, `run`, `pull` and `janitor` take
+  `--runtime gvisor`, or a `--binary` named `runsc`; `auto` never picks it. See
+  [gVisor](docs/gvisor.md) and [gVisor sandboxes](docs/security.md#gvisor-sandboxes).
+- **`SifImages(provider=...)`** names the provider in the error that refuses a squashfs image.
+- **`MemoryKill.measure`** says what a memory kill's sizes measure: `"PSS"`, or `"gVisor's memory"`
+  for a gVisor sandbox; the report on stderr names it.
+- **`HPC_SANDBOX_TEST_RUNTIME=gvisor`** runs the integration tests of every provider with gVisor,
+  but for those of the per-process memory watchdog; the pod integration tests skip with it.
+
+### Changed behaviour
+
+- **`hpc-sandbox janitor` sweeps gVisor's sessions too**, unless `--runtime` or `--binary` selects
+  one runtime: like enroot's, they need no runtime to sweep, since their sandboxes died with their
+  owners. See [`janitor`](docs/cli.md#janitor).
+- **Janitors keep a template that a sandbox still holds**, even once a start moved it aside because
+  it lost its marker: a gVisor sandbox holds its template's `.users.lock` while it runs. See
+  [Root filesystem](docs/gvisor.md#root-filesystem).
+- **A mount target that starts with `//` raises `ValueError`**, with every provider. Linux reads
+  `//tmp/x` as `/tmp/x`, but the checks of reserved targets did not, so such a bind passed them.
+  See [Mounts](docs/python-api.md#mounts).
+
 ## 0.5.1 (2026-10-26)
 
 ### Changed behaviour

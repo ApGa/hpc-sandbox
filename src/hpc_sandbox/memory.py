@@ -85,6 +85,7 @@ class MemoryKill:
     processes: int = 1  # how many processes the branch held
     tmpfs_bytes: int | None = None  # held by files on the sandbox's tmpfs mounts, if known
     pids: tuple[int, ...] = ()  # the branch's processes as sampled, root first
+    measure: str = "PSS"  # what the sizes measure: PSS, or the gVisor provider's own measure
 
     def message(self) -> str:
         killed = f"pid {self.pid}"
@@ -92,7 +93,7 @@ class MemoryKill:
             killed += f" and {self.processes - 1} descendant(s)"
         tmpfs = "" if self.tmpfs_bytes is None else f"; tmpfs files hold {self.tmpfs_bytes} bytes"
         return (
-            f"hpc-sandbox: memory limit exceeded (PSS {self.total_bytes} > "
+            f"hpc-sandbox: memory limit exceeded ({self.measure} {self.total_bytes} > "
             f"{self.limit_bytes} bytes); killed {killed} using {self.pss_bytes} bytes{tmpfs}"
         )
 
