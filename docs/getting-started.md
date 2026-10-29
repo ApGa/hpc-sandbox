@@ -46,7 +46,7 @@ pip install hpc-sandbox
 Where the node's `python3` is older than 3.11, load a newer one (sites often provide Python as an
 environment module) or use [uv](https://docs.astral.sh/uv/): `uv venv --python 3.12` creates the
 environment, with a Python that uv downloads if the node has none, and `uv pip install hpc-sandbox`
-installs into it. In a uv project, run `uv add "hpc-sandbox>=0.5,<0.6"`. hpc-sandbox has no
+installs into it. In a uv project, run `uv add "hpc-sandbox>=0.6,<0.7"`. hpc-sandbox has no
 dependencies and no compiled code.
 
 This installs the `hpc_sandbox` package and the `hpc-sandbox` command. `python -m hpc_sandbox` runs
@@ -55,7 +55,7 @@ the same command, for example with an environment that is not activated:
 
 hpc-sandbox's version is below 1.0: a minor release (0.4.0) may change the Python API or the command
 line, and a patch release (0.3.1) only fixes bugs. In a project that depends on hpc-sandbox, require
-one minor release, such as `hpc-sandbox>=0.5,<0.6`. [CHANGELOG.md](../CHANGELOG.md) lists what each
+one minor release, such as `hpc-sandbox>=0.6,<0.7`. [CHANGELOG.md](../CHANGELOG.md) lists what each
 release changes, and [Public API and versioning](python-api.md#public-api-and-versioning) says what
 the API is.
 

@@ -2,9 +2,9 @@
 
 What each release of hpc-sandbox changes. Its version is below 1.0: a minor release (0.4.0) may
 change the Python API or the command line, and a patch release (0.3.1) only fixes bugs. To stay on
-one minor release, require a range such as `hpc-sandbox>=0.5,<0.6`.
+one minor release, require a range such as `hpc-sandbox>=0.6,<0.7`.
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-10-29)
 
 ### Added
 
@@ -28,8 +28,10 @@ one minor release, require a range such as `hpc-sandbox>=0.5,<0.6`.
   among those your gVisor sandboxes on the node use least. hpc-sandbox finds runsc as `binary`
   names it, or on `PATH`, before it pulls an image, and never downloads it. Its options are
   `platform`, `host_uds`, `net_raw`, `guest_cgroups`, `overlay_size_mb`, `singularity_binary` and
-  `extra_start_args`. It runs no pods yet. `hpc-sandbox doctor`, `run`, `pull` and `janitor` take
-  `--runtime gvisor`, or a `--binary` named `runsc`; `auto` never picks it. See
+  `extra_start_args`. It runs no pods yet: `start_pod()` raises `ValueError`. `GvisorSandbox`, its
+  sandboxes' class, and `RunscRuntime`, the runsc command lines it runs, are public too.
+  `hpc-sandbox doctor`, `run`, `pull` and `janitor` take `--runtime gvisor`, or a `--binary` named
+  `runsc`; `auto` never picks it. See
   [gVisor](docs/gvisor.md) and [gVisor sandboxes](docs/security.md#gvisor-sandboxes).
 - **`SifImages(provider=...)`** names the provider in the error that refuses a squashfs image.
 - **`MemoryKill.measure`** says what a memory kill's sizes measure: `"PSS"`, or `"gVisor's memory"`
