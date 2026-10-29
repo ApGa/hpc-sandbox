@@ -6,9 +6,11 @@ host. Root in a sandbox holds every capability, but only towards the Sentry: it 
 systems, create namespaces, switch users, trace processes and set firewall rules, which workloads
 ask Docker's privileged mode for, and none of it reaches the host's kernel. The provider is opt-in:
 nothing picks it unless you ask for it (`GvisorProvider()`, or `--runtime gvisor` on the command
-line). It also runs services of Singularity and enroot pods, whose other services stay on their
-runtime ([Pod services](#pod-services)). [Architecture](architecture.md) describes what every
-provider shares.
+line). Its images are SIF images, which Singularity CE or Apptainer pulls, or squashfs images,
+which enroot imports, so it runs on a cluster that has either ([Images](#images)). It also runs
+services of Singularity and enroot pods, whose other services stay on their runtime
+([Pod services](#pod-services)). [Architecture](architecture.md) describes what every provider
+shares.
 
 ## What gVisor gives, and what it does not
 
@@ -45,13 +47,15 @@ exists, and each command's `runsc exec` takes about 7 ms.
 |---|---|
 | `runsc` on `PATH`, or the `binary` option, with the `gvisor-bin/` directory of its release beside it | every sandbox |
 | unprivileged user namespaces | every sandbox: rootless runsc makes one |
-| Singularity CE or Apptainer: `singularity`, else `apptainer`, on `PATH`, or the `singularity_binary` option | pulling SIF images and extracting them ([Images](#images)) |
+| Singularity CE or Apptainer (`singularity`, else `apptainer`, on `PATH`, or the `singularity_binary` option), or enroot (`enroot` on `PATH`, or the `enroot_binary` option) with its `+caps` package and squashfs-tools' `unsquashfs`, as the enroot provider needs them ([enroot](enroot.md#requirements)) | pulling and extracting images: SIF images with Singularity CE or Apptainer, squashfs images with enroot ([Images](#images)) |
 | `/bin/sh`, `sleep` and `cat` in the image | the keep-alive loop, and reading the image's environment |
 | `mkdir` and `mount` in the image | binds whose targets the image lacks ([Root filesystem](#root-filesystem)) |
 
 Run the process that starts the sandboxes on the host, or in a container of
 `singularity exec --userns`: in a setuid Singularity container without `--userns`, runsc cannot
-start its gofer. [Getting started](getting-started.md) lists what every provider needs.
+start its gofer, and inside any container, `enroot import` cannot use its file capabilities
+([enroot](enroot.md#site-notes)). [Getting started](getting-started.md) lists what every provider
+needs.
 
 ### Installing runsc
 
@@ -72,19 +76,58 @@ runsc --version
 
 ## Images
 
-The provider runs SIF images, with the references, the image cache and the staging of the
-Singularity provider ([Singularity CE and Apptainer](singularity.md#images)): Singularity CE or
-Apptainer pulls them and validates them, as `singularity_binary` names it, and with its temporary
-and cache directories on the scratch root. A squashfs image raises `ValueError` before anything is
-created.
+The provider runs one of two kinds of images, as its `images` option says:
+
+| `images` | Images, and their references | Pulled by | Extracted by |
+|---|---|---|---|
+| `"sif"` | SIF files, as the Singularity provider takes them ([Singularity CE and Apptainer](singularity.md#images)) | Singularity CE or Apptainer (`singularity_binary`), which validates them too | `singularity build --sandbox --fix-perms` |
+| `"enroot"` | squashfs files, as the enroot provider takes them ([enroot](enroot.md#images)) | `enroot import` (`enroot_binary`), with the variables of your environment that the enroot provider passes it, and the `import_env` option's ([Imports](enroot.md#imports)) | `enroot create` |
+
+By default (`images=None`), the provider runs SIF images where it finds Singularity CE or Apptainer,
+and squashfs images where it finds enroot and neither of them, the first time it needs to know. So
+on a cluster that has enroot and no Singularity, `GvisorProvider()` runs enroot's images, and
+needs no Singularity. `provider.image_kind` says which it runs. Where neither is found, a start
+raises `SandboxStartError` naming both; so does a start whose `images` names a runtime that is
+missing, before anything is pulled or created. An image of the other kind, such as a `.sqsh` file
+with `images="sif"`, raises `ValueError` before anything is created.
+
+hpc-sandbox imports images with umask 022 ([Imports](enroot.md#imports)). Import a local `.sqsh`
+file with that umask too: `enroot import` gives the image's root directory and `/etc` the
+importer's umask, and with a stricter one, such as 027, only root can enter them, so `su`, apt's
+`_apt` and every other user in the sandbox fail with `Permission denied`.
+
+Images already in the image cache stay as they were imported: before 0.7.0, hpc-sandbox imported
+the enroot provider's images with your umask. Import those again where it was stricter than 022.
+`hpc-sandbox pull --runtime enroot --refresh IMAGE` imports a tag again. `--refresh` changes
+nothing for a digest-pinned reference, which always names the same image: delete its pointer,
+`oci-<digest>.sqsh.json`, from the image cache, then pull it
+([The image cache](configuration.md#the-image-cache)).
+
+Both kinds share the image cache, the staging of images on scratch, and the temporary and cache
+directories of their runtimes on scratch (`runtime-tmp/` and `runtime-cache/`): each kind keeps
+its files and pointers under a suffix of its own (`.sif` or `.sqsh`), as providers that share a
+cache do ([Images and the image cache](architecture.md#images-and-the-image-cache)). The services
+that the provider runs in pods take the kind of images of their pod's provider, unless `images` is
+set ([Pod services](#pod-services)).
 
 ## Root filesystem
 
-Each image is extracted once per node with `singularity build --sandbox --fix-perms`, into the
-node's gVisor template of it in `templates-gvisor/` on scratch, as the Singularity provider makes
-its own templates in `templates/` ([Templates](singularity.md#templates)). The template is the
-sandbox's read-only lower layer. gVisor's overlay (`--overlay2=root:dir=<session>/overlay`) keeps
-what the sandbox writes in a file of the session, so:
+Each image is extracted once per node, into the node's gVisor template of it in `templates-gvisor/`
+on scratch, as the Singularity provider makes its own templates in `templates/`
+([Templates](singularity.md#templates)). Templates of both kinds are named, locked, shared and
+deleted alike:
+
+- A SIF image is extracted with `singularity build --sandbox --fix-perms`.
+- A squashfs image is extracted with `enroot create`, with enroot's data path set to the
+  extraction, as the enroot provider extracts a sandbox's root filesystem
+  ([Root filesystem](enroot.md#root-filesystem)). No container starts, so none of enroot's hooks
+  run. The extraction runs with umask 0: run as you, `unsquashfs` gives the files it makes your
+  umask, and with one stricter than 022, the other users in the sandbox could not run the image's
+  programs. The template's directory is private to your uid, whatever the modes inside it.
+
+Either way, your uid can then read and write everything in the template, which is the sandbox's
+read-only lower layer. gVisor's overlay (`--overlay2=root:dir=<session>/overlay`) keeps what the
+sandbox writes in a file of the session, so:
 
 - a start copies nothing, whatever the size of the image;
 - root in the sandbox can give files to any user, since the overlay keeps their owners, which a
@@ -128,7 +171,7 @@ A gVisor session holds, besides the shared files:
 | Path | What it holds |
 |---|---|
 | `config.json` | the OCI spec of the sandbox's container: the session is runsc's bundle |
-| `rootfs.json` | the template, and the upper layer's archive of a restore |
+| `rootfs.json` | the template, its kind of images, and the upper layer's archive of a restore |
 | `runsc/` | runsc's state (`--root`), private to the sandbox |
 | `overlay/` | the overlay's file |
 | `exec/` | the sandbox-side PIDs of running commands |
@@ -153,10 +196,23 @@ the host's memory as the sandbox's (`/proc/meminfo`).
 
 Each command is one `runsc exec` that runs the prologue ([Commands](architecture.md#commands)),
 with `--cwd /`. runsc runs with a minimal environment: a fixed `PATH`, and none of your variables.
-The image's environment comes from its Singularity environment scripts
-(`/.singularity.d/env/*.sh`), which a start sources inside the sandbox, once, and reads back with
-`cat /proc/self/environ`; every command gets it, then `HOME`, the spec's `env` and the call's
-`env`.
+A start reads the image's environment inside the sandbox, once; every command gets it, then
+`HOME`, the spec's `env` and the call's `env`:
+
+- **SIF images:** the variables that its Singularity environment scripts
+  (`/.singularity.d/env/*.sh`) set, sourced and read back with `cat /proc/self/environ`.
+- **enroot's images:** the variables of its `/etc/environment`, which `enroot import` writes from
+  the image's `Env`, read as enroot reads it for its own containers: leading blanks are dropped;
+  comments, blank lines, lines that set no variable and `ENROOT_` variables are skipped; quotes
+  around a value are removed; and of a variable set twice, the last value counts. enroot fills a
+  `${NAME}` in the file from its own environment on the host; here, it gets runsc's: `${PATH}` the
+  fixed `PATH`, and any other nothing, so none of your variables reach the sandbox. An image that
+  sets no `PATH` gets that `PATH` too.
+
+Commands run in the spec's `workdir`, whatever the image's own working directory: as the enroot
+provider does, the provider never runs the `/etc/rc` that enroot's own containers start with, which
+enters the image's working directory and runs its entrypoint, and the Singularity provider skips the
+image's runscript.
 
 Killing a `runsc exec` leaves its command running in the sandbox, since the command is a process of
 gVisor's kernel, not a child of `runsc exec` on the host. So, on a timeout or a cancellation,
@@ -221,6 +277,11 @@ copy of the archive, which gVisor lays over it (the `dev.gvisor.tar.rootfs.upper
 `--allow-rootfs-tar-annotation`). It works only on the node whose template the snapshot lies over,
 while that template exists: anything else raises `ValueError`.
 
+A snapshot records the kind of its image too (`images`), and a restore runs that kind, whatever
+the restoring provider's `images`: the image's environment is read as for its kind. A restore pulls
+and extracts nothing, so it needs neither Singularity CE, Apptainer nor enroot. A snapshot that
+records no kind, as those of hpc-sandbox 0.6 do, is of a SIF image.
+
 ## Teardown
 
 The launcher (`anchor.py`'s `exec` form, run with the same Python interpreter) arranges to be
@@ -263,6 +324,10 @@ as a sandbox does, with these differences:
   the container's spec.
 - `securebits="ignore"` and `guest_cgroups` are settings of the service
   ([Securebits](pods.md#securebits)).
+- Its image is of the kind that the pod's provider runs, unless the `GvisorProvider`'s `images`
+  says otherwise: a SIF image in a Singularity pod, a squashfs image in an enroot pod, which so
+  needs no Singularity. The `GvisorProvider` pulls and extracts it with its own options
+  (`singularity_binary` or `enroot_binary`, `import_env`, `image_cache` and `stage_images`).
 
 `net_raw` changes nothing for a service: the pod's network gives it no raw or packet sockets.
 
@@ -294,9 +359,10 @@ asyncio.run(main())
 ## Site notes
 
 Run `hpc-sandbox doctor --runtime gvisor --image IMAGE` on a compute node of a new site first. For
-gVisor, it also checks runsc's helpers, the Singularity CE or Apptainer that images need,
-unprivileged user namespaces, and that rootless runsc runs a command (`runsc do true`) on the
-default platform.
+gVisor, it also checks runsc's helpers; which images the provider runs, and why, and that their
+runtime runs, and for enroot's images, `unsquashfs`, whether `enroot-aufs2ovlfs` converts
+whiteouts, and whether the process runs inside a container; unprivileged user namespaces; and that
+rootless runsc runs a command (`runsc do true`) on the default platform.
 
 - **Platforms.** `systrap`, the default, needs nothing from the node. `ptrace` works too, and is
   slower. `kvm` needs a `/dev/kvm` that the job may open: batch systems that confine a job's devices
@@ -323,11 +389,20 @@ default platform.
 - **Memory.** A sandbox's memory limit stops it whole, and counts the Sentry's own memory
   ([Limits](#limits)). Keep `memory_mb` well above what the workload needs, and check
   `sandbox.memory_kills` when a sandbox is lost.
+- **Root of a container's user namespace.** Where the process that starts the sandboxes is root of
+  a user namespace that has a mount namespace of its own, as in a container entered as root
+  (`enroot start --root`, or pyxis with remap-root), runsc mounts a file of its state directory,
+  `runsc/null-netns`, in that mount namespace, and nothing unmounts it once the sandbox stops. The
+  session then cannot be deleted (`EBUSY`), with either kind of images, and doctor reports
+  `sandbox stop: session not deleted within 60 s`. As a plain user, on the host or in a container,
+  runsc mounts it in a namespace of its own, which ends with it. Start the sandboxes there until
+  hpc-sandbox unmounts it itself.
 
 ## Next steps
 
 - [Architecture](architecture.md): sessions, commands, transfers and janitors.
-- [Singularity CE and Apptainer](singularity.md): the images this provider shares, and templates.
+- [Singularity CE and Apptainer](singularity.md) and [enroot](enroot.md): the images this provider
+  shares with them, and templates.
 - [Configuration](configuration.md): every provider option, and where files go.
 - [Security model](security.md#gvisor-sandboxes): what gVisor adds to isolation, and what it does
   not.

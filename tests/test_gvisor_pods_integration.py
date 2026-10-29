@@ -1,22 +1,26 @@
-"""Pod services in gVisor end to end: a real ``runsc`` running services of Singularity CE or
-Apptainer pods, on a compute node.
+"""Pod services in gVisor end to end: a real ``runsc`` running services of Singularity CE,
+Apptainer or enroot pods, on a compute node.
 
 Run on a compute node (never a login node), with runsc on ``PATH`` (with its release's
-``gvisor-bin/`` beside it) and Singularity CE or Apptainer, which runs the pods' other services and
-pulls the images of both::
+``gvisor-bin/`` beside it) and Singularity CE or Apptainer, or enroot, which runs the pods' other
+services and pulls the images of both::
 
     HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_gvisor_pods_integration.py -v
 
-Without ``HPC_SANDBOX_INTEGRATION=1``, runsc or Singularity, every test skips. Services run
+``HPC_SANDBOX_TEST_POD_RUNTIME`` picks the pods' provider: ``singularity`` (the default where
+Singularity CE or Apptainer is on ``PATH``) or ``enroot`` (the default elsewhere). Their gVisor
+services run the images that provider runs, unless ``HPC_SANDBOX_TEST_GVISOR_IMAGES`` (``sif`` or
+``enroot``) says otherwise. Without ``HPC_SANDBOX_INTEGRATION=1``, runsc, the pods' runtime or
+the runtime of their gVisor services' images, every test skips. Services run
 ``HPC_SANDBOX_TEST_POD_IMAGE`` (default ``docker://alpine:3.20``), and the checks that need Python
 run ``HPC_SANDBOX_TEST_APT_IMAGE`` (default ``docker://python:3.12-slim``).
 ``HPC_SANDBOX_TEST_GVISOR_PLATFORM`` picks gVisor's platform (default ``systrap``). Egress checks
-run where slirp4netns is found. ``HPC_SANDBOX_TEST_SUBIDS=1`` also runs a gVisor service in a pod
-with ``users="subids"``. ``HPC_SANDBOX_TEST_GOJUDGE``, a directory that holds go-judge's
-``go-judge`` binary, as its release archive does, runs it as a gVisor service of the pods' image,
-with and without ``securebits="ignore"``. Where the pod's provider cannot run a service of its own
-(Singularity CE or Apptainer in the pod), the tests that pair one with a gVisor service skip, naming
-the error; ``tests/test_pods_integration.py`` tests those services.
+run where slirp4netns is found. ``HPC_SANDBOX_TEST_SUBIDS=1`` also runs a gVisor service in a
+Singularity pod with ``users="subids"``. ``HPC_SANDBOX_TEST_GOJUDGE``, a directory that holds
+go-judge's ``go-judge`` binary, as its release archive does, runs it as a gVisor service of the
+pods' image, with and without ``securebits="ignore"``. Where the pod's provider cannot run a
+service of its own (Singularity CE or Apptainer in the pod), the tests that pair one with a gVisor
+service skip, naming the error; ``tests/test_pods_integration.py`` tests those services.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from typing import Any
 import pytest
 
 from hpc_sandbox import (
+    EnrootProvider,
     GvisorProvider,
     GvisorService,
     HealthCheck,
@@ -56,16 +61,26 @@ from hpc_sandbox.procfs import owned_live_start_time
 from hpc_sandbox.runtime import RUNTIME_CANDIDATES
 from hpc_sandbox.sessions import remove_tree
 
+SINGULARITY = any(shutil.which(binary) for binary in RUNTIME_CANDIDATES)
+POD_RUNTIME = os.environ.get("HPC_SANDBOX_TEST_POD_RUNTIME") or (
+    "singularity" if SINGULARITY else "enroot"
+)
+GVISOR_IMAGES = os.environ.get("HPC_SANDBOX_TEST_GVISOR_IMAGES") or None
+# What the tests need on PATH: the pods' runtime, and that of their gVisor services' images.
+FOUND = {"singularity": SINGULARITY, "enroot": shutil.which("enroot") is not None}
+NEEDED = sorted(
+    {POD_RUNTIME, {"sif": "singularity", "enroot": "enroot"}.get(GVISOR_IMAGES or "", POD_RUNTIME)}
+)
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         os.environ.get("HPC_SANDBOX_INTEGRATION") != "1",
-        reason="set HPC_SANDBOX_INTEGRATION=1 on a compute node with runsc and Singularity",
+        reason="set HPC_SANDBOX_INTEGRATION=1 on a compute node with runsc and a pod runtime",
     ),
     pytest.mark.skipif(shutil.which("runsc") is None, reason="needs runsc on PATH"),
     pytest.mark.skipif(
-        not any(shutil.which(binary) for binary in RUNTIME_CANDIDATES),
-        reason="needs singularity or apptainer on PATH, for the pods and the images",
+        not all(FOUND[runtime] for runtime in NEEDED),
+        reason=f"needs {' and '.join(NEEDED)} on PATH, for the pods and their gVisor services",
     ),
 ]
 IMAGE = os.environ.get("HPC_SANDBOX_TEST_POD_IMAGE", "docker://alpine:3.20")
@@ -87,9 +102,12 @@ SECUREBITS = (
 )
 
 
-def make_provider(scratch: Path, **options: Any) -> SingularityProvider:
-    gvisor = GvisorProvider(scratch_root=scratch, platform=PLATFORM, **options.pop("gvisor", {}))
-    return SingularityProvider(scratch_root=scratch, gvisor=gvisor, **options)
+def make_provider(scratch: Path, **options: Any) -> Any:
+    """A provider of ``POD_RUNTIME``'s pods, whose gVisor services run ``GVISOR_IMAGES``."""
+    settings = {"images": GVISOR_IMAGES, **options.pop("gvisor", {})}
+    gvisor = GvisorProvider(scratch_root=scratch, platform=PLATFORM, **settings)
+    pods = EnrootProvider if POD_RUNTIME == "enroot" else SingularityProvider
+    return pods(scratch_root=scratch, gvisor=gvisor, **options)
 
 
 @pytest.fixture
@@ -102,7 +120,7 @@ def scratch() -> Iterator[Path]:
         shutil.rmtree(path, ignore_errors=True)
 
 
-async def finish(provider: SingularityProvider) -> None:
+async def finish(provider: Any) -> None:
     for pod in provider.pods:
         await pod.stop()
     report = await provider.reap()
@@ -111,7 +129,7 @@ async def finish(provider: SingularityProvider) -> None:
 
 
 @pytest.fixture
-async def provider(scratch: Path) -> AsyncIterator[SingularityProvider]:
+async def provider(scratch: Path) -> AsyncIterator[Any]:
     provider = make_provider(scratch, service_stop_grace_s=10.0)
     yield provider
     await finish(provider)
@@ -143,7 +161,7 @@ def gateway(tmp_path: Path) -> Iterator[Path]:
 _PLAIN_SERVICES: dict[str, str | None] = {}
 
 
-async def needs_plain_services(provider: SingularityProvider) -> None:
+async def needs_plain_services(provider: Any) -> None:
     """Skip, naming the error, where the pod's provider cannot run a service of its own: the
     tests that pair one with a gVisor service. Checked once per run."""
     if "error" not in _PLAIN_SERVICES:
@@ -450,12 +468,14 @@ async def test_a_gvisor_service_whose_holder_died_is_lost_and_stops(provider):
 CRASH = """\
 import asyncio, os, signal, sys
 sys.path.insert(0, {src!r})
-from hpc_sandbox import GvisorProvider, SingularityProvider, PodSpec, SandboxSpec, ServiceSpec
+from hpc_sandbox import EnrootProvider, GvisorProvider, SingularityProvider
+from hpc_sandbox import PodSpec, SandboxSpec, ServiceSpec
 
 async def main():
-    scratch, image, platform = sys.argv[1:]
-    gvisor = GvisorProvider(scratch_root=scratch, platform=platform)
-    provider = SingularityProvider(scratch_root=scratch, gvisor=gvisor)
+    scratch, image, platform, runtime, images = sys.argv[1:]
+    gvisor = GvisorProvider(scratch_root=scratch, platform=platform, images=images or None)
+    pods = EnrootProvider if runtime == "enroot" else SingularityProvider
+    provider = pods(scratch_root=scratch, gvisor=gvisor)
     pod = await provider.start_pod(PodSpec(labels={{"t": "crash"}}))
     spec = ServiceSpec("judge", SandboxSpec(image=image), runtime="gvisor")
     service = await pod.start_service(spec)
@@ -472,7 +492,16 @@ async def test_a_dead_owners_gvisor_services_die_and_the_janitor_removes_them(pr
     await needs_plain_services(provider)
     result = await asyncio.to_thread(
         subprocess.run,
-        [sys.executable, "-c", CRASH.format(src=SRC), str(scratch), IMAGE, PLATFORM],
+        [
+            sys.executable,
+            "-c",
+            CRASH.format(src=SRC),
+            str(scratch),
+            IMAGE,
+            PLATFORM,
+            POD_RUNTIME,
+            GVISOR_IMAGES or "",
+        ],
         capture_output=True,
         text=True,
         timeout=600,
@@ -543,6 +572,7 @@ async def test_securebits_ignore_lets_prctl_succeed_without_setting_them(provide
 
 
 @pytest.mark.skipif(not SUBIDS, reason="set HPC_SANDBOX_TEST_SUBIDS=1 where you have subids")
+@pytest.mark.skipif(POD_RUNTIME == "enroot", reason="enroot pods map one id: no users='subids'")
 async def test_a_subids_pod_runs_gvisor_services(provider, tmp_path):
     await needs_plain_services(provider)
     volume = tmp_path / "volume"

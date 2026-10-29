@@ -111,17 +111,19 @@ async def pods(
     fake_runtime: FakeRuntime,
 ) -> AsyncIterator[tuple[Any, str, str]]:
     """A provider with pods on a fake runtime, whose gVisor is the fake runsc; an image for its own
-    services, and a SIF image for gVisor's."""
-    sif = str(fake_runtime.make_sif(tmp_path / "images" / "judge.sif", {"app/x": "x\n"}))
+    services, and one for gVisor's, of the kind the pod's provider runs, as gVisor takes it."""
     gvisor = make_gvisor_provider(tmp_path)
     if request.param == "enroot":
         fake = request.getfixturevalue("fake_enroot")
         image = str(fake.make_sqsh(tmp_path / "images" / "main.sqsh", {"app/x": "x\n"}))
+        judge_image = str(fake.make_sqsh(tmp_path / "images" / "judge.sqsh", {"app/x": "x\n"}))
         provider: Any = make_enroot_provider(tmp_path, gvisor=gvisor, service_stop_grace_s=3.0)
     else:
-        image = sif
+        image = judge_image = str(
+            fake_runtime.make_sif(tmp_path / "images" / "judge.sif", {"app/x": "x\n"})
+        )
         provider = make_provider(tmp_path, gvisor=gvisor, service_stop_grace_s=3.0)
-    yield provider, image, sif
+    yield provider, image, judge_image
     for pod in provider.pods:
         await pod.stop()
 
@@ -163,13 +165,13 @@ async def http_get(pod: Any, port: int) -> str:
 
 
 async def test_a_gvisor_service_is_one_of_the_pods_services(pods, gateway, fake_runsc):
-    provider, image, sif = pods
+    provider, image, judge_image = pods
     port = free_port()
     spec = PodSpec(
         upstreams={"api": f"unix://{gateway}"}, exposes=[port], hosts=["alias"], labels={"t": "g"}
     )
     pod = await provider.start_pod(spec)
-    service = await pod.start_service(judge(sif, port), wait="healthy")
+    service = await pod.start_service(judge(judge_image, port), wait="healthy")
     assert isinstance(service, GvisorService) and "gvisor_services" in provider.capabilities
     main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=image)))
     # By name from the other services, from the host through an exposed port, and out to the
@@ -202,11 +204,13 @@ async def test_a_gvisor_service_is_one_of_the_pods_services(pods, gateway, fake_
 
 
 async def test_a_pod_whose_every_service_runs_in_gvisor(pods, tmp_path):
-    provider, _, sif = pods
+    provider, _, judge_image = pods
     port = free_port()
     pod = await provider.start_pod(PodSpec(exposes=[port]))
-    await pod.start_service(judge(sif, port), wait="healthy")
-    main = await pod.start_service(ServiceSpec("main", SandboxSpec(image=sif), runtime="gvisor"))
+    await pod.start_service(judge(judge_image, port), wait="healthy")
+    main = await pod.start_service(
+        ServiceSpec("main", SandboxSpec(image=judge_image), runtime="gvisor")
+    )
     assert all(isinstance(service, GvisorService) for service in pod.services.values())
     assert (await main.exec(fetch(f"http://judge:{port}/"))).stdout == "judge-ok\n"
     assert await http_get(pod, port) == "judge-ok"
@@ -220,9 +224,9 @@ async def test_a_pod_whose_every_service_runs_in_gvisor(pods, tmp_path):
 
 
 async def test_its_command_is_pid_1_and_its_exit_ends_the_service(pods):
-    provider, _, sif = pods
+    provider, _, judge_image = pods
     pod = await provider.start_pod(PodSpec())
-    spec = SandboxSpec(image=sif)
+    spec = SandboxSpec(image=judge_image)
     done = await pod.start_service(
         ServiceSpec("done", spec, command=["/bin/sh", "-c", "exit 3"], runtime="gvisor")
     )
@@ -237,7 +241,7 @@ async def test_its_command_is_pid_1_and_its_exit_ends_the_service(pods):
     working = await pod.start_service(
         ServiceSpec(
             "working",
-            SandboxSpec(image=sif, workdir="/srv/work"),
+            SandboxSpec(image=judge_image, workdir="/srv/work"),
             command=["sleep", "600"],
             runtime="gvisor",
         )
@@ -251,9 +255,9 @@ async def test_its_command_is_pid_1_and_its_exit_ends_the_service(pods):
 
 
 async def test_a_graceful_stop_reaches_a_pid_1_that_handles_sigterm(pods):
-    provider, _, sif = pods
+    provider, _, judge_image = pods
     pod = await provider.start_pod(PodSpec())
-    spec = SandboxSpec(image=sif)
+    spec = SandboxSpec(image=judge_image)
     handled = await pod.start_service(
         ServiceSpec(
             "handled",
@@ -275,9 +279,9 @@ async def test_a_graceful_stop_reaches_a_pid_1_that_handles_sigterm(pods):
 
 
 async def test_the_memory_limit_stops_the_whole_service(pods, fake_runsc):
-    provider, _, sif = pods
+    provider, _, judge_image = pods
     pod = await provider.start_pod(PodSpec())
-    spec = SandboxSpec(image=sif, memory_mb=40)
+    spec = SandboxSpec(image=judge_image, memory_mb=40)
     service = await pod.start_service(ServiceSpec("hog", spec, runtime="gvisor"))
     fake_runsc.set_value("memory-file-mb", "64")
     for _ in range(100):
@@ -292,7 +296,7 @@ async def test_the_memory_limit_stops_the_whole_service(pods, fake_runsc):
 
 
 async def test_limits_mounts_and_cpus(pods, tmp_path):
-    provider, image, sif = pods
+    provider, image, judge_image = pods
     if len(os.sched_getaffinity(0)) < 2:
         pytest.skip("needs two CPUs")
     volume = tmp_path / "volume"
@@ -302,7 +306,7 @@ async def test_limits_mounts_and_cpus(pods, tmp_path):
     service = await pod.start_service(
         ServiceSpec(
             "limited",
-            SandboxSpec(image=sif, mounts=mounts, cpus=1),
+            SandboxSpec(image=judge_image, mounts=mounts, cpus=1),
             ulimits={"stack": (-1, -1), "nofile": (1024, 2048), "nproc": (5, 5)},
             shm_mb=32,
             runtime="gvisor",
@@ -357,10 +361,10 @@ async def test_securebits_and_guest_cgroups_reach_runsc(tmp_path, fake_runsc, fa
 
 
 async def test_the_janitor_stops_what_runs_of_a_gvisor_service(pods):
-    provider, _, sif = pods
+    provider, _, judge_image = pods
     pod = await provider.start_pod(PodSpec())
     service = await pod.start_service(
-        ServiceSpec("judge", SandboxSpec(image=sif), runtime="gvisor")
+        ServiceSpec("judge", SandboxSpec(image=judge_image), runtime="gvisor")
     )
     owner = json.loads((service.session_dir / "owner.json").read_text())
     running = [(owner[f"{r}_pid"], owner[f"{r}_start_time"]) for r in ("sentry", "launcher")]
@@ -416,10 +420,10 @@ async def test_a_gvisor_service_dies_with_its_owner_and_the_janitor_removes_its_
 
 
 async def test_a_gvisor_service_whose_holder_died_is_lost(pods):
-    provider, _, sif = pods
+    provider, _, judge_image = pods
     pod = await provider.start_pod(PodSpec())
     service = await pod.start_service(
-        ServiceSpec("judge", SandboxSpec(image=sif), runtime="gvisor")
+        ServiceSpec("judge", SandboxSpec(image=judge_image), runtime="gvisor")
     )
     sentry = (service._sentry_pid, service._sentry_start_time)
     os.kill(pod.holder_pid, signal.SIGKILL)
@@ -448,10 +452,10 @@ def running(argv: list[str]) -> list[int]:
 
 
 async def test_after_its_holder_died_timeouts_and_the_memory_limit_still_apply(pods, fake_runsc):
-    provider, _, sif = pods
+    provider, _, judge_image = pods
     pod = await provider.start_pod(PodSpec())
     service = await pod.start_service(
-        ServiceSpec("judge", SandboxSpec(image=sif, memory_mb=40), runtime="gvisor")
+        ServiceSpec("judge", SandboxSpec(image=judge_image, memory_mb=40), runtime="gvisor")
     )
     command = service.exec("sleep 3017 & sleep 3017", timeout_s=3)
     started = asyncio.ensure_future(command)
@@ -545,6 +549,54 @@ async def test_gvisor_services_are_refused_without_what_they_need(
     with pytest.raises(SandboxStartError, match="runsc"):
         await pod.start_service(ServiceSpec("judge", spec, runtime="gvisor"))
     assert not [path for path in pod.services_root.iterdir() if path.name.startswith("hpcsb-")]
+    await pod.stop()
+
+
+async def test_an_enroot_pods_gvisor_services_need_no_singularity(
+    tmp_path, fake_runsc, fake_runtime, fake_enroot, monkeypatch
+):
+    """Unless the gVisor provider says ``images``, its services run the kind of images their pod's
+    provider runs: an enroot pod's, squashfs images, which enroot imports and extracts."""
+    hide_from_path(monkeypatch, "singularity", "apptainer")
+    sqsh = str(fake_enroot.make_sqsh(tmp_path / "images" / "judge.sqsh", {"app/x": "x\n"}))
+    gvisor = make_gvisor_provider(tmp_path)
+    provider = make_enroot_provider(tmp_path, gvisor=gvisor)
+    pod = await provider.start_pod(PodSpec())
+    local = await pod.start_service(ServiceSpec("local", SandboxSpec(image=sqsh), runtime="gvisor"))
+    pulled = await pod.start_service(
+        ServiceSpec("pulled", SandboxSpec(image="docker://example/judge:1"), runtime="gvisor")
+    )
+    assert (await local.exec("cat /app/x")).stdout == "x\n"
+    assert (await pulled.exec("cat /etc/os-release")).stdout == "fake\n"
+    created = [call["argv"][-1] for call in fake_enroot.calls("create")]
+    assert len(created) == 2 and sqsh in created  # a template of each image
+    assert fake_runtime.calls() == []  # Singularity never ran
+    sif = str(fake_runtime.make_sif(tmp_path / "images" / "judge.sif"))
+    with pytest.raises(ValueError, match="SIF image; the gvisor provider runs squashfs images"):
+        await pod.start_service(ServiceSpec("sif", SandboxSpec(image=sif), runtime="gvisor"))
+    await pod.stop()
+    # Its images say otherwise: SIF images, which need Singularity CE or Apptainer.
+    provider = make_enroot_provider(tmp_path, gvisor=make_gvisor_provider(tmp_path, images="sif"))
+    pod = await provider.start_pod(PodSpec())
+    with pytest.raises(SandboxStartError, match="sif images need Singularity CE or Apptainer"):
+        await pod.start_service(ServiceSpec("judge", SandboxSpec(image=sif), runtime="gvisor"))
+    with pytest.raises(ValueError, match="squashfs image; the gvisor provider runs SIF images"):
+        await pod.start_service(ServiceSpec("judge", SandboxSpec(image=sqsh), runtime="gvisor"))
+    await pod.stop()
+
+
+async def test_a_singularity_pods_gvisor_services_can_run_enroot_images(
+    tmp_path, fake_runsc, fake_runtime, fake_enroot
+):
+    sqsh = str(fake_enroot.make_sqsh(tmp_path / "images" / "judge.sqsh", {"app/x": "x\n"}))
+    gvisor = make_gvisor_provider(tmp_path, images="enroot")
+    provider = make_provider(tmp_path, gvisor=gvisor)
+    pod = await provider.start_pod(PodSpec())
+    service = await pod.start_service(
+        ServiceSpec("judge", SandboxSpec(image=sqsh), runtime="gvisor")
+    )
+    assert (await service.exec("cat /app/x")).stdout == "x\n"
+    assert [call["argv"][-1] for call in fake_enroot.calls("create")] == [sqsh]
     await pod.stop()
 
 

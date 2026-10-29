@@ -7,8 +7,10 @@ Run on a compute node (never a login node) with::
 ``HPC_SANDBOX_TEST_RUNTIME`` picks the runtime (``singularity``, ``enroot``,
 ``gvisor``, or ``auto``: the first of singularity, apptainer and enroot on
 PATH); with ``gvisor``, ``HPC_SANDBOX_TEST_GVISOR_PLATFORM`` picks gVisor's
-platform (default ``systrap``), and the tests of the per-process memory
-watchdog skip: ``tests/test_gvisor_integration.py`` tests gVisor's own.
+platform (default ``systrap``) and ``HPC_SANDBOX_TEST_GVISOR_IMAGES`` its
+images (``sif`` or ``enroot``; by default what it finds), and the tests of the
+per-process memory watchdog skip: ``tests/test_gvisor_integration.py`` tests
+gVisor's own.
 ``HPC_SANDBOX_TEST_IMAGE`` picks the image (default ``docker://alpine:3.20``;
 any image hpc-sandbox can start that has the usual command-line tools of
 BusyBox or a distribution's base system works, including a local .sif or
@@ -62,6 +64,7 @@ NETWORK_NONE = RUNTIME in ("enroot", "gvisor") or (
 )
 FAKEROOT = RUNTIME == "singularity" and os.environ.get("HPC_SANDBOX_TEST_FAKEROOT") == "1"
 GVISOR_PLATFORM = os.environ.get("HPC_SANDBOX_TEST_GVISOR_PLATFORM", "systrap")
+GVISOR_IMAGES = os.environ.get("HPC_SANDBOX_TEST_GVISOR_IMAGES") or None
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 enroot_only = pytest.mark.skipif(RUNTIME != "enroot", reason="enroot provider behavior")
 # gVisor's memory limit stops the whole sandbox: tests/test_gvisor_integration.py tests it.
@@ -132,7 +135,8 @@ def make_provider(scratch: Path) -> SessionProvider[Any]:
         return EnrootProvider(scratch_root=scratch)
     if RUNTIME == "gvisor":
         platform: Any = GVISOR_PLATFORM
-        return GvisorProvider(scratch_root=scratch, platform=platform)
+        images: Any = GVISOR_IMAGES
+        return GvisorProvider(scratch_root=scratch, platform=platform, images=images)
     return SingularityProvider(scratch_root=scratch, allow_network_none=NETWORK_NONE)
 
 
@@ -412,8 +416,12 @@ from hpc_sandbox import EnrootProvider, GvisorProvider, SandboxSpec, Singularity
 
 async def main():
     runtime, scratch, image = sys.argv[1:]
-    providers = {"enroot": EnrootProvider, "singularity": SingularityProvider}
-    provider = providers.get(runtime, GvisorProvider)(scratch_root=scratch)
+    if runtime == "gvisor":
+        images = os.environ.get("HPC_SANDBOX_TEST_GVISOR_IMAGES") or None
+        provider = GvisorProvider(scratch_root=scratch, images=images)
+    else:
+        providers = {"enroot": EnrootProvider, "singularity": SingularityProvider}
+        provider = providers[runtime](scratch_root=scratch)
     sandbox = await provider.start(SandboxSpec(image=image, labels={'t': 'j'}))
     pids = {"enroot": "_init_pid", "gvisor": "_sentry_pid", "singularity": "_instance_pid"}
     pid = getattr(sandbox, pids[runtime])
@@ -507,6 +515,8 @@ async def test_gpus_are_passed_through(scratch):
 
 
 def test_doctor_smoke_test_passes():
+    if RUNTIME == "gvisor" and GVISOR_IMAGES and GVISOR_IMAGES != GvisorProvider().image_kind:
+        pytest.skip(f"the command line runs gVisor's default images here, not {GVISOR_IMAGES}")
     result = asyncio.run(
         run_process(
             [sys.executable, "-m", "hpc_sandbox", "doctor", "--runtime", RUNTIME, "--image", IMAGE],

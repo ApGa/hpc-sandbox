@@ -655,10 +655,12 @@ mounted
 
 The `gvisor` option adds the `gvisor_services` capability. The `GvisorProvider` gives its services
 runsc and its options (`binary`, `platform`, `guest_cgroups`, `overlay_size_mb`, `host_uds` and
-`extra_start_args`), their images, which are SIF images that Singularity CE or Apptainer pulls even
-in an enroot pod, the node's templates of them, and their CPUs. The pod's provider gives them its
-timeouts, `memory_poll_s` and `service_stop_grace_s`. A gVisor service has the API of the other
-services, and the differences below.
+`extra_start_args`), their images, the node's templates of them, and their CPUs. Their images are
+of the kind that the pod's provider runs, unless the `GvisorProvider`'s `images` says otherwise:
+SIF images, which Singularity CE or Apptainer pulls, in a Singularity pod, and squashfs images,
+which enroot imports, in an enroot pod, which so needs no Singularity ([Images](gvisor.md#images)).
+The pod's provider gives them its timeouts, `memory_poll_s` and `service_stop_grace_s`. A gVisor
+service has the API of the other services, and the differences below.
 
 ### Every service in gVisor
 
@@ -682,9 +684,8 @@ service, the cost is:
 - memory: a gVisor kernel of its own, about 15 MiB when idle and more after work on many files,
   which its `memory_mb` counts, and a breach of that limit stops the whole service
   ([Its limits](#its-limits));
-- what gVisor services lack: images other than SIF images, even in an enroot pod; GPUs;
-  `run_as="caller"` and file owners manifests; raw and packet sockets, firewalls and bridges
-  ([Its network](#its-network)).
+- what gVisor services lack: GPUs; `run_as="caller"` and file owners manifests; raw and packet
+  sockets, firewalls and bridges ([Its network](#its-network)).
 
 ### Its network
 
@@ -848,7 +849,7 @@ scratch root, in `pods-singularity/` or `pods-enroot/`
 | slirp4netns ([Egress](#egress)), and a `/dev/net/tun` that users may open, as it usually is | egress |
 | a range of subordinate ids for your user in `/etc/subuid` and `/etc/subgid`, and shadow-utils' `newuidmap` and `newgidmap` (the `uidmap` package on Debian and Ubuntu) | pods with `users="subids"`, with Singularity CE and Apptainer ([Subordinate ids](#subordinate-ids)) |
 | `/bin/sh` in the image and, for a service without a command, what a sandbox needs in its image ([Image references](python-api.md#image-references)) | every service |
-| runsc and Singularity CE or Apptainer, as the gVisor provider needs them ([gVisor](gvisor.md#requirements)) | gVisor services ([gVisor services](#gvisor-services)) |
+| runsc, and the runtime of their images, as the gVisor provider needs them: Singularity CE or Apptainer in a Singularity pod, enroot in an enroot pod, unless its `images` says otherwise ([gVisor](gvisor.md#requirements)) | gVisor services ([gVisor services](#gvisor-services)) |
 
 `hpc-sandbox doctor` shows on its `pods: egress` line which slirp4netns pods would use, and, with
 Singularity, on its `pods: subordinate ids` line the ranges that pods with `users="subids"` would

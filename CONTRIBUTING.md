@@ -146,12 +146,13 @@ HPC_SANDBOX_INTEGRATION=1 uv run pytest tests/test_gvisor_pods_integration.py -v
 ```
 
 The last two run what is the gVisor provider's own, its sandboxes and the services it runs in
-Singularity pods, which need `runsc` on `PATH` (with its release's `gvisor-bin/` beside it) and
-Singularity CE or Apptainer, and skip without them. Where the pods' runtime cannot run a service
-of its own, the tests of the last file that pair one with a gVisor service skip, naming the error. `HPC_SANDBOX_TEST_RUNTIME=gvisor` runs the
-first file with gVisor too, but for its tests of the per-process memory watchdog, which gVisor's
-whole-sandbox limit replaces; the tests of `tests/test_pods_integration.py` skip with it, since
-the gVisor provider starts no pods of its own.
+Singularity or enroot pods, which need `runsc` on `PATH` (with its release's `gvisor-bin/` beside
+it) and the runtime of their images, Singularity CE or Apptainer, or enroot, and skip without them.
+Where the pods' runtime cannot run a service of its own, the tests of the last file that pair one
+with a gVisor service skip, naming the error. `HPC_SANDBOX_TEST_RUNTIME=gvisor` runs the first file
+with gVisor too, but for its tests of the per-process memory watchdog, which gVisor's whole-sandbox
+limit replaces; the tests of `tests/test_pods_integration.py` skip with it, since the gVisor
+provider starts no pods of its own.
 
 Their sandboxes live under the default scratch root
 ([The scratch root](docs/configuration.md#the-scratch-root)): where that is not on the node's local
@@ -170,6 +171,8 @@ choose what they test:
 | `HPC_SANDBOX_TEST_POD_IMAGE` | `docker://alpine:3.20` | The image of the pod tests' services; its busybox serves and fetches HTTP. |
 | `HPC_SANDBOX_TEST_APT_IMAGE` | `docker://python:3.12-slim` | The image of the pod test and the gVisor test that run apt, and of the gVisor tests that run Python (host Unix sockets, memory). |
 | `HPC_SANDBOX_TEST_GVISOR_PLATFORM` | `systrap` | gVisor's platform in `tests/test_gvisor_integration.py`, and in `tests/test_integration.py` with `HPC_SANDBOX_TEST_RUNTIME=gvisor`: `systrap`, `ptrace` or `kvm`. |
+| `HPC_SANDBOX_TEST_GVISOR_IMAGES` | unset | gVisor's `images` in the integration tests of gVisor, and in `tests/test_integration.py` with `HPC_SANDBOX_TEST_RUNTIME=gvisor`: `sif` or `enroot`. Unset, the provider's default: SIF images where `singularity` or `apptainer` is on `PATH`, else enroot's, and in pods the kind of the pods' provider. |
+| `HPC_SANDBOX_TEST_POD_RUNTIME` | `singularity` where `singularity` or `apptainer` is on `PATH`, else `enroot` | The provider of the pods of `tests/test_gvisor_pods_integration.py`: `singularity` or `enroot`. |
 | `HPC_SANDBOX_TEST_REDIS_IMAGE` | `docker://redis:7-alpine` | The Redis image that the pod tests run as each `run_as`, with its entrypoint. |
 | `HPC_SANDBOX_TEST_POSTGRES_IMAGE` | `docker://postgres:16-alpine` | The PostgreSQL image that the pod tests run as each `run_as`, with its entrypoint. |
 | `HPC_SANDBOX_TEST_SUBIDS` | unset | `1` also tests pods with `users="subids"`, with Singularity, where your user has subordinate ids (`/etc/subuid` and `/etc/subgid`) and `newuidmap` and `newgidmap` map them: services that switch users, the owners of an image's files, and that nothing they leave stays behind after a stop or a janitor's sweep. |
@@ -192,9 +195,9 @@ they ran on.
 
 - Test against the fakes: the fixtures in `tests/conftest.py` give you a provider on each fake
   runtime (`provider`, `enroot_provider` and `gvisor_provider`, whose `fake_runsc` fixture records
-  runsc's calls and sets its knobs) and an image for it (`sif` and `sqsh`; gVisor's take SIF
-  images too). Only the integration tests use a real runtime, and they run only with
-  `HPC_SANDBOX_INTEGRATION=1`.
+  runsc's calls and sets its knobs) and an image for it (`sif` and `sqsh`; gVisor's take either,
+  with the fake `singularity` or the fake `enroot`, `fake_enroot`, on `PATH`). Only the
+  integration tests use a real runtime, and they run only with `HPC_SANDBOX_INTEGRATION=1`.
 - Put a test with the tests of the code it covers, such as `tests/test_enroot.py` for the enroot
   provider. The test directory has no `__init__.py`, and test files import each other by their
   bare names (`from conftest import make_provider`), so give every test file a unique name.
@@ -333,7 +336,7 @@ request into `main`; the `lint`, `test` and `gvisor` jobs also run for every pus
 | `pr-title` | On pull requests only | The title, or the subject of a single commit, is not a Conventional Commit in the form above |
 | `lint` | `uvx pre-commit run --all-files --show-diff-on-failure` | A hook fails or changes a file |
 | `test` | On Python 3.11, 3.12 and 3.13: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, then `uv sync --group dev` and `uv run pytest -v -ra` | Unprivileged user namespaces do not work, or a test fails |
-| `gvisor` | On Python 3.12: the same sysctl, runsc, Apptainer and go-judge from their releases, each checked against a pinned checksum, `runsc --rootless do true`, `hpc-sandbox doctor --runtime gvisor --image docker://alpine:3.20` (which starts a sandbox as the provider does), then, with `HPC_SANDBOX_INTEGRATION=1`, `tests/test_gvisor_integration.py`, `tests/test_gvisor_pods_integration.py` (gVisor services in Apptainer pods, go-judge among them) and `tests/test_integration.py` with `HPC_SANDBOX_TEST_RUNTIME=gvisor` (`tests/test_gvisor.py` and `tests/test_gvisor_pods.py` run in the `test` job) | A download's checksum differs, rootless runsc does not run, `doctor` fails, or a test fails |
+| `gvisor` | On Python 3.12, twice: with SIF images (`images: sif`), and with enroot's images on a runner without Singularity (`images: enroot`). The same sysctl, runsc, go-judge, and Apptainer or enroot (with its `+caps` package) from their releases, each checked against a pinned checksum, `runsc --rootless do true`, `hpc-sandbox doctor --runtime gvisor --image docker://alpine:3.20` (which starts a sandbox as the provider does, with the images it finds), then, with `HPC_SANDBOX_INTEGRATION=1`, `tests/test_gvisor_integration.py`, `tests/test_gvisor_pods_integration.py` (gVisor services in Apptainer or enroot pods, go-judge among them) and `tests/test_integration.py` with `HPC_SANDBOX_TEST_RUNTIME=gvisor` (`tests/test_gvisor.py` and `tests/test_gvisor_pods.py` run in the `test` job) | A download's checksum differs, rootless runsc does not run, `doctor` fails, or a test fails |
 | `build` (the release workflow) | The build and the checks of [Cut a release](#cut-a-release), without publishing | The sdist or the wheel does not build or does not pass `twine check --strict`, or the wheel's `hpc-sandbox --version` fails |
 
 The `test` job has no container runtime and no `sshfs`: the fakes stand in for the runtimes, the

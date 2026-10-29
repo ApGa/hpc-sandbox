@@ -58,20 +58,29 @@ jobs:
       - name: Run tests
         run: uv run pytest -v -ra
 
-  # The gVisor provider against a real runsc (tests/test_gvisor_integration.py, its services in
-  # Apptainer pods in tests/test_gvisor_pods_integration.py, go-judge among them, and the
-  # integration tests of every provider), with Apptainer for its SIF images. runsc, Apptainer and
-  # go-judge come from their releases, checked against the checksums pinned here; the runsc release
-  # is the one the provider was measured with. tests/test_gvisor.py and tests/test_gvisor_pods.py
-  # run in the test job.
+  # The gVisor provider against a real runsc (tests/test_gvisor_integration.py, its services in pods
+  # in tests/test_gvisor_pods_integration.py, go-judge among them, and the integration tests of
+  # every provider), twice: with SIF images, which Apptainer pulls, in Apptainer pods; and on a
+  # runner without Singularity, with the squashfs images that enroot imports, in enroot pods, as on
+  # clusters that have only enroot. The provider picks its images by what it finds, and doctor says
+  # which. runsc, Apptainer, enroot and go-judge come from their releases, checked against the
+  # checksums pinned here; the runsc release is the one the provider was measured with.
+  # tests/test_gvisor.py and tests/test_gvisor_pods.py run in the test job.
   gvisor:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        images: [sif, enroot]
     env:
       GVISOR_RELEASE: "20261026.0"
       GVISOR_SHA512: 26e4a327565f5da0f73261a6387e2c20f4695a232e330095a3111b70efd604fdf09d734e8cc8f714dbb5c5607ce8c87ea80b26df549d83a146f2efd5a1af448a
       APPTAINER_VERSION: "1.5.5"
       APPTAINER_SHA256: 25095d3711504b3e8657dbb2e172ef8db9db43c4503d940c9c36b105db8dce77
+      ENROOT_VERSION: "4.2.1"
+      ENROOT_SHA256: 5955c51e88df0c5ed538d87abb5264609d4bad55fa8570745ed5d4ec66c8ab91
+      ENROOT_CAPS_SHA256: ca22652dcbdd3ebb6e2c68df781ef4301647c79dd7a41ed62899c2fd0f692750
       GOJUDGE_VERSION: "1.11.1"
       GOJUDGE_SHA256: ffb8828f6097b2cc70adfab6781a372f5f58ba77ca06cf22bbfbb6a17c7a2e65
       UV_PYTHON: "3.12"
@@ -104,6 +113,7 @@ jobs:
           echo "$directory" >> "$GITHUB_PATH"
 
       - name: Install Apptainer
+        if: matrix.images == 'sif'
         run: |
           deb="apptainer_${APPTAINER_VERSION}_amd64.deb"
           url="https://github.com/apptainer/apptainer/releases/download/v$APPTAINER_VERSION/$deb"
@@ -111,6 +121,23 @@ jobs:
           echo "$APPTAINER_SHA256  $RUNNER_TEMP/$deb" | sha256sum -c -
           sudo apt-get update -q
           sudo apt-get install -y -q "$RUNNER_TEMP/$deb"
+
+      # enroot and its +caps package, which gives enroot-aufs2ovlfs and enroot-mksquashovlfs the
+      # file capabilities that imports need; the SHA-256s are those the release publishes. enroot
+      # itself first runs in doctor, below, with its directories as hpc-sandbox sets them.
+      - name: Install enroot
+        if: matrix.images == 'enroot'
+        run: |
+          url="https://github.com/NVIDIA/enroot/releases/download/v$ENROOT_VERSION"
+          enroot="enroot_${ENROOT_VERSION}-1_amd64.deb"
+          caps="enroot+caps_${ENROOT_VERSION}-1_amd64.deb"
+          curl -fsSL -o "$RUNNER_TEMP/$enroot" "$url/$enroot"
+          curl -fsSL -o "$RUNNER_TEMP/$caps" "$url/${caps/+/%2B}"
+          echo "$ENROOT_SHA256  $RUNNER_TEMP/$enroot" | sha256sum -c -
+          echo "$ENROOT_CAPS_SHA256  $RUNNER_TEMP/$caps" | sha256sum -c -
+          sudo apt-get update -q
+          sudo apt-get install -y -q "$RUNNER_TEMP/$enroot" "$RUNNER_TEMP/$caps"
+          dpkg-query --show enroot enroot+caps
 
       # The release archive holds the go-judge binary that the go-judge test binds into a service.
       - name: Install go-judge
@@ -130,9 +157,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
-      # Starts a sandbox with runsc run, as the provider does, beyond runsc do.
+      # Starts a sandbox with runsc run, as the provider does, beyond runsc do, from the images it
+      # picks: SIF images with Apptainer, enroot's without.
       - name: Check the node with doctor
-        run: uv run hpc-sandbox doctor --runtime gvisor --image docker://alpine:3.20
+        env:
+          EXPECTED: ${{ matrix.images == 'enroot' && 'squashfs images' || 'SIF images' }}
+        run: |
+          set -o pipefail
+          uv run hpc-sandbox doctor --runtime gvisor --image docker://alpine:3.20 \
+            | tee "$RUNNER_TEMP/doctor.txt"
+          grep -q "^\[  ok\] images: $EXPECTED" "$RUNNER_TEMP/doctor.txt"
 
       - name: Run the integration tests with gVisor
         env:

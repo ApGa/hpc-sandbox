@@ -30,7 +30,7 @@ such as `allow_network_none` or `fakeroot`; see [`GvisorProvider` options](#gvis
 | `memory_poll_s` | `1.0` | Seconds between two samples of the memory watchdog. |
 | `slirp4netns` | `None` | The slirp4netns that pods use for egress, a name on `PATH` or a path. `None` means the one on `PATH` if it has the options pods need, else the one that `hpc-sandbox fetch-tools` downloaded. |
 | `service_stop_grace_s` | `0.0` | How long the commands of pod services get between SIGTERM and SIGKILL when their pod stops. |
-| `gvisor` | `None` | A `GvisorProvider` that runs the pod services whose spec says `runtime="gvisor"`, and adds the `gvisor_services` capability; it gives them runsc and its options, their images and templates, and their CPUs ([gVisor services](pods.md#gvisor-services)). Anything else raises `TypeError`. |
+| `gvisor` | `None` | A `GvisorProvider` that runs the pod services whose spec says `runtime="gvisor"`, and adds the `gvisor_services` capability; it gives them runsc and its options, their images, of the kind this provider runs unless its `images` says otherwise, their templates, and their CPUs ([gVisor services](pods.md#gvisor-services)). Anything else raises `TypeError`. |
 
 ### `SingularityProvider` options
 
@@ -66,7 +66,10 @@ the table of [options of both providers](#options-of-both-providers) describes t
 | Option | Default | Meaning |
 |---|---|---|
 | `binary` | `runsc` | runsc, a name on `PATH` or a path, with its release's `gvisor-bin/` beside it. It is looked up when first needed, and never downloaded ([Installing runsc](gvisor.md#installing-runsc)). |
-| `singularity_binary` | `singularity`, else `apptainer` | The Singularity CE or Apptainer that pulls SIF images and extracts them into the node's templates. |
+| `images` | `None` | What the sandboxes' images are: `"sif"`, SIF images that Singularity CE or Apptainer pulls and extracts into the node's templates, or `"enroot"`, squashfs images that enroot imports and extracts. `None` takes `"sif"` where Singularity CE or Apptainer is found, else `"enroot"` where enroot is, and, for the services of a pod provider, the kind that provider runs ([Images](gvisor.md#images)). Any other value raises `ValueError`. |
+| `singularity_binary` | `singularity`, else `apptainer` | The Singularity CE or Apptainer that pulls SIF images and extracts them. |
+| `enroot_binary` | `enroot` | The enroot that imports squashfs images and extracts them. |
+| `import_env` | `()` | Extra variables passed to `enroot import`, as the enroot provider's `import_env`. |
 | `platform` | `"systrap"` | gVisor's platform: `"systrap"`, `"ptrace"`, or `"kvm"` where the job may open `/dev/kvm`. Any other value raises `ValueError`. |
 | `host_uds` | `None` | Let sandboxes use the Unix sockets of the host on their mounts: `"open"` connects to them, `"create"` makes ones that host processes connect to, `"all"` allows both. |
 | `net_raw` | `False` | Allow raw and packet sockets in sandboxes (`--net-raw --allow-packet-socket-write`), and keep `CAP_NET_RAW`, for tools such as `ping` and packet capture. |
@@ -204,6 +207,7 @@ quota:
 | Singularity, Apptainer | `SINGULARITY_TMPDIR`, `APPTAINER_TMPDIR` | `runtime-tmp/` on the scratch root, or the value of whichever of the two you set. |
 | Singularity, Apptainer | `SINGULARITY_CACHEDIR`, `APPTAINER_CACHEDIR` | `runtime-cache/` on the scratch root, or the value of whichever of the two you set. |
 | enroot imports | `ENROOT_TEMP_PATH`, `ENROOT_CACHE_PATH` | `runtime-tmp/` and `runtime-cache/` on the scratch root, unless you set them. |
+| enroot imports, `enroot version` | `ENROOT_RUNTIME_PATH`, `ENROOT_DATA_PATH` | `runtime-tmp/` on the scratch root, unless you set them: enroot makes both before every command, by default in `$XDG_RUNTIME_DIR` (else `/run`) and your home directory. |
 
 `enroot create` and `enroot start` always run with the provider's own data, runtime, cache,
 temporary and configuration paths, whatever your environment and the site's `enroot.conf` say;
@@ -231,6 +235,8 @@ containers even with `--cleanenv`, and whose URLs may hold credentials. Give the
 | `HPC_SANDBOX_INTEGRATION` | Tests only | `1` runs the integration tests, which need a compute node with a container runtime. |
 | `HPC_SANDBOX_TEST_RUNTIME` | Tests only | The runtime of the integration tests: `singularity`, `enroot`, `gvisor`, or `auto` (the default, which never picks gVisor). gVisor's own integration tests are a file of their own, which runs where `runsc` is on `PATH`. |
 | `HPC_SANDBOX_TEST_GVISOR_PLATFORM` | Tests only | The platform of the integration tests with gVisor; default `systrap`. |
+| `HPC_SANDBOX_TEST_GVISOR_IMAGES` | Tests only | The images of the integration tests with gVisor, its `images` option: `sif` or `enroot`; unset, what the provider finds, and in pods the kind of the pods' provider. |
+| `HPC_SANDBOX_TEST_POD_RUNTIME` | Tests only | The provider of the pods of the integration tests of gVisor pod services: `singularity`, or `enroot`; unset, Singularity where `singularity` or `apptainer` is on `PATH`, else enroot. |
 | `HPC_SANDBOX_TEST_IMAGE` | Tests only | The image of the integration tests; default `docker://alpine:3.20`. |
 | `HPC_SANDBOX_TEST_NETWORK_NONE` | Tests only | `1` also tests `network="none"` with Singularity, where the site allows it. enroot always tests it. |
 | `HPC_SANDBOX_TEST_FAKEROOT` | Tests only | `1` also tests Singularity's `fakeroot` option, where `--fakeroot` works for the user. |

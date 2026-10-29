@@ -4,13 +4,15 @@
 instances, and `enroot start` runs one command in a container that ends with it, a sandbox is one
 long-lived `enroot start` whose command is a keep-alive loop, in namespaces that a small launcher
 creates; commands enter it with `nsenter`. Sandboxes die with the process that started them.
-[Architecture](architecture.md) describes what both providers share.
+[Architecture](architecture.md) describes what both providers share. For root's privileges in a
+sandbox, with no capability on the host's kernel, the [gVisor](gvisor.md) provider runs the same
+images in gVisor, on a cluster that has enroot and no Singularity too ([Images](gvisor.md#images)).
 
 ## Requirements
 
 | Requirement | Needed for |
 |---|---|
-| enroot 3.x: `enroot` on `PATH`, or the `binary` option | every sandbox |
+| enroot 3.x or 4.x: `enroot` on `PATH`, or the `binary` option | every sandbox |
 | enroot's `+caps` package, whose `enroot-aufs2ovlfs` converts layer whiteouts with file capabilities | importing images; local `.sqsh` files need none |
 | util-linux `nsenter` | every command |
 | unprivileged user namespaces (`/proc/sys/user/max_user_namespaces` above zero) | the launcher's namespaces |
@@ -42,7 +44,7 @@ a local file that starts like one), a scheme that enroot cannot import and a mal
 
 ### Digest pins
 
-Since enroot 3.x reads `@` in a reference as a user name, the provider imports
+Since enroot reads `@` in a reference as a user name, the provider imports
 `docker://repo[:tag]@sha256:<hex>` as `repo:sha256:<hex>`: enroot passes that to the registry where
 a tag would go, and a registry serves a manifest by its digest there. A tag next to the digest is
 dropped, since the digest decides.
@@ -78,9 +80,18 @@ changes.
 Batch-job, GPU and other variables are dropped. Besides:
 
 - `ENROOT_CACHE_PATH` and `ENROOT_TEMP_PATH` point at `runtime-cache/` and `runtime-tmp/` on
-  scratch, unless your environment sets them.
+  scratch, unless your environment sets them, and so do `ENROOT_RUNTIME_PATH` and
+  `ENROOT_DATA_PATH`, at `runtime-tmp/`: enroot makes both before every command, by default in
+  `$XDG_RUNTIME_DIR`, else `/run`, and in your home directory, which a batch job or a CI runner may
+  lack or not let you write. An import uses neither. `enroot version`, which `doctor` runs, gets
+  the same four.
 - `TAR_OPTIONS` gets `--delay-directory-restore`, so images that revisit a read-only directory
   extract instead of failing with `Permission denied`.
+- `enroot import` runs with umask 022. It makes the image's root directory and `/etc`, and writes
+  `/etc/environment`, `/etc/rc` and the like, with the importer's umask, so with a stricter one
+  only root could enter the image's root directory: no other user of a
+  [gVisor](gvisor.md#images) sandbox could run anything. The files of the image's layers keep
+  their own modes.
 - When `enroot-aufs2ovlfs` is on `PATH`, a wrapper around it comes first on `PATH`, from
   `enroot-tools/` on scratch. The whiteout converter of enroot 3.5 aborts when a layer holds both a
   whiteout and an entry of the same name, and cannot remove whiteouts below a depth of five in
@@ -240,6 +251,9 @@ uid: the launcher nests a user namespace that maps your uid and gid to the pod's
 runs in it without `--root`, so the node must let users nest three user namespaces: the pod's, the
 launcher's and enroot's. enroot maps one id into a container, so `run_as="subids"` raises
 `ValueError`, as `start_pod()` does for `PodSpec(users="subids")`. [Pods](pods.md) describes them.
+With `EnrootProvider(gvisor=GvisorProvider())`, a service with `runtime="gvisor"` runs in gVisor,
+from a squashfs image that enroot imports and extracts, as the pod's other services' images are
+([gVisor services](pods.md#gvisor-services)).
 
 ## Site notes
 
@@ -271,6 +285,7 @@ provider overrides, the site's hooks, and which of the standard hooks sandboxes 
 
 - [Architecture](architecture.md): sessions, commands, transfers, the memory watchdog and janitors.
 - [Singularity CE and Apptainer](singularity.md): the other runtime.
+- [gVisor](gvisor.md): sandboxes in gVisor, from enroot's images too.
 - [Configuration](configuration.md): every provider option, and where files go.
 - [Pods](pods.md): services that share one network.
 - [Security model](security.md): what isolation covers.

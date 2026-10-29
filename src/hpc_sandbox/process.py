@@ -108,8 +108,10 @@ async def run_process(
     cwd: str | Path | None = None,
     output_limit: int = DEFAULT_OUTPUT_LIMIT,
     on_start: Callable[[int], None] | None = None,
+    umask: int = -1,
 ) -> ProcessResult:
-    """Run ``argv`` in its own session, bounding its run time and captured output.
+    """Run ``argv`` in its own session, bounding its run time and captured output; with ``umask``
+    (not -1), with that umask.
 
     On timeout the process tree is killed and the result has ``timed_out`` set
     and exit status 124. On cancellation the tree is killed before
@@ -124,6 +126,7 @@ async def run_process(
         env=None if env is None else dict(env),
         cwd=cwd,
         start_new_session=True,
+        umask=umask,
     )
     assert proc.stdout is not None and proc.stderr is not None
     stdout, stderr = BoundedOutput(output_limit), BoundedOutput(output_limit)
