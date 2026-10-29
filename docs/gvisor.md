@@ -6,7 +6,9 @@ host. Root in a sandbox holds every capability, but only towards the Sentry: it 
 systems, create namespaces, switch users, trace processes and set firewall rules, which workloads
 ask Docker's privileged mode for, and none of it reaches the host's kernel. The provider is opt-in:
 nothing picks it unless you ask for it (`GvisorProvider()`, or `--runtime gvisor` on the command
-line). [Architecture](architecture.md) describes what every provider shares.
+line). It also runs services of Singularity and enroot pods, whose other services stay on their
+runtime ([Pod services](#pod-services)). [Architecture](architecture.md) describes what every
+provider shares.
 
 ## What gVisor gives, and what it does not
 
@@ -23,7 +25,7 @@ and unprivileged user namespaces, whose batch jobs get cgroup v1 without delegat
 | `strace -f` and `strace -p`, `ptrace`, seccomp filters, `mknod` | works |
 | A firewall: `iptables-legacy`, raw and packet sockets (with `net_raw`), veth pairs and bridges | works with `network="none"`; not with host networking |
 | Docker 29 in the sandbox: `dockerd`, `docker run` with bridge networking, `exec`, `build`, `--privileged`, `--pids-limit` | works with `guest_cgroups` and a tmpfs mounted at `/var/lib/docker` (measured with `net_raw=True`, which Docker's own networking does not need); `docker run -m` is accepted but not enforced |
-| go-judge 1.11 in the sandbox | runs once go-judge stops setting securebits that gVisor refuses ([Site notes](#site-notes)) |
+| go-judge 1.11 in the sandbox | runs as a pod service with `securebits="ignore"`, which makes the securebits that gVisor refuses look set ([Site notes](#site-notes)) |
 | `iptables` with the nftables backend, loop devices, kernel modules | does not work |
 | An overlay whose upper layer is on the root filesystem | does not work: the root filesystem is gVisor's overlay already; use a tmpfs |
 | Memory and CPU limits of cgroups in the sandbox | accepted, not enforced; pids limits are enforced with `guest_cgroups="v2"` |
@@ -241,12 +243,28 @@ parent. So:
   still matches, or whose arguments name the session's state directory, and deletes the session.
   `hpc-sandbox janitor` sweeps gVisor's sessions without runsc.
 
-## Pods
+## Pod services
 
-The gVisor provider runs no pods yet: `start_pod()` raises `ValueError`. A pod service enters its
-container's namespaces with `nsenter`, while gVisor's processes live in the Sentry, and a service
-in the pod's network namespace needs gVisor's own network stack in that namespace, as runsc runs
-it outside `--rootless`. The [roadmap](roadmap.md) lists it.
+The gVisor provider starts no pods of its own: `start_pod()` raises `ValueError`. It runs services
+of the pods of a Singularity or enroot provider instead, as that provider's `gvisor` option:
+`SingularityProvider(gvisor=GvisorProvider(...))` runs the services whose `ServiceSpec` says
+`runtime="gvisor"` in gVisor, and the pod's other services on Singularity, all in the pod's
+network ([gVisor services](pods.md#gvisor-services)); any service may, so a pod can run every
+service in gVisor ([Every service in gVisor](pods.md#every-service-in-gvisor)). Such a service runs
+as a sandbox does, with these differences:
+
+- Its launcher (`anchor.py`'s `gvisor-service` form) joins the pod's user and network namespaces
+  and nests a user namespace that maps root alone, in which it runs `runsc run`, always with
+  `--network=host`: gVisor's host network stack is the pod's network, so the service's sockets are
+  on the pod's loopback, and gVisor's kernel holds no capability over that network.
+- Its command, under the pods' start protocol, is the container's PID 1, in place of the
+  keep-alive loop, and its hostname is the service's name. Its `/etc/hosts` and `/etc/resolv.conf`
+  are the pod's, its `/dev/shm` a tmpfs of `shm_mb`, and its `ulimits` are the resource limits of
+  the container's spec.
+- `securebits="ignore"` and `guest_cgroups` are settings of the service
+  ([Securebits](pods.md#securebits)).
+
+`net_raw` changes nothing for a service: the pod's network gives it no raw or packet sockets.
 
 ## Options
 
@@ -294,11 +312,14 @@ default platform.
   `network="none"` (host networking has no bridges), and a tmpfs at `/var/lib/docker`, which root in
   the sandbox can mount itself: `mount -t tmpfs none /var/lib/docker`. The measurements started
   `dockerd` with `--iptables=false --ip6tables=false`, as gVisor's guide to Docker does.
-- **go-judge** needs two changes to run in gVisor. hpc-sandbox makes one: go-judge's container init
-  sends SIGKILL to itself as the PID 1 of a new PID namespace, which Linux ignores, and gVisor too
-  with `--signal-unkillable-policy=linux`. The other is go-judge's: before every program it sets
-  locked and `NOROOT` securebits, for which gVisor returns `EPERM`, so every run fails with
-  `keep_capability: operation not permitted` until go-judge or gVisor changes.
+- **go-judge** needs two changes to run in gVisor. go-judge's container init sends SIGKILL to
+  itself as the PID 1 of a new PID namespace, which Linux ignores, and gVisor too with
+  `--signal-unkillable-policy=linux`, which hpc-sandbox always sets. Before every program, go-judge
+  also sets locked and `NOROOT` securebits, for which gVisor returns `EPERM`, so every run fails
+  with `keep_capability: operation not permitted`. A pod service with `securebits="ignore"` makes
+  that call succeed without setting anything, which [Securebits](pods.md#securebits) weighs; as
+  root, go-judge also needs `guest_cgroups`. Measured in a pod, go-judge 1.11.1 then ran programs,
+  and enforced their CPU time limits, with `guest_cgroups="v2"`.
 - **Memory.** A sandbox's memory limit stops it whole, and counts the Sentry's own memory
   ([Limits](#limits)). Keep `memory_mb` well above what the workload needs, and check
   `sandbox.memory_kills` when a sandbox is lost.

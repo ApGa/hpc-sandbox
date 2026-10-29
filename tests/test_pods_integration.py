@@ -5,7 +5,8 @@ Run on a compute node (never a login node) with::
     HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_pods_integration.py -v
 
 ``HPC_SANDBOX_TEST_RUNTIME`` picks the runtime as for ``test_integration.py``
-(with ``gvisor``, whose provider runs no pods yet, every test skips).
+(with ``gvisor``, whose provider starts no pods of its own, every test skips:
+``test_gvisor_pods_integration.py`` tests the services it runs in pods).
 Services run ``HPC_SANDBOX_TEST_POD_IMAGE`` (default ``docker://alpine:3.20``,
 whose busybox serves and fetches HTTP); the apt check runs
 ``HPC_SANDBOX_TEST_APT_IMAGE`` (default ``docker://python:3.12-slim``), and the
@@ -66,7 +67,7 @@ pytestmark = [
         os.environ.get("HPC_SANDBOX_INTEGRATION") != "1",
         reason="set HPC_SANDBOX_INTEGRATION=1 on a compute node with a container runtime",
     ),
-    pytest.mark.skipif(RUNTIME == "gvisor", reason="the gvisor provider runs no pods yet"),
+    pytest.mark.skipif(RUNTIME == "gvisor", reason="the gvisor provider starts no pods of its own"),
 ]
 IMAGE = os.environ.get("HPC_SANDBOX_TEST_POD_IMAGE", "docker://alpine:3.20")
 APT_IMAGE = os.environ.get("HPC_SANDBOX_TEST_APT_IMAGE", "docker://python:3.12-slim")

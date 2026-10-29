@@ -756,7 +756,8 @@ async def test_what_gvisor_does_not_do_is_refused(gvisor_provider, image, tmp_pa
     manifest.write_text("0 0 /app\n")
     with pytest.raises(ValueError, match="file owners"):
         await gvisor_provider.start(SandboxSpec(image=str(image), file_owners=str(manifest)))
-    with pytest.raises(ValueError, match="does not run pods"):
+    # It names the providers that run its services in their pods.
+    with pytest.raises(ValueError, match=r"no pods of its own.*SingularityProvider\(gvisor="):
         await gvisor_provider.start_pod(PodSpec())
 
 

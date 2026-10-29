@@ -30,6 +30,7 @@ such as `allow_network_none` or `fakeroot`; see [`GvisorProvider` options](#gvis
 | `memory_poll_s` | `1.0` | Seconds between two samples of the memory watchdog. |
 | `slirp4netns` | `None` | The slirp4netns that pods use for egress, a name on `PATH` or a path. `None` means the one on `PATH` if it has the options pods need, else the one that `hpc-sandbox fetch-tools` downloaded. |
 | `service_stop_grace_s` | `0.0` | How long the commands of pod services get between SIGTERM and SIGKILL when their pod stops. |
+| `gvisor` | `None` | A `GvisorProvider` that runs the pod services whose spec says `runtime="gvisor"`, and adds the `gvisor_services` capability; it gives them runsc and its options, their images and templates, and their CPUs ([gVisor services](pods.md#gvisor-services)). Anything else raises `TypeError`. |
 
 ### `SingularityProvider` options
 
@@ -240,6 +241,7 @@ containers even with `--cleanenv`, and whose URLs may hold credentials. Give the
 | `HPC_SANDBOX_TEST_REDIS_IMAGE`, `HPC_SANDBOX_TEST_POSTGRES_IMAGE` | Tests only | The database images that the pod integration tests run as each `run_as`, with their entrypoints; default `docker://redis:7-alpine` and `docker://postgres:16-alpine`. |
 | `HPC_SANDBOX_TEST_SUBIDS` | Tests only | `1` also tests pods with `users="subids"`, with Singularity, where your user has subordinate ids that `newuidmap` and `newgidmap` map. |
 | `HPC_SANDBOX_TEST_PODS` | Tests only | How many pods the pod integration tests start at once; default 16. |
+| `HPC_SANDBOX_TEST_GOJUDGE` | Tests only | A directory that holds go-judge's `go-judge` binary, as its release archive does, which the integration tests of gVisor pod services run as a service of the pods' image, with and without `securebits="ignore"`; unset, that test skips. |
 
 [CONTRIBUTING.md](../CONTRIBUTING.md) describes how to run the tests.
 

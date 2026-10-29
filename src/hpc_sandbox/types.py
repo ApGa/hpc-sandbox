@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 Network = Literal["host", "none"]
 
@@ -157,6 +157,11 @@ PodNetwork = Literal["none", "egress"]
 PodUsers = Literal["single", "subids"]
 ServiceHealth = Literal["starting", "healthy", "unhealthy", "exited"]
 ServiceRunAs = Literal["root", "caller", "subids"]
+ServiceRuntime = Literal["gvisor"]
+ServiceSecurebits = Literal["ignore"]
+GuestCgroups = Literal["v1", "v2"]
+#: The values of :data:`GuestCgroups`, which the gVisor provider and gVisor pod services take.
+GUEST_CGROUPS: tuple[str, ...] = get_args(GuestCgroups)
 
 
 @dataclass
@@ -195,6 +200,19 @@ class ServiceSpec:
     which is your uid on the host and cannot switch users; ``"caller"``, your
     own uid, not root; or ``"subids"``, root that can switch to the users your
     subordinate ids map, in a pod started with ``users="subids"``.
+
+    ``runtime`` is what runs the service: ``None``, the pod's provider, or
+    ``"gvisor"``, gVisor, through the ``gvisor`` option of the pod's provider,
+    for a service that asks for root's privileges (Docker's ``privileged``):
+    root in it holds every capability towards gVisor's kernel only, and none
+    over the pod's network. Its root can switch to any user, so it takes
+    ``run_as`` ``"root"`` or ``"subids"``, which mean the same there, in any
+    pod. Two settings apply to gVisor services alone: ``securebits="ignore"``
+    makes ``prctl(PR_SET_SECUREBITS)`` succeed without setting the bits, which
+    gVisor refuses, for software such as go-judge that sets them before it
+    runs a program; ``guest_cgroups`` (``"v1"`` or ``"v2"``) mounts gVisor's
+    own cgroups at ``/sys/fs/cgroup``, by default as the ``GvisorProvider``
+    says.
     """
 
     name: str
@@ -204,6 +222,9 @@ class ServiceSpec:
     shm_mb: int | None = None
     ulimits: dict[str, tuple[int, int]] = field(default_factory=dict)
     run_as: ServiceRunAs = "root"
+    runtime: ServiceRuntime | None = None
+    securebits: ServiceSecurebits | None = None
+    guest_cgroups: GuestCgroups | None = None
 
 
 @dataclass

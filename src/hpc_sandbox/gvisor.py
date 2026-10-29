@@ -81,16 +81,17 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from . import memory, procfs
 from .anchor import cpu_list
 from .images import ImageStore, ResolvedImage, SifImages
 from .locks import locked
 from .paths import default_image_cache, should_stage
+from .pods import DEFAULT_SHM_MB, NAMESERVER, SERVICE_LOG, PodService, write_and_close
 from .process import DEFAULT_OUTPUT_LIMIT, ProcessResult, run_process
 from .runtime import ContainerRuntime
-from .sandbox import TRANSFER_DIR, SessionProvider, SessionSandbox, poll
+from .sandbox import TRANSFER_DIR, SessionProvider, SessionSandbox, environment_script, poll
 from .sessions import Session, kill_exact, remove_tree
 from .templates import (
     extract_image,
@@ -99,7 +100,19 @@ from .templates import (
     rootfs_template,
     template_ready,
 )
-from .types import SandboxError, SandboxSnapshot, SandboxSpec, SandboxStartError
+from .types import (
+    GUEST_CGROUPS,
+    GuestCgroups,
+    SandboxError,
+    SandboxLostError,
+    SandboxSnapshot,
+    SandboxSpec,
+    SandboxStartError,
+    ServiceSpec,
+)
+
+if TYPE_CHECKING:
+    from .pods import SessionPod
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +122,6 @@ ANCHOR_SCRIPT = Path(__file__).with_name("anchor.py")
 SNAPSHOT_FORMAT = "hpc-sandbox/gvisor-overlay-v1"
 PLATFORMS = ("systrap", "ptrace", "kvm")
 HOST_UDS = ("open", "create", "all")
-GUEST_CGROUPS = ("v1", "v2")
 #: The gVisor provider's templates, on the scratch root: its own, since each holds its mount
 #: points (:data:`PROVIDER_DIR`).
 TEMPLATE_DIR = "templates-gvisor"
@@ -185,6 +197,10 @@ _IMAGE_ENVIRONMENT = (
     "exec cat /proc/self/environ"
 )
 _SHELL_STATE = ("PWD", "OLDPWD", "SHLVL", "_", "hpc_sandbox_script")
+# sh -c _MAKE_WORKDIR hpc-sandbox UMASK WORKDIR, in a pod service before its command starts: the
+# working directory, as the start protocol makes it, so that a command entered as soon as the start
+# returns finds it. A failure is left to the start protocol to report.
+_MAKE_WORKDIR = '( if [ -n "$1" ]; then umask "$1"; fi; mkdir -p -- "$2" ) 2>/dev/null; exit 0\n'
 _SANDBOX_ID = re.compile(r"hpcsb-[0-9a-f]{32}")
 # runsc ps's table: UID PID PPID PGID C TTY STIME TIME CMD. A command's name holds at most 15
 # bytes, so a line break in one cannot make a row of that many fields.
@@ -193,6 +209,11 @@ _QUERY_TIMEOUT_S = 30.0
 _KILL_WAIT_S = 5.0
 _KILL_CONCURRENCY = 16  # runsc kill processes at once, on a timeout
 _NOFILE_CAP = 1 << 20  # what an unlimited RLIMIT_NOFILE becomes in the sandbox (Docker's default)
+_RLIM_INFINITY = (1 << 64) - 1  # an unlimited resource, in an OCI spec
+#: prctl's option that sets securebits, which a pod service's ``securebits="ignore"`` makes succeed
+#: without setting anything (:func:`securebits_filter`).
+PR_SET_SECUREBITS = 28
+_SECCOMP_ARCHITECTURES = {"x86_64": "SCMP_ARCH_X86_64", "aarch64": "SCMP_ARCH_AARCH64"}
 
 
 class RunscRuntime:
@@ -271,7 +292,9 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
     ``None`` leaves it to the scratch filesystem. ``extra_start_args`` are runsc options added to
     each ``runsc run``.
 
-    Sandboxes die with the process that started them. Pods are not supported yet.
+    Sandboxes die with the process that started them. The provider starts no pods of its own: give
+    it as the ``gvisor`` option of a Singularity or enroot provider to run services of their pods
+    in gVisor (:class:`GvisorService`).
     """
 
     name = "gvisor"
@@ -292,7 +315,7 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
         platform: Literal["systrap", "ptrace", "kvm"] = "systrap",
         host_uds: Literal["open", "create", "all"] | None = None,
         net_raw: bool = False,
-        guest_cgroups: Literal["v1", "v2"] | None = None,
+        guest_cgroups: GuestCgroups | None = None,
         overlay_size_mb: int | None = None,
         bind_resolv_conf: bool = True,
         extra_start_args: Sequence[str] = (),
@@ -435,20 +458,14 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
         return await asyncio.to_thread(remove_abandoned_extractions, self.template_root)
 
     async def _stop_abandoned(self, path: Path, record: dict[str, Any] | None) -> bool:
-        """Kill what still runs of an abandoned sandbox, which usually died with its owner: the
-        launcher and the Sentry that its owner record names, then any process of yours whose
-        arguments name the session's own state directory."""
-        processes = []
-        if record is not None:
-            for role in ("sentry", "launcher"):  # the Sentry first: its end stops the sandbox
-                pid, started = record.get(f"{role}_pid"), record.get(f"{role}_start_time")
-                if isinstance(pid, int) and isinstance(started, str):
-                    processes.append((pid, started))
-        stopped = await asyncio.to_thread(kill_exact, processes, path.name)
-        survivors = await asyncio.to_thread(runsc_processes, path / STATE_DIR)
-        if survivors:
-            stopped |= await asyncio.to_thread(kill_exact, survivors, path.name)
-        return stopped
+        return await stop_abandoned(path, record)
+
+    def _check_pods(self) -> None:
+        raise ValueError(
+            "the gvisor provider starts no pods of its own: give it to a provider with pods, as "
+            "SingularityProvider(gvisor=...) or EnrootProvider(gvisor=...), and start the services "
+            "with ServiceSpec(runtime='gvisor')"
+        )
 
     def _choose_cpus(self, cpus: float) -> list[int] | None:
         """The CPUs a sandbox with ``cpus`` runs on: as many as ``cpus`` rounded up, of those this
@@ -487,7 +504,11 @@ class GvisorSandbox(SessionSandbox):
 
     def __init__(self, provider: GvisorProvider, spec: SandboxSpec) -> None:
         super().__init__(provider, spec)
-        self._provider: GvisorProvider = provider
+        # The provider of runsc, its options, the templates and the CPUs: this sandbox's own, or for
+        # a pod service the gVisor provider that its pod's provider delegates to. self._provider is
+        # the provider that started it, whose timeouts and limits it keeps: a pod service's is the
+        # pod's provider.
+        self._gvisor: GvisorProvider = provider
         self._launcher: subprocess.Popen[bytes] | None = None
         self._launcher_start_time: str | None = None
         self._sentry_pid: int | None = None
@@ -539,7 +560,7 @@ class GvisorSandbox(SessionSandbox):
     def _global_flags(self) -> list[str]:
         """runsc's options before each subcommand for this sandbox."""
         assert self._session is not None
-        provider = self._provider
+        provider = self._gvisor
         overlay = f"root:dir={self._session.path / OVERLAY_DIR}"
         if provider.overlay_size_mb is not None:
             overlay += f",size={provider.overlay_size_mb}m"
@@ -547,7 +568,7 @@ class GvisorSandbox(SessionSandbox):
             "--rootless",
             f"--root={self._state}",
             f"--platform={provider.platform}",
-            f"--network={'none' if self.spec.network == 'none' else 'host'}",
+            f"--network={'host' if self._host_network() else 'none'}",
             "--signal-unkillable-policy=linux",
             f"--overlay2={overlay}",
             "--allow-suid",
@@ -556,16 +577,36 @@ class GvisorSandbox(SessionSandbox):
             flags.append(f"--host-uds={provider.host_uds}")
         if provider.net_raw:
             flags += ["--net-raw", "--allow-packet-socket-write"]
-        if provider.guest_cgroups == "v2":
+        if self._guest_cgroups() == "v2":
             flags.append("--in-sandbox-cgroup=v2")
         if self._upper is not None:
             flags.append("--allow-rootfs-tar-annotation")
         return flags
 
+    def _host_network(self) -> bool:
+        """Whether runsc gives the sandbox the network it runs in (``--network=host``)."""
+        return self.spec.network != "none"
+
+    def _guest_cgroups(self) -> str | None:
+        return self._gvisor.guest_cgroups
+
+    def _container_args(self) -> list[str]:
+        """The container's command, its PID 1."""
+        return ["/bin/sh", "-c", KEEPALIVE, self.id]
+
+    def _hostname(self) -> str:
+        return socket.gethostname()
+
+    def _host_binds(self) -> list[tuple[Path, str, bool]]:
+        """The host's files bound into every sandbox, as ``(source, target, read_only)``."""
+        resolv_conf = Path("/etc/resolv.conf")
+        if self._host_network() and self._gvisor.bind_resolv_conf and resolv_conf.is_file():
+            return [(resolv_conf.resolve(), "/etc/resolv.conf", True)]
+        return []
+
     def _bundle(self) -> dict[str, Any]:
         """The OCI spec of the sandbox's container (``config.json``)."""
         assert self._session is not None and self._lower is not None
-        provider = self._provider
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         limits = [
             _NOFILE_CAP if value == resource.RLIM_INFINITY else value for value in (soft, hard)
@@ -583,7 +624,7 @@ class GvisorSandbox(SessionSandbox):
         ]
         for bind in self._binds:
             mounts.append(_bind(bind.source, bind.point or bind.target, bind.read_only))
-        if provider.guest_cgroups:
+        if self._guest_cgroups():
             mounts.append(
                 {
                     "destination": "/sys/fs/cgroup",
@@ -593,14 +634,14 @@ class GvisorSandbox(SessionSandbox):
                 }
             )
         namespaces = [{"type": kind} for kind in ("pid", "ipc", "uts", "mount")]
-        if self.spec.network == "none":
+        if not self._host_network():
             namespaces.append({"type": "network"})
         spec: dict[str, Any] = {
             "ociVersion": "1.0.2",
             "process": {
                 "terminal": False,
                 "user": {"uid": 0, "gid": 0},
-                "args": ["/bin/sh", "-c", KEEPALIVE, self.id],
+                "args": self._container_args(),
                 "env": [f"PATH={_HOST_PATH}"],
                 "cwd": "/",
                 "capabilities": {
@@ -610,7 +651,7 @@ class GvisorSandbox(SessionSandbox):
                 "rlimits": [{"type": "RLIMIT_NOFILE", "soft": limits[0], "hard": limits[1]}],
             },
             "root": {"path": str(self._lower), "readonly": False},
-            "hostname": socket.gethostname(),
+            "hostname": self._hostname(),
             "mounts": mounts,
             "linux": {"namespaces": namespaces},
         }
@@ -635,14 +676,7 @@ class GvisorSandbox(SessionSandbox):
         session.tmp.mkdir(mode=0o700)
         session.var_tmp.mkdir(mode=0o700)
         self._transfer_source.mkdir(mode=0o700)
-        binds: list[tuple[Path, str, bool]] = []
-        resolv_conf = Path("/etc/resolv.conf")
-        if (
-            self.spec.network == "host"
-            and self._provider.bind_resolv_conf
-            and resolv_conf.is_file()
-        ):
-            binds.append((resolv_conf.resolve(), "/etc/resolv.conf", True))
+        binds = self._host_binds()
         for mount in self.spec.mounts:
             binds.append((Path(mount.source).resolve(), mount.target, mount.read_only))
         self._binds = plan_binds(self._lower, binds)
@@ -658,20 +692,20 @@ class GvisorSandbox(SessionSandbox):
 
     async def _start_container(self) -> None:
         assert self._session is not None and self._lower is not None
-        provider = self._provider
+        provider, gvisor = self._provider, self._gvisor
         self._template_lock = await hold_template(self._lower)
         if self.spec.cpus is None:
             await self._start_launcher()
         else:
             # One start at a time chooses CPUs, until its launcher, which names them, runs.
-            async with locked(provider.scratch_root / CPU_LOCK):
-                self._cpus = await asyncio.to_thread(provider._choose_cpus, self.spec.cpus)
+            async with locked(gvisor.scratch_root / CPU_LOCK):
+                self._cpus = await asyncio.to_thread(gvisor._choose_cpus, self.spec.cpus)
                 await self._start_launcher()
         launcher = self._launcher
         assert launcher is not None
         self._launcher_start_time = procfs.start_time(launcher.pid)
         self._record()
-        log_path = self._session.path / RUNSC_LOG
+        log_path = self._log_path
         deadline = time.monotonic() + provider.start_timeout_s
         while READY not in _read_lines(log_path):
             if launcher.poll() is not None:
@@ -692,37 +726,44 @@ class GvisorSandbox(SessionSandbox):
         await self._bind_at_targets()
         self._environment = await self._image_environment()
 
-    async def _start_launcher(self) -> None:
-        """Start the launcher, from the thread that starts every launcher (:class:`_Spawner`)."""
+    @property
+    def _log_path(self) -> Path:
+        """Where the launcher's output, runsc's and the container's, goes."""
         assert self._session is not None
-        provider = self._provider
-        cpus = ["--cpus", ",".join(map(str, self._cpus))] if self._cpus else []
-        command = [
-            sys.executable,
-            "-I",
-            "-S",
-            str(ANCHOR_SCRIPT),
-            str(os.getpid()),
-            "exec",
-            *cpus,
-            "--",
-            provider.runtime.path,
+        return self._session.path / RUNSC_LOG
+
+    def _runsc_run(self) -> list[str]:
+        """The ``runsc run`` command line of the sandbox."""
+        assert self._session is not None
+        gvisor = self._gvisor
+        return [
+            gvisor.runtime.path,
             *self._global_flags(),
-            *provider.extra_start_args,
+            *gvisor.extra_start_args,
             "run",
             "--bundle",
             str(self._session.path),
             self.id,
         ]
-        with (self._session.path / RUNSC_LOG).open("wb") as output:
+
+    def _launcher_command(self) -> list[str]:
+        cpus = ["--cpus", ",".join(map(str, self._cpus))] if self._cpus else []
+        launcher = [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid())]
+        return [*launcher, "exec", *cpus, "--", *self._runsc_run()]
+
+    async def _start_launcher(self, stdin: int = subprocess.DEVNULL) -> None:
+        """Start the launcher, from the thread that starts every launcher (:class:`_Spawner`)."""
+        command = self._launcher_command()
+        with self._log_path.open("wb") as output:
             started = _SPAWNER.submit(
                 partial(
                     subprocess.Popen,
                     command,
-                    stdin=subprocess.DEVNULL,
+                    stdin=stdin,
                     stdout=output,
                     stderr=subprocess.STDOUT,
-                    env=provider.runtime.environment(),
+                    env=self._gvisor.runtime.environment(),
+                    cwd="/",  # never the caller's directory, which nothing needs
                     start_new_session=True,
                 )
             )
@@ -809,7 +850,7 @@ class GvisorSandbox(SessionSandbox):
             self._mark_lost("the sandbox's Sentry is gone")
         pid_file = self._session.path / EXEC_DIR / uuid.uuid4().hex
         argv = [
-            self._provider.runtime.path,
+            self._gvisor.runtime.path,
             *self._global_flags(),
             "exec",
             "--cwd",
@@ -825,7 +866,7 @@ class GvisorSandbox(SessionSandbox):
                     argv,
                     timeout_s=timeout_s,
                     stdin=stdin,
-                    env=self._provider.runtime.environment(),
+                    env=self._gvisor.runtime.environment(),
                     output_limit=self._output_limit,
                     on_start=on_start,
                 )
@@ -836,7 +877,7 @@ class GvisorSandbox(SessionSandbox):
                 await self._kill_command(pid_file)
         finally:
             pid_file.unlink(missing_ok=True)
-        if not self._container_alive() and self._stop_task is None and not self._stopping:
+        if not self._sentry_alive() and self._stop_task is None and not self._stopping:
             # runsc exec may report success for a command whose sandbox died under it.
             self._mark_lost(result.stderr.decode(errors="replace"))
         return result
@@ -848,9 +889,9 @@ class GvisorSandbox(SessionSandbox):
             pid = int(pid_file.read_text().strip())
         except (OSError, ValueError):
             return  # it never started
-        if not self._container_alive():
+        if not self._sentry_alive():
             return
-        runtime = self._provider.runtime
+        runtime = self._gvisor.runtime
         try:
             listing = await runtime.run(
                 *self._global_flags(), "ps", self.id, timeout_s=_QUERY_TIMEOUT_S
@@ -878,8 +919,12 @@ class GvisorSandbox(SessionSandbox):
                 log.warning("sandbox %s: could not kill a command in it: %s", self.id, outcome)
 
     def _container_alive(self) -> bool:
+        return self._sentry_alive()
+
+    def _sentry_alive(self) -> bool:
         """Whether the Sentry runs, and is not on its way out: a command whose Sentry was killed
-        can end while the kernel still tears the Sentry down."""
+        can end while the kernel still tears the Sentry down. For a pod service, whether its
+        processes can still be reached and its memory limit still applies, holder or not."""
         return (
             self._sentry_pid is not None
             and self._memory_kill is None
@@ -924,7 +969,7 @@ class GvisorSandbox(SessionSandbox):
         it lies over."""
         assert self._lower is not None
         archive = target / UPPER_ARCHIVE
-        result = await self._provider.runtime.run(
+        result = await self._gvisor.runtime.run(
             *self._global_flags(),
             "tar",
             "rootfs-upper",
@@ -957,7 +1002,7 @@ class GvisorSandbox(SessionSandbox):
 
     async def _check_memory(self, held: SentryMemory, limit_bytes: int) -> None:
         total = await asyncio.to_thread(held.read)
-        if total is None or total <= limit_bytes or not self._container_alive():
+        if total is None or total <= limit_bytes or not self._sentry_alive():
             return
         kill = memory.MemoryKill(
             pid=held.pid,
@@ -971,6 +1016,263 @@ class GvisorSandbox(SessionSandbox):
         self._memory_kill = kill  # before the signal: commands that fail find it
         self._on_memory_kill(kill)
         await asyncio.to_thread(kill_exact, [(held.pid, held.started)], self.id)
+
+
+class GvisorService(PodService, GvisorSandbox):
+    """A pod service in gVisor: ``pod.start_service(ServiceSpec(..., runtime="gvisor"))``, in a pod
+    of a provider created with ``gvisor=GvisorProvider(...)``.
+
+    Its launcher (:mod:`hpc_sandbox.anchor`'s ``gvisor-service`` form) joins the pod's user and
+    network namespaces, nests a user namespace that maps root alone, and runs
+    ``runsc --rootless --network=host run`` there. gVisor's host network stack is then the pod's,
+    so the service's sockets are on the pod's loopback, where the other services reach it by name,
+    and gVisor's kernel holds no capability over that network, as a Singularity service's root
+    holds none. The service's command, under the pods' start protocol, is the container's PID 1;
+    commands, health checks and transfers run with ``runsc exec`` from the host. runsc, its
+    options, the image, its template and the CPUs come from the gVisor provider; the timeouts, the
+    log and the session from the pod's.
+    """
+
+    # Both parents define much of the sandbox, and PodService comes first in the MRO. What it does
+    # as a pod service comes from PodService: the start protocol's command (_service_argv), the
+    # pod's names, health checks, the session in the pod's directory and its discard, and the
+    # owner record's pod fields. What runs it comes from GvisorSandbox: every name that both
+    # define is defined here too, as a hook or as GvisorSandbox's own (_start_container,
+    # _stop_container, _spawn, _container_alive, _prepare_rootfs, _identity, _user,
+    # _workdir_umask, _full_environment, __init__), so that a name PodService gains later cannot
+    # silently take its place (tests/test_gvisor_pods.py checks this).
+
+    #: Root of gVisor's kernel, which can switch to any user: ``"subids"`` means the same there.
+    run_modes = ("root", "subids")
+
+    def __init__(self, provider: SessionProvider[Any], pod: SessionPod, service: ServiceSpec):
+        super().__init__(provider, pod, service)
+        gvisor = provider.gvisor
+        if not isinstance(gvisor, GvisorProvider):
+            raise ValueError(f"the {provider.name} provider has no gvisor=GvisorProvider(...)")
+        self._gvisor = gvisor
+
+    @classmethod
+    def _check_start(cls, pod: SessionPod, spec: ServiceSpec) -> None:
+        gvisor = pod._provider.gvisor
+        assert gvisor is not None
+        if spec.run_as not in cls.run_modes:
+            raise ValueError(
+                f"a gVisor service runs as root of gVisor's kernel, which can switch to any user: "
+                f"run_as 'root' or 'subids', not {spec.run_as!r}"
+            )
+        if spec.sandbox.file_owners is not None:
+            raise ValueError(gvisor._file_owners_refusal())
+        gvisor._check(spec.sandbox, service=True)
+        gvisor._find_runsc()  # before an image is pulled or extracted
+
+    async def _populate(self) -> Callable[[Session], Coroutine[Any, Any, None]]:
+        gvisor = self._gvisor
+        await gvisor._prepare()
+        image = await gvisor.images.resolve(self.spec.image)
+        return partial(gvisor._extract, image)
+
+    # What the service's container is.
+
+    def _host_network(self) -> bool:
+        return True  # the pod's: the launcher runs runsc in the pod's network namespace
+
+    def _guest_cgroups(self) -> str | None:
+        return self.service.guest_cgroups or self._gvisor.guest_cgroups
+
+    def _container_args(self) -> list[str]:
+        return self._service_argv()
+
+    def _hostname(self) -> str:
+        return self.name
+
+    def _host_binds(self) -> list[tuple[Path, str, bool]]:
+        return [(self.hosts_path, "/etc/hosts", True), (self.resolv_path, "/etc/resolv.conf", True)]
+
+    def _bundle(self) -> dict[str, Any]:
+        spec = GvisorSandbox._bundle(self)
+        process = spec["process"]
+        limits = {limit["type"]: limit for limit in process["rlimits"]}
+        for name, (soft, hard) in self._ulimits.items():
+            kind = f"RLIMIT_{name.upper()}"
+            unlimited = _NOFILE_CAP if name == "nofile" else _RLIM_INFINITY
+            soft, hard = (unlimited if value < 0 else value for value in (soft, hard))
+            limits[kind] = {"type": kind, "soft": soft, "hard": hard}
+        process["rlimits"] = list(limits.values())
+        size = (self.service.shm_mb or DEFAULT_SHM_MB) * 1024 * 1024
+        shm = {
+            "destination": "/dev/shm",
+            "type": "tmpfs",
+            "source": "shm",
+            "options": ["nosuid", "nodev", "mode=1777", f"size={size}"],
+        }
+        mounts = spec["mounts"]
+        mounts.insert(next(i for i, m in enumerate(mounts) if m["destination"] == "/dev") + 1, shm)
+        if self.service.securebits == "ignore":
+            spec["linux"]["seccomp"] = securebits_filter()
+        return spec
+
+    def _runsc_run(self) -> list[str]:
+        run = GvisorSandbox._runsc_run(self)
+        if self.service.securebits == "ignore":
+            run.insert(1, "--oci-seccomp")  # a global option: runsc applies the spec's filter
+        return run
+
+    def _launcher_command(self) -> list[str]:
+        cpus = ["--cpus", ",".join(map(str, self._cpus))] if self._cpus else []
+        launcher = [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid())]
+        holder = str(self.pod.holder_pid)
+        return [*launcher, "gvisor-service", holder, *cpus, "--", *self._runsc_run()]
+
+    @property
+    def _log_path(self) -> Path:
+        return self._files / SERVICE_LOG
+
+    # The lifecycle.
+
+    def _prepare_rootfs(self) -> None:
+        self.pod._write_hosts(self)
+        self.resolv_path.write_text(f"nameserver {NAMESERVER}\n")
+        GvisorSandbox._prepare_rootfs(self)
+
+    async def _start_launcher(self, stdin: int = subprocess.PIPE) -> None:
+        # Its stdin carries the command's environment (_start_container).
+        await GvisorSandbox._start_launcher(self, stdin=stdin)
+
+    async def _start_container(self) -> None:
+        if not self.pod.holder_alive():
+            raise SandboxLostError(f"pod {self.pod.id} lost its holder")
+        try:
+            # The launcher, the Sentry, the binds, the image's environment and the working
+            # directory, while the command's shell waits for its own variables on stdin.
+            await GvisorSandbox._start_container(self)
+            workdir = [self._workdir_umask(), self.spec.workdir]
+            argv = ["/bin/sh", "-c", _MAKE_WORKDIR, "hpc-sandbox", *workdir]
+            await self._run(argv, cwd="/", env={}, stdin=None, timeout_s=_QUERY_TIMEOUT_S)
+            launcher = self._launcher
+            assert launcher is not None and launcher.stdin is not None
+            line = environment_script({**self._environment, "HOME": "/root", **self.spec.env})
+            await asyncio.to_thread(write_and_close, launcher.stdin, line)
+        finally:
+            launcher = self._launcher
+            if launcher is not None and launcher.stdin is not None and not launcher.stdin.closed:
+                launcher.stdin.close()
+
+    async def _spawn(
+        self,
+        command: list[str],
+        *,
+        stdin: bytes | None,
+        timeout_s: float,
+        on_start: Callable[[int], None],
+    ) -> ProcessResult:
+        if not self._container_alive():
+            self._mark_lost(
+                "the pod's holder is gone"
+                if not self.pod.holder_alive()
+                else "the service's command exited"
+            )
+        return await GvisorSandbox._spawn(
+            self, command, stdin=stdin, timeout_s=timeout_s, on_start=on_start
+        )
+
+    def _command_running(self) -> bool:
+        sentry = self._sentry_pid
+        return (
+            sentry is not None
+            and procfs.owned_live_start_time(sentry) == self._sentry_start_time
+            and not procfs.exiting(sentry)
+        )
+
+    def _container_alive(self) -> bool:
+        # New commands need the holder too. Once it died, the Sentry runs on until the pod stops,
+        # and the memory limit and the kills of timed-out commands still go by the Sentry alone.
+        return self._sentry_alive() and self.pod.holder_alive()
+
+    @property
+    def exit_status(self) -> int | None:
+        """The exit status of the service's command, once it exited (128 + signal if killed)."""
+        launcher = self._launcher
+        if launcher is not None and launcher.poll() is not None:
+            code = launcher.returncode  # negative when the launcher itself was killed
+            self._exit_status = 128 - code if code < 0 else code
+        return self._exit_status
+
+    async def _terminate(self) -> None:
+        """Ask the command, the container's PID 1, to stop: SIGTERM through ``runsc kill``. As in
+        a Docker container, a PID 1 gets it only when it handles SIGTERM."""
+        if not self._command_running():
+            return
+        try:
+            result = await self._gvisor.runtime.run(
+                *self._global_flags(), "kill", self.id, "TERM", timeout_s=_QUERY_TIMEOUT_S
+            )
+        except SandboxError as error:
+            log.warning("service %s of pod %s: %s", self.name, self.pod.id, error)
+            return
+        if result.returncode != 0 and self._command_running():
+            log.warning(
+                "service %s of pod %s: runsc kill: %s", self.name, self.pod.id, result.detail()
+            )
+
+    async def _stop_container(self, session: Session) -> None:
+        launcher = self._launcher
+        if launcher is not None and launcher.stdin is not None and not launcher.stdin.closed:
+            launcher.stdin.close()
+        try:
+            await GvisorSandbox._stop_container(self, session)
+        finally:
+            if launcher is not None and launcher.returncode is not None:
+                code = launcher.returncode  # negative when the launcher itself was killed
+                self._exit_status = 128 - code if code < 0 else code
+
+    # What the owner record, the watchdog and the files say.
+
+    def _identity(self) -> dict[str, Any]:
+        return {
+            "pod": self.pod.id,
+            "service": self.name,
+            "runtime": "gvisor",
+            "run_as": self.service.run_as,
+            **GvisorSandbox._identity(self),
+        }
+
+    def _user(self) -> dict[str, Any]:
+        return GvisorSandbox._user(self)
+
+    def _workdir_umask(self) -> str:
+        return GvisorSandbox._workdir_umask(self)
+
+    def _full_environment(self, env: Mapping[str, str]) -> dict[str, str]:
+        return GvisorSandbox._full_environment(self, env)
+
+    def _watch_root(self) -> int | None:
+        return None  # its processes are gVisor's, not the host's
+
+    def _own_processes(self) -> list[int]:
+        return []
+
+    def _container_pid(self) -> int | None:
+        return None
+
+    @property
+    def _writes_as_other_users(self) -> bool:
+        return False  # its users are gVisor's: on the host, everything it writes is yours
+
+
+def securebits_filter() -> dict[str, Any]:
+    """The OCI seccomp filter of ``securebits="ignore"``: ``prctl(PR_SET_SECUREBITS, ...)`` returns
+    0 and sets nothing, and every other call, other prctl options included, runs as before."""
+    rule = {
+        "names": ["prctl"],
+        "action": "SCMP_ACT_ERRNO",
+        "errnoRet": 0,
+        "args": [{"index": 0, "value": PR_SET_SECUREBITS, "op": "SCMP_CMP_EQ"}],
+    }
+    spec: dict[str, Any] = {"defaultAction": "SCMP_ACT_ALLOW", "syscalls": [rule]}
+    if architecture := _SECCOMP_ARCHITECTURES.get(os.uname().machine):
+        spec["architectures"] = [architecture]
+    return spec
 
 
 class SentryMemory:
@@ -1254,6 +1556,24 @@ def command_groups(listing: str, pid: int) -> list[int]:
         if groups[process] not in found:
             found.append(groups[process])
     return [group for group in found if group != 1]
+
+
+async def stop_abandoned(path: Path, record: dict[str, Any] | None) -> bool:
+    """Kill what still runs of the abandoned gVisor sandbox or pod service whose session is
+    ``path``, which usually died with its owner: the launcher and the Sentry that its owner record
+    names, then any process of yours whose arguments name the session's own state directory.
+    Return whether anything ran."""
+    processes = []
+    if record is not None:
+        for role in ("sentry", "launcher"):  # the Sentry first: its end stops the sandbox
+            pid, started = record.get(f"{role}_pid"), record.get(f"{role}_start_time")
+            if isinstance(pid, int) and isinstance(started, str):
+                processes.append((pid, started))
+    stopped = await asyncio.to_thread(kill_exact, processes, path.name)
+    survivors = await asyncio.to_thread(runsc_processes, path / STATE_DIR)
+    if survivors:
+        stopped |= await asyncio.to_thread(kill_exact, survivors, path.name)
+    return stopped
 
 
 def cpus_in_use() -> Counter[int]:

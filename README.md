@@ -28,7 +28,8 @@ What it gives you:
   the memory, so a command that runs away dies and the harness that started it survives.
 - **Pods.** Services that share one network, like a docker-compose project: a sandbox reaches the
   databases, tool servers or graders it works with by name, and the host reaches the ports you
-  expose through Unix sockets.
+  expose through Unix sockets. A service that asks for Docker's privileged mode, such as a judge
+  that sandboxes what it grades, can run in gVisor while the others stay on Singularity or enroot.
 - **Clean nodes.** Teardown proves each process's identity before signalling it, and janitors
   recover what a crashed process or job left behind, from running containers to files and mounts.
 - **Built for busy nodes.** Images are cached and staged once per node, sessions are deleted in the
@@ -110,7 +111,7 @@ memory limits and errors; [pods](docs/pods.md) start services next to a sandbox.
 | Per command | one `singularity exec`, which starts the runtime | `nsenter` into the running container | one `runsc exec` |
 | `network="none"` | with `allow_network_none=True`, where the site lets users create network namespaces | always, unless `allow_network_none=False` | always |
 | `memory_mb` | kills the branch of processes that holds the memory | the same | stops the whole sandbox |
-| Pods | yes | yes | not yet |
+| Pods | yes | yes | as services of Singularity and enroot pods (`gvisor=`, [gVisor services](docs/pods.md#gvisor-services)) |
 | When the owning process dies | instances run until a janitor stops them | everything dies with it; a janitor removes the files | the same as enroot |
 
 [Singularity CE and Apptainer](docs/singularity.md), [enroot](docs/enroot.md) and

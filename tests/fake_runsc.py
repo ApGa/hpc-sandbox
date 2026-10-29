@@ -11,16 +11,19 @@ them:
   bundle's root, ``root/`` in ``--overlay2``'s directory, over which the archive of the
   ``dev.gvisor.tar.rootfs.upper`` annotation is extracted (only with
   ``--allow-rootfs-tar-annotation``, as runsc demands). The Sentry holds a memory file, a memfd
-  named ``runsc-memory``, makes user (root mapped to the caller), mount and PID namespaces, and a
-  network namespace with only loopback for ``--network=none``; binds the host's system
-  directories, ``/dev`` and the spec's binds into the copy, and a tmpfs over an empty ``/tmp``
-  that the spec does not mount, as runsc does; chroots into it; and runs the container's command
-  as PID 1, with the spec's environment. The command's output is the run's;
+  named ``runsc-memory``, makes user (root mapped to the caller), mount, UTS and PID namespaces,
+  and a network namespace with only loopback for ``--network=none`` (else it stays in the network
+  namespace it was started in); sets the spec's hostname and resource limits; binds the host's
+  system directories, ``/dev`` and the spec's binds into the copy, mounts the spec's tmpfs mounts
+  below ``/dev`` (``/dev/shm``), and a tmpfs over an empty ``/tmp`` that the spec does not mount,
+  as runsc does; chroots into it; and runs the container's command as PID 1, with the spec's
+  environment and the run's stdin. The command's output is the run's;
 - ``exec [--cwd DIR] [--internal-pid-file FILE] ID CMD...``: the Sentry runs CMD as a child of its
   own, in its own process group and with the client's stdin, stdout and stderr, which the client
-  passes it over a Unix socket. So, as with runsc, killing the client leaves the command running.
-  The client writes the command's PID to FILE, and exits with its status, or with 0 when the
-  Sentry dies first, as runsc was seen to;
+  passes it over a Unix socket in the state directory (``--root``), which a client in another
+  network namespace reaches too, as runsc's does. So, as with runsc, killing the client leaves the
+  command running. The client writes the command's PID to FILE, and exits with its status, or
+  with 0 when the Sentry dies first, as runsc was seen to;
 - ``ps ID``: the table of the sandbox's processes (UID PID PPID PGID ... CMD);
 - ``kill [--pgid=N|--pid=N] ID SIGNAL``;
 - ``tar rootfs-upper --file=FILE ID``: an archive of the overlay's copy;
@@ -42,6 +45,7 @@ import ctypes
 import fcntl
 import json
 import os
+import resource
 import select
 import signal
 import socket
@@ -56,6 +60,7 @@ STATE = Path(os.environ["FAKE_RUNSC_STATE"])
 FAKE = str(Path(__file__).resolve())
 HOST_DIRS = ("bin", "sbin", "usr", "lib", "lib32", "lib64", "libx32")
 CLONE_NEWNS, CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET = 0x20000, 0x10000000, 0x20000000, 0x40000000
+CLONE_NEWUTS = 0x4000000
 MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC = 0x1, 0x2, 0x4, 0x8
 MS_REMOUNT, MS_BIND, MS_REC, MS_PRIVATE = 0x20, 0x1000, 0x4000, 0x40000
 MS_NOATIME, MS_NODIRATIME, MS_RELATIME = 0x400, 0x800, 0x200000
@@ -125,8 +130,10 @@ def parse(args: list[str], valued: set[str]) -> tuple[dict[str, str], list[str]]
     return options, args[index:]
 
 
-def socket_name(identifier: str) -> bytes:
-    return b"\0fake-runsc-" + identifier.encode()
+def socket_name(identifier: str) -> str:
+    """The Sentry's socket, relative to the state directory: its path may be too long for a
+    socket address."""
+    return f"{identifier}.sock"
 
 
 def state_file(flags: dict[str, str], identifier: str) -> Path:
@@ -272,7 +279,8 @@ def sentry(argv: list[str]) -> int:
     spec = json.loads((bundle / "config.json").read_text())
     state_dir = os.open(root.removeprefix("--root="), os.O_RDONLY | os.O_DIRECTORY)
     knobs = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY)  # still reachable once chrooted
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # in the host's network
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    os.fchdir(state_dir)
     server.bind(socket_name(identifier))
     server.listen(64)
     if (STATE / "start-fails").exists():
@@ -281,7 +289,7 @@ def sentry(argv: list[str]) -> int:
     if (STATE / "slow-exit").exists():
         slow_exit()
     uid, gid = os.getuid(), os.getgid()
-    namespaces = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID
+    namespaces = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS
     if flags.get("network") == "none":
         namespaces |= CLONE_NEWNET
     check(libc.unshare(namespaces), "unshare")
@@ -291,6 +299,21 @@ def sentry(argv: list[str]) -> int:
     mount("none", Path("/"), None, MS_REC | MS_PRIVATE)
     if flags.get("network") == "none":
         loopback_up()
+    if hostname := spec.get("hostname"):
+        check(libc.sethostname(hostname.encode(), len(hostname.encode())), "sethostname")
+    for limit in spec["process"].get("rlimits", []):  # for the command and every exec, as runsc
+        which = getattr(resource, limit["type"])
+        ceiling = resource.getrlimit(which)[1]
+        soft, hard = (
+            resource.RLIM_INFINITY if limit[key] >= (1 << 64) - 1 else limit[key]
+            for key in ("soft", "hard")
+        )
+        if ceiling != resource.RLIM_INFINITY:  # within what this process may set
+            soft, hard = (
+                ceiling if value == resource.RLIM_INFINITY else min(value, ceiling)
+                for value in (soft, hard)
+            )
+        resource.setrlimit(which, (soft, hard))
     for name in HOST_DIRS:
         target = merged / name
         if target.is_dir() and not target.is_symlink():
@@ -301,6 +324,11 @@ def sentry(argv: list[str]) -> int:
         if entry["type"] == "bind":
             target = merged / entry["destination"].lstrip("/")
             bind(entry["source"], target, read_only="ro" in entry.get("options", []))
+        elif entry["type"] == "tmpfs" and entry["destination"].startswith("/dev/"):
+            target = merged / entry["destination"].lstrip("/")
+            target.mkdir(exist_ok=True)
+            data = ",".join(o for o in entry.get("options", []) if o.startswith(("mode=", "size=")))
+            mount("tmpfs", target, "tmpfs", MS_NOSUID | MS_NODEV, data)
     # As runsc does: a tmpfs of its own over an empty /tmp, unless the spec mounts one.
     tmp = merged / "tmp"
     if all(entry["destination"] != "/tmp" for entry in spec["mounts"]) and (
@@ -401,6 +429,7 @@ def exec_(flags: dict[str, str], args: list[str]) -> int:
         return fail(f'cannot execute in container "{identifier}" in state stopped')
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        os.chdir(flags["root"])
         client.connect(socket_name(identifier))
     except OSError:
         return fail(f'cannot execute in container "{identifier}" in state stopped')
