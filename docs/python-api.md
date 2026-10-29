@@ -776,7 +776,7 @@ describes them so that you can place, size and clean them, and a minor release m
 
 hpc-sandbox's version is below 1.0: a minor release (0.4.0) may change the public API, and a patch
 release (0.3.1) only fixes bugs. To stay on one minor release, require a range such as
-`hpc-sandbox>=0.5,<0.6`. [CHANGELOG.md](../CHANGELOG.md) lists what each release changes, and
+`hpc-sandbox>=0.6,<0.7`. [CHANGELOG.md](../CHANGELOG.md) lists what each release changes, and
 `hpc_sandbox.__version__` holds the version of the running copy: the one that `pyproject.toml` sets
 when it runs from a source checkout, else the installed distribution's.
 
