@@ -23,6 +23,51 @@ one minor release, require a range such as `hpc-sandbox>=0.6,<0.7`.
   [gVisor pod services](docs/security.md#gvisor-pod-services).
   The gVisor provider still starts no pods of its own (`start_pod()` raises `ValueError`); it runs
   services of Singularity and enroot pods as their providers' `gvisor=` option.
+- **The gVisor provider runs enroot's images too, so it needs no Singularity where enroot is
+  installed.** `GvisorProvider(images="enroot")` runs the squashfs images that enroot imports, from
+  the references the enroot provider takes, and `images="sif"` the SIF images that Singularity CE
+  or Apptainer pulls. By default it runs SIF images where it finds Singularity CE or Apptainer, else
+  enroot's where it finds enroot; `provider.image_kind` says which. Where it finds neither, or
+  `images` names a runtime that is missing, a start raises `SandboxStartError` before anything is
+  pulled or created; an image of the other kind raises `ValueError`. New options: `images`,
+  `enroot_binary` and `import_env`. See [Images](docs/gvisor.md#images).
+- **A gVisor sandbox of an enroot image** runs the node's gVisor template of it, which
+  `enroot create` extracts with umask 0, so that its files keep the image's modes, and which
+  sandboxes share, hold and leave to janitors as they do SIF images' templates. Its commands get
+  the variables of the image's `/etc/environment`, read as enroot reads it, with each `${NAME}`
+  filled from runsc's environment rather than yours, and run in the spec's `workdir`, as on the
+  enroot provider. A snapshot records its image's kind, and a restore runs that kind, whatever the
+  restoring provider's, and needs neither runtime.
+- **The gVisor services of a pod run the kind of images that the pod's provider runs**, unless the
+  `GvisorProvider`'s `images` is set: an enroot pod's gVisor services need no Singularity.
+  `provider.image_store(kind)` and `provider.service_image_kind(pod_provider)` give the store and
+  the kind of those images, to pull them ahead of time.
+- **`hpc-sandbox doctor --runtime gvisor`** says which images the provider runs and why, and for
+  enroot's, checks `unsquashfs` and enroot's whiteout converter. The command line takes the
+  provider's default kind of images.
+- **`SquashfsImages(provider=..., hint=...)`, and `SifImages`' new `hint=`,** name the
+  provider in the error that refuses an image of the other format, and end it with `hint`.
+- **`EnrootRuntime.extract()`** extracts a squashfs image into a directory with `enroot create`
+  outside any session, with the environment of `EnrootRuntime.extraction_environment()`.
+- **`HPC_SANDBOX_TEST_GVISOR_IMAGES`** (`sif` or `enroot`) picks the images of the integration
+  tests with gVisor, and **`HPC_SANDBOX_TEST_POD_RUNTIME`** (`singularity` or `enroot`) the pods of
+  those of gVisor services. CI runs them with SIF images, and with enroot's on a runner without
+  Singularity.
+
+### Changed behaviour
+
+- **`enroot import` runs with umask 022**, whatever yours, for the enroot provider and gVisor's
+  enroot images: it makes the image's root directory and `/etc`, and writes `/etc/environment` and
+  `/etc/rc`, with the importer's umask, and a stricter one would keep the other users of a gVisor
+  sandbox out of them. Images already in the cache stay as they were imported: import those that
+  an earlier hpc-sandbox imported with a stricter umask again, with
+  `hpc-sandbox pull --runtime enroot --refresh IMAGE` for a tag, and for a digest-pinned reference,
+  which `--refresh` does not pull again, by deleting its pointer, `oci-<digest>.sqsh.json`, from
+  the image cache first. See [Images](docs/gvisor.md#images).
+- **`enroot import` and `enroot version` run with `ENROOT_RUNTIME_PATH` and `ENROOT_DATA_PATH` on
+  scratch** (`runtime-tmp/`), unless your environment sets them: enroot makes both before every
+  command, by default in `$XDG_RUNTIME_DIR`, else `/run`, and in your home directory, which a batch
+  job or a CI runner may lack or not let you write. See [Imports](docs/enroot.md#imports).
 
 ## 0.6.0 (2026-10-29)
 

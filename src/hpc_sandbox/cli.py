@@ -394,7 +394,11 @@ async def _doctor(args: argparse.Namespace) -> int:
         return 1
     # The runtime's checks write in the scratch root: create it and the image cache before them,
     # as a start and a pull do, so that the scratch root is private. Their lines keep their place.
-    cache = provider.images.cache_dir
+    # A gVisor provider's kinds of images share their cache and staging, which it knows without
+    # its images' runtime.
+    gvisor = isinstance(provider, GvisorProvider)
+    cache = provider.image_cache if gvisor else provider.images.cache_dir
+    staging = provider.image_stage_dir if gvisor else provider.images.stage_dir
     directories = [
         _check_directory(
             "scratch root", provider.scratch_root, provider._make_scratch_directories, local=True
@@ -418,7 +422,6 @@ async def _doctor(args: argparse.Namespace) -> int:
     report.line("info", "batch job", job or "none (login node or laptop)")
     for line in directories:
         report.line(*line)
-    staging = provider.images.stage_dir
     report.line("info", "image staging", f"to {staging}" if staging else "off")
     report.line(
         "info",
@@ -455,12 +458,7 @@ async def _enroot_checks(report: _Report, provider: EnrootProvider) -> None:
         else:
             report.line("FAIL", "namespaces", probe.detail() or f"exit {probe.returncode}")
     if not outside_user_namespaces():
-        report.line(
-            "warn",
-            "user namespace",
-            "this process runs inside a container's user namespace: enroot import cannot "
-            "use its file capabilities here; run on the host or pass .sqsh images",
-        )
+        report.line(*_NESTED_IMPORTS)
     report.line(*_whiteout_check(provider.runtime.temp_dir))
     for key, value in enroot_site_config(provider.runtime.enroot_conf()).items():
         report.line("info", f"site: {key}", f"{value} (overridden per sandbox)")
@@ -487,11 +485,7 @@ async def _gvisor_checks(report: _Report, provider: GvisorProvider) -> None:
             "runsc helpers",
             f"no {helpers}: releases that ship gvisor.tar need its gvisor-bin/ beside runsc",
         )
-    images = provider.image_runtime
-    try:
-        report.line("ok", "images", f"{images.path} ({await images.version()})")
-    except SandboxError as error:
-        report.line("FAIL", "images", f"pulling and extracting SIF images needs: {error}")
+    await _gvisor_image_checks(report, provider)
     argv = [sys.executable, "-I", "-S", str(ANCHOR_SCRIPT), str(os.getpid()), "none", "--", "true"]
     try:
         probe = await run_process(argv, timeout_s=60)
@@ -503,6 +497,42 @@ async def _gvisor_checks(report: _Report, provider: GvisorProvider) -> None:
         else:
             report.line("FAIL", "user namespaces", probe.detail() or f"exit {probe.returncode}")
     report.line(*await _runsc_do(provider))
+
+
+async def _gvisor_image_checks(report: _Report, provider: GvisorProvider) -> None:
+    """Which images the gVisor provider's own sandboxes run, and whether the tools that pull and
+    extract them are here."""
+    try:
+        kind = provider.image_kind
+    except SandboxError as error:
+        report.line("FAIL", "images", str(error))
+        return
+    if provider.images_option is not None:
+        chosen = f"images={kind!r}"
+    elif kind == "sif":
+        chosen = "Singularity CE or Apptainer is here"
+    else:
+        chosen = "enroot is here, and neither Singularity CE nor Apptainer"
+    runtime = provider.enroot_runtime if kind == "enroot" else provider.image_runtime
+    what = "squashfs images, imported and extracted by enroot" if kind == "enroot" else "SIF images"
+    try:
+        found = f"{runtime.path} ({await runtime.version()})"
+    except SandboxError as error:
+        report.line("FAIL", "images", f"{what} ({chosen}) need: {error}")
+        return
+    report.line("ok", "images", f"{what} ({chosen}): {found}")
+    if kind != "enroot":
+        return
+    unsquashfs = shutil.which("unsquashfs")
+    if unsquashfs is None:
+        report.line(
+            "FAIL", "image extraction", "enroot create needs unsquashfs (squashfs-tools) on PATH"
+        )
+    else:
+        report.line("ok", "image extraction", f"enroot create, with {unsquashfs}")
+    if not outside_user_namespaces():
+        report.line(*_NESTED_IMPORTS)
+    report.line(*_whiteout_check(provider.enroot_runtime.temp_dir))
 
 
 async def _runsc_do(provider: GvisorProvider) -> tuple[str, str, str]:
@@ -539,6 +569,14 @@ def _subids_check() -> tuple[str, str, str]:
         return "info" if uids is None or gids is None else "warn", name, str(error)
     spans = (f"{extent.start}-{extent.start + extent.count - 1}" for extent in (ids.uids, ids.gids))
     return "ok", name, "uids {}, gids {}; {}, {}".format(*spans, ids.newuidmap, ids.newgidmap)
+
+
+_NESTED_IMPORTS = (
+    "warn",
+    "user namespace",
+    "this process runs inside a container's user namespace: enroot import cannot use its file "
+    "capabilities here; run on the host or pass .sqsh images",
+)
 
 
 def _whiteout_check(temp_dir: Path) -> tuple[str, str, str]:

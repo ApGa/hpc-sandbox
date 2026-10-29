@@ -49,8 +49,8 @@ runtimes:
 | Runtime | What it needs |
 |---|---|
 | Singularity CE or Apptainer | the runtime, in setuid or user-namespace mode |
-| enroot 3.x | unprivileged user namespaces, util-linux `nsenter`, and enroot's `+caps` package to import images |
-| gVisor (`runsc`), opt-in | unprivileged user namespaces, and Singularity CE or Apptainer for its images |
+| enroot 3.x or 4.x | unprivileged user namespaces, util-linux `nsenter`, and enroot's `+caps` package to import images |
+| gVisor (`runsc`), opt-in | unprivileged user namespaces, and Singularity CE or Apptainer, or enroot, for its images |
 
 Pods need unprivileged user namespaces and util-linux `nsenter`, with Singularity or enroot.
 [Getting started](docs/getting-started.md#requirements) lists every tool and what needs it.
@@ -105,7 +105,7 @@ memory limits and errors; [pods](docs/pods.md) start services next to a sandbox.
 
 | | `SingularityProvider` | `EnrootProvider` | `GvisorProvider` |
 |---|---|---|---|
-| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x, unprivileged | rootless `runsc` |
+| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x or 4.x, unprivileged | rootless `runsc` |
 | Images | SIF (`singularity pull`) | squashfs (`enroot import`) | SIF, as the node's templates |
 | Inside the sandbox | your user | root mapped to your user (or your user) | root of gVisor's kernel, with every capability, which can switch users |
 | Per command | one `singularity exec`, which starts the runtime | `nsenter` into the running container | one `runsc exec` |

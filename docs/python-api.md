@@ -42,7 +42,7 @@ keyword arguments only, and their defaults suit a batch job;
 
 | | `SingularityProvider` | `EnrootProvider` | `GvisorProvider` |
 |---|---|---|---|
-| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x, unprivileged | rootless `runsc`, opt-in |
+| Runtime | Singularity CE or Apptainer, in setuid or user-namespace mode | enroot 3.x or 4.x, unprivileged | rootless `runsc`, opt-in |
 | Images | SIF files, pulled with `singularity pull` | squashfs files, imported with `enroot import` | SIF files, as the Singularity provider's |
 | Commands run as | your uid | root of the sandbox's user namespace, which is your uid outside (`remap_root=False`: your uid) | root of gVisor's kernel, with every capability; your uid outside |
 | Each command | one `singularity exec` | `nsenter` into the running container | one `runsc exec` |
@@ -119,7 +119,9 @@ provider was created with `bind_resolv_conf=False`.
 
 Every provider also accepts enroot's `registry#repo` spelling, in `docker://` references and in
 references without a scheme. `GvisorProvider` takes the references that `SingularityProvider` takes,
-and pulls them with Singularity CE or Apptainer.
+and pulls them with Singularity CE or Apptainer, or with `images="enroot"`, or where it finds enroot
+and no Singularity, those that `EnrootProvider` takes, which enroot imports
+([Images](gvisor.md#images)).
 
 A remote image is pulled once into the image cache. A tag keeps the image it named when it was first
 pulled until you refresh it (see [Images](#images)), so pin images by digest, or use local files
@@ -659,6 +661,15 @@ asyncio.run(main())
 | `await images.pull(reference, refresh=False)` | Returns the cached image of a remote reference as a `ResolvedImage`, pulling it unless it is cached, or checks a local image file. With `refresh=True` it pulls a tag again: sandboxes started afterwards get the new image, running ones keep theirs, and starts never wait for a refresh. `refresh` changes nothing for digest-pinned and local references, which always name the same image. |
 | `await images.resolve(reference)` | What a start does: `pull()`, then staging the file to the scratch root when staging is on. |
 
+A `GvisorProvider` has a store for each kind of images, which share the image cache:
+`provider.image_store("sif")` and `provider.image_store("enroot")`. Its `provider.images` is the
+store of `provider.image_kind`, the kind its own sandboxes run. Reading either looks for the
+runtimes the first time, and raises `SandboxStartError` where neither is found. The gVisor services
+of a pod run the kind of `provider.service_image_kind(pod_provider)`: to pull an enroot pod's gVisor
+images ahead of time on a node that has Singularity too, use
+`provider.image_store(provider.service_image_kind(enroot_provider))`
+([Images](gvisor.md#images)).
+
 A `ResolvedImage` has the `reference`, the `path` of the image file, and `sha256`, the file's
 SHA-256 (`None` when unknown). A pull that still fails after three attempts raises `SandboxError`.
 `hpc-sandbox pull` does the same from the command line, and
@@ -769,7 +780,7 @@ logging configuration, Python prints warnings and errors on stderr;
 | Protocols | `SandboxProvider`, `Sandbox`, `PodProvider`, `Pod` |
 | Pods | `PodSpec`, `ServiceSpec`, `HealthCheck`, `PodNetwork`, `PodUsers`, `ServiceHealth`, `ServiceRunAs`, `ServiceRuntime`, `ServiceSecurebits`, `GuestCgroups`, `SessionPod`, `PodService`, `SingularityService`, `EnrootService`, `GvisorService` |
 | Images | `ImageStore`, `ImageFormat`, `ResolvedImage`, `SifImages`, `SquashfsImages` |
-| Runtimes | `ContainerRuntime`, `EnrootRuntime` and `RunscRuntime`: the runtime command lines a provider runs, as its `runtime` attribute (a `GvisorProvider`'s `ContainerRuntime`, which pulls and extracts its images, is its `image_runtime`) |
+| Runtimes | `ContainerRuntime`, `EnrootRuntime` and `RunscRuntime`: the runtime command lines a provider runs, as its `runtime` attribute (a `GvisorProvider`'s `ContainerRuntime`, which pulls and extracts its SIF images, is its `image_runtime`, and the `EnrootRuntime` that imports and extracts its squashfs images its `enroot_runtime`) |
 
 The public API is the names in `hpc_sandbox.__all__`, listed above, with the behaviour these docs
 describe, and the command-line output that [Command line](cli.md) documents. Other names, such as

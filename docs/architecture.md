@@ -80,10 +80,11 @@ owns. [Configuration](configuration.md) says how the scratch root is chosen.
 
 ## Images and the image cache
 
-Each provider serves one image format: SIF files for Singularity CE and Apptainer, and for gVisor,
-whose images Singularity CE or Apptainer pulls, and squashfs files for enroot. A reference names
-either a local image file or a remote image; each runtime page lists the forms it accepts. A
-reference the provider can never run (a SIF image for enroot, a squashfs image for Singularity or
+Each provider serves one image format: SIF files for Singularity CE and Apptainer, squashfs files
+for enroot, and for gVisor, either, as its `images` option says, pulled by Singularity CE or
+Apptainer or by enroot ([Images](gvisor.md#images)). A reference names either a local image file
+or a remote image; each runtime page lists the forms it accepts. A reference the provider can never
+run (a SIF image for enroot, a squashfs image for Singularity, an image of the other format for
 gVisor, a scheme the runtime cannot pull) raises `ValueError` before anything is created.
 
 A remote reference is pulled once into the image cache:

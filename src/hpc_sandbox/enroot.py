@@ -298,7 +298,9 @@ class EnrootRuntime:
 
     ``cache_dir`` and ``temp_dir`` hold layers and extraction space for
     imports unless the caller's environment already sets ``ENROOT_CACHE_PATH``
-    or ``ENROOT_TEMP_PATH``. When containers start, ``config_dir`` is an empty
+    or ``ENROOT_TEMP_PATH``, and ``temp_dir`` is enroot's runtime and data
+    directory for imports unless it sets ``ENROOT_RUNTIME_PATH`` or
+    ``ENROOT_DATA_PATH``. When containers start, ``config_dir`` is an empty
     ``ENROOT_CONFIG_PATH``, so user-level hooks, mounts and environment files
     never apply, and a system configuration written below ``sysconf_root``
     replaces the installation's; see :meth:`prepare_sysconf`. ``tools_dir``
@@ -463,17 +465,27 @@ class EnrootRuntime:
         return target
 
     async def run(
-        self, *args: str, env: Mapping[str, str], timeout_s: float, output_limit: int = 1 << 20
+        self,
+        *args: str,
+        env: Mapping[str, str],
+        timeout_s: float,
+        output_limit: int = 1 << 20,
+        umask: int = -1,
     ) -> ProcessResult:
         try:
             return await run_process(
-                [self.path, *args], timeout_s=timeout_s, env=env, output_limit=output_limit
+                [self.path, *args],
+                timeout_s=timeout_s,
+                env=env,
+                output_limit=output_limit,
+                umask=umask,
             )
         except OSError as error:
             raise SandboxError(f"could not run {self.path}: {error}") from error
 
     async def version(self) -> str:
-        result = await self.run("version", env=os.environ, timeout_s=30.0)
+        env = self._scratch_paths(dict(os.environ))
+        result = await self.run("version", env=env, timeout_s=30.0)
         if result.returncode != 0:
             raise SandboxError(f"{self.path} version failed: {result.detail()}")
         return result.stdout.decode(errors="replace").strip()
@@ -494,13 +506,13 @@ class EnrootRuntime:
         names = set(_IMPORT_ENV) | self.credential_variables()
         prefixes = _IMPORT_PREFIXES + tuple(p[:-1] for p in self.import_env if p.endswith("*"))
         names |= {name for name in self.import_env if not name.endswith("*")}
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in names or key.startswith(prefixes)
-        }
-        env.setdefault("ENROOT_CACHE_PATH", str(self.cache_dir))
-        env.setdefault("ENROOT_TEMP_PATH", str(self.temp_dir))
+        env = self._scratch_paths(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if key in names or key.startswith(prefixes)
+            }
+        )
         tar_options = env.get("TAR_OPTIONS", "").split()
         if "--delay-directory-restore" not in tar_options:
             env["TAR_OPTIONS"] = " ".join([*tar_options, "--delay-directory-restore"])
@@ -511,6 +523,18 @@ class EnrootRuntime:
             _publish(wrapper, AUFS2OVLFS_WRAPPER.encode(), 0o700)
             env["HPC_SANDBOX_REAL_AUFS2OVLFS"] = str(Path(real).resolve())
             env["PATH"] = os.pathsep.join([str(self.tools_dir), env.get("PATH", "")])
+        return env
+
+    def _scratch_paths(self, env: dict[str, str]) -> dict[str, str]:
+        """``env``, with enroot's cache, temporary, runtime and data directories on scratch where
+        it sets none. enroot makes its runtime and data directories before every command, by
+        default in ``$XDG_RUNTIME_DIR`` (else ``/run``) and in your home directory, which a batch
+        job or a CI runner may lack or not let you write; imports and ``enroot version`` use
+        neither."""
+        env.setdefault("ENROOT_CACHE_PATH", str(self.cache_dir))
+        env.setdefault("ENROOT_TEMP_PATH", str(self.temp_dir))
+        env.setdefault("ENROOT_RUNTIME_PATH", str(self.temp_dir))
+        env.setdefault("ENROOT_DATA_PATH", str(self.temp_dir))
         return env
 
     def _sysconf(self, restored: bool) -> Path:
@@ -530,6 +554,51 @@ class EnrootRuntime:
             return set()
         return set(_VARIABLE_REFERENCE.findall(text))
 
+    @staticmethod
+    def _host_environment() -> dict[str, str]:
+        """What enroot needs of your environment to run at all."""
+        env = {
+            key: os.environ[key]
+            for key in ("PATH", "HOME", "USER", "LOGNAME", "ENROOT_LIBRARY_PATH")
+            if key in os.environ
+        }
+        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        return env
+
+    def extraction_environment(self, data_path: Path) -> dict[str, str]:
+        """The environment of an ``enroot create`` into ``data_path`` outside any session: what
+        :meth:`container_environment` passes of yours, and where enroot keeps its files. A
+        create starts no container, so it needs none of the containers' settings."""
+        env = self._host_environment()
+        env.update(
+            ENROOT_DATA_PATH=str(data_path),
+            ENROOT_RUNTIME_PATH=str(self.temp_dir),
+            ENROOT_CACHE_PATH=str(self.cache_dir),
+            ENROOT_TEMP_PATH=str(self.temp_dir),
+        )
+        return env
+
+    async def extract(self, image: Path, rootfs: Path, *, timeout_s: float) -> None:
+        """Extract the squashfs ``image`` into the new directory ``rootfs`` with ``enroot create``,
+        as the enroot provider extracts a sandbox's, and give your uid read and write access to
+        everything in it: how the gVisor provider makes a template of an enroot image.
+
+        It runs with umask 0: unsquashfs, run as you, gives the files it makes your umask, and the
+        other users of a gVisor sandbox need the modes the image gives them. ``rootfs``'s parent
+        should be private."""
+        result = await self.run(
+            "create",
+            "--name",
+            rootfs.name,
+            str(image),
+            env=self.extraction_environment(rootfs.parent),
+            timeout_s=timeout_s,
+            umask=0,
+        )
+        if result.returncode != 0 or result.timed_out:
+            raise SandboxStartError(f"could not extract {image}: {result.detail()}")
+        await asyncio.to_thread(make_owner_writable, rootfs)
+
     def container_environment(
         self, session: Session, *, remap_root: bool, gpus: str | None, restored: bool = False
     ) -> dict[str, str]:
@@ -540,12 +609,7 @@ class EnrootRuntime:
         treats an empty value as unset and falls back to the site default.
         Restored sandboxes start with the restore system configuration.
         """
-        env = {
-            key: os.environ[key]
-            for key in ("PATH", "HOME", "USER", "LOGNAME", "ENROOT_LIBRARY_PATH")
-            if key in os.environ
-        }
-        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        env = self._host_environment()
         env.update(
             ENROOT_DATA_PATH=str(session.path),
             ENROOT_RUNTIME_PATH=str(session.path / "runtime"),
@@ -569,13 +633,19 @@ class EnrootRuntime:
 
 
 class SquashfsImages:
-    """Squashfs images, imported by enroot and recognized by their magic bytes."""
+    """Squashfs images, imported by enroot and recognized by their magic bytes.
+
+    ``provider`` names the provider that runs them, in the error that refuses a SIF image, which
+    ends with ``hint``.
+    """
 
     name = "squashfs"
     suffix = ".sqsh"
 
-    def __init__(self, runtime: EnrootRuntime) -> None:
+    def __init__(self, runtime: EnrootRuntime, *, provider: str = "enroot", hint: str = "") -> None:
         self.runtime = runtime
+        self.provider = provider
+        self.hint = hint
 
     @property
     def tool(self) -> str:
@@ -587,14 +657,15 @@ class SquashfsImages:
         )
 
     def check(self, reference: str) -> None:
+        refusal = f"{reference!r} is a SIF image; the {self.provider} provider runs squashfs images"
         if not self.is_local(reference):
+            if DIGEST.sub("", reference).endswith(".sif"):
+                raise ValueError(refusal + self.hint)
             import_uri(reference)  # raises ValueError for what enroot cannot import
             return
         path = local_path(reference)
         if path.suffix == ".sif" or is_sif(path):
-            raise ValueError(
-                f"{reference!r} is a SIF image; the enroot provider runs squashfs images"
-            )
+            raise ValueError(refusal + self.hint)
 
     def pull_uri(self, reference: str) -> str:
         return import_uri(reference)
@@ -605,8 +676,11 @@ class SquashfsImages:
     async def pull(self, uri: str, target: Path, *, timeout_s: float) -> ProcessResult:
         # Reading enroot's settings runs bash, which can take a while.
         env = await asyncio.to_thread(self.runtime.import_environment)
+        # enroot import makes the image's root directory and writes /etc/environment, /etc/rc and
+        # the like with the importer's umask; 022 gives them the modes an image's own files have,
+        # whatever yours, so the other users of a gVisor sandbox can enter its root directory.
         return await self.runtime.run(
-            "import", "--output", str(target), uri, env=env, timeout_s=timeout_s
+            "import", "--output", str(target), uri, env=env, timeout_s=timeout_s, umask=0o022
         )
 
 
@@ -638,8 +712,9 @@ class EnrootProvider(SessionProvider["EnrootSandbox"]):
     else on PATH, else as fetched by ``hpc-sandbox fetch-tools``; their
     services get ``service_stop_grace_s`` between SIGTERM and SIGKILL when
     their pod stops. ``gvisor``, a :class:`~hpc_sandbox.gvisor.GvisorProvider`,
-    runs the services whose spec says ``runtime="gvisor"`` in gVisor, with its
-    SIF images, and adds the ``gvisor_services`` capability.
+    runs the services whose spec says ``runtime="gvisor"`` in gVisor, with
+    squashfs images that enroot imports unless its ``images`` says otherwise,
+    and adds the ``gvisor_services`` capability.
     """
 
     network_none_hint = "network 'none' was turned off with allow_network_none=False"

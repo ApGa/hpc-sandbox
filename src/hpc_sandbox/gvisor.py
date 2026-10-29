@@ -12,9 +12,10 @@ the host. A sandbox is built like this:
   so each sandbox keeps runsc's state to itself, and with
   ``--signal-unkillable-policy=linux``: a PID namespace's init ignores the
   SIGKILL it sends itself, as Linux does.
-- **Images** are SIF files, pulled and extracted by Singularity CE or Apptainer
-  into the node's gVisor template of the image (``templates-gvisor/``). The
-  template is the sandbox's read-only lower layer: gVisor's overlay
+- **Images** are SIF files, pulled and extracted by Singularity CE or Apptainer,
+  or squashfs files, imported and extracted by enroot (``images``), into the
+  node's gVisor template of the image (``templates-gvisor/``). The template is
+  the sandbox's read-only lower layer: gVisor's overlay
   (``--overlay2=root:dir=``) keeps what the sandbox writes in a file of its
   session, so a start copies nothing, and root in it can give files to any
   user. ``/tmp`` and ``/var/tmp`` are part of that overlay: gVisor would mount
@@ -38,9 +39,10 @@ the host. A sandbox is built like this:
   state of its own on the host: a timeout kills the command's process groups
   inside the sandbox too.
 - **Snapshots** are the overlay's upper layer, as ``runsc tar rootfs-upper``
-  writes it, with the template it lies over; a restore lays a copy of that
-  archive over the same template (the ``dev.gvisor.tar.rootfs.upper``
-  annotation), and keeps the owners of its files.
+  writes it, with the template it lies over and the kind of its image; a
+  restore lays a copy of that archive over the same template (the
+  ``dev.gvisor.tar.rootfs.upper`` annotation), keeps the owners of its files,
+  and runs the snapshot's kind of image, whatever the provider's.
 - **Limits.** ``memory_mb`` arms a watchdog that samples what the Sentry holds
   for the sandbox (:class:`SentryMemory`), and stops the whole sandbox when it
   exceeds the limit: the sandbox's processes are not host processes, so no
@@ -51,8 +53,8 @@ the host. A sandbox is built like this:
   read-write mounts. Rootless runsc applies no cgroup limits.
 
 Host requirements: runsc (with its ``gvisor-bin/`` beside it, for releases that
-ship one), unprivileged user namespaces, and Singularity CE or Apptainer for
-images.
+ship one), unprivileged user namespaces, and for images Singularity CE or
+Apptainer, or enroot.
 """
 
 from __future__ import annotations
@@ -85,6 +87,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from . import memory, procfs
 from .anchor import cpu_list
+from .enroot import EnrootRuntime, SquashfsImages
 from .images import ImageStore, ResolvedImage, SifImages
 from .locks import locked
 from .paths import default_image_cache, should_stage
@@ -122,6 +125,10 @@ ANCHOR_SCRIPT = Path(__file__).with_name("anchor.py")
 SNAPSHOT_FORMAT = "hpc-sandbox/gvisor-overlay-v1"
 PLATFORMS = ("systrap", "ptrace", "kvm")
 HOST_UDS = ("open", "create", "all")
+#: The gVisor provider's kinds of images (its ``images`` option): SIF files, which Singularity CE or
+#: Apptainer pulls and extracts, or squashfs files, which enroot imports and extracts.
+IMAGES = ("sif", "enroot")
+GvisorImages = Literal["sif", "enroot"]
 #: The gVisor provider's templates, on the scratch root: its own, since each holds its mount
 #: points (:data:`PROVIDER_DIR`).
 TEMPLATE_DIR = "templates-gvisor"
@@ -141,7 +148,7 @@ BUNDLE = "config.json"  # the OCI bundle's spec; the session directory is the bu
 STATE_DIR = "runsc"  # runsc's --root
 OVERLAY_DIR = "overlay"  # where gVisor keeps the file that backs the overlay's upper layer
 EXEC_DIR = "exec"  # the sandbox-side PIDs of running commands
-ROOTFS_RECORD = "rootfs.json"  # the lower layer, and the upper layer's archive of a restore
+ROOTFS_RECORD = "rootfs.json"  # the lower layer, its kind of images, a restore's upper layer
 UPPER_ARCHIVE = "rootfs-upper.tar"
 RUNSC_LOG = "runsc.log"
 UPPER_ANNOTATION = "dev.gvisor.tar.rootfs.upper"
@@ -197,6 +204,14 @@ _IMAGE_ENVIRONMENT = (
     "exec cat /proc/self/environ"
 )
 _SHELL_STATE = ("PWD", "OLDPWD", "SHLVL", "_", "hpc_sandbox_script")
+# Run in the sandbox of an image that enroot imported: the file that enroot builds a container's
+# environment from, which enroot import writes from the image's configuration (its Env).
+_ENROOT_ENVIRONMENT = "if [ -f /etc/environment ]; then exec cat /etc/environment; fi"
+# A line of an environment file that enroot keeps (common::envfmt), and one whose value it unquotes:
+# its sed takes a backslash for a quote too.
+_ENROOT_VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_ENROOT_QUOTED = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)=["'\\](.*)["'\\][ \t\v\f\r]*""", re.DOTALL)
+_ENROOT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # sh -c _MAKE_WORKDIR hpc-sandbox UMASK WORKDIR, in a pod service before its command starts: the
 # working directory, as the start protocol makes it, so that a command entered as soon as the start
 # returns finds it. A failure is left to the start protocol to report.
@@ -278,13 +293,19 @@ class RunscRuntime:
 class GvisorProvider(SessionProvider["GvisorSandbox"]):
     """Start, restore and reap sandboxes in gVisor, with rootless ``runsc``.
 
-    ``binary`` is runsc, a name on ``PATH`` or a path; ``singularity_binary`` is the Singularity
-    CE or Apptainer that pulls SIF images and extracts them into the node's templates, found as
-    :class:`~hpc_sandbox.runtime.ContainerRuntime` finds it. ``platform`` is gVisor's way of
-    running the sandbox's code: ``"systrap"`` (the default), ``"ptrace"``, or ``"kvm"`` where
-    ``/dev/kvm`` can be opened. ``host_uds`` lets the sandbox use the Unix sockets of the host
-    that its mounts hold: ``"open"`` (connect to them), ``"create"`` (make ones the host reaches)
-    or ``"all"``. ``net_raw`` allows raw and packet sockets (``ping``, packet capture).
+    ``binary`` is runsc, a name on ``PATH`` or a path. ``images`` says what the sandboxes'
+    images are: ``"sif"``, SIF files that Singularity CE or Apptainer pulls and extracts into the
+    node's templates, or ``"enroot"``, squashfs files that enroot imports and extracts; by
+    default SIF images where Singularity CE or Apptainer is found, else enroot's where enroot is.
+    ``singularity_binary`` is the Singularity CE or Apptainer, found as
+    :class:`~hpc_sandbox.runtime.ContainerRuntime` finds it, and ``enroot_binary`` the enroot,
+    which imports images with the variables of your environment that the enroot provider passes,
+    and those ``import_env`` names (:meth:`~hpc_sandbox.enroot.EnrootRuntime.import_environment`).
+    ``platform`` is gVisor's way of running the sandbox's code: ``"systrap"`` (the default),
+    ``"ptrace"``, or ``"kvm"`` where ``/dev/kvm`` can be opened. ``host_uds`` lets the sandbox use
+    the Unix sockets of the host that its mounts hold: ``"open"`` (connect to them), ``"create"``
+    (make ones the host reaches) or ``"all"``. ``net_raw`` allows raw and packet sockets
+    (``ping``, packet capture).
     ``guest_cgroups`` (``"v1"`` or ``"v2"``) mounts gVisor's own cgroups at ``/sys/fs/cgroup``,
     for software that manages cgroups itself; they limit nothing on the host.
     ``overlay_size_mb`` caps what each sandbox writes to its root filesystem, ``/tmp`` included,
@@ -294,7 +315,8 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
 
     Sandboxes die with the process that started them. The provider starts no pods of its own: give
     it as the ``gvisor`` option of a Singularity or enroot provider to run services of their pods
-    in gVisor (:class:`GvisorService`).
+    in gVisor (:class:`GvisorService`), from the kind of images that provider runs unless
+    ``images`` is set.
     """
 
     name = "gvisor"
@@ -305,7 +327,10 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
         self,
         *,
         binary: str | None = None,
+        images: GvisorImages | None = None,
         singularity_binary: str | None = None,
+        enroot_binary: str | None = None,
+        import_env: Sequence[str] = (),
         scratch_root: str | Path | None = None,
         image_cache: str | Path | None = None,
         stage_images: bool | None = None,
@@ -324,6 +349,8 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
     ) -> None:
         if platform not in PLATFORMS:
             raise ValueError(f"platform must be one of {PLATFORMS}, not {platform!r}")
+        if images is not None and images not in IMAGES:
+            raise ValueError(f"images must be None or one of {IMAGES}, not {images!r}")
         if host_uds is not None and host_uds not in HOST_UDS:
             raise ValueError(f"host_uds must be None or one of {HOST_UDS}, not {host_uds!r}")
         if guest_cgroups is not None and guest_cgroups not in GUEST_CGROUPS:
@@ -346,21 +373,55 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
         )
         self.sandbox_type = GvisorSandbox
         self.runtime = RunscRuntime(binary)
+        # Both runtimes keep their temporary files and caches in the same directories on scratch.
         self.image_runtime = ContainerRuntime(
             singularity_binary,
             tmp_dir=self.scratch_root / "runtime-tmp",
             cache_dir=self.scratch_root / "runtime-cache",
         )
+        self.enroot_runtime = EnrootRuntime(
+            enroot_binary,
+            cache_dir=self.scratch_root / "runtime-cache",
+            temp_dir=self.scratch_root / "runtime-tmp",
+            config_dir=self.scratch_root / "enroot-config",
+            sysconf_root=self.scratch_root / "enroot-sysconf",
+            tools_dir=self.scratch_root / "enroot-tools",
+            import_env=import_env,
+        )
         cache = Path(image_cache) if image_cache else default_image_cache()
         if stage_images is None:
             stage_images = should_stage(cache, self.scratch_root)
-        self.images = ImageStore(
-            SifImages(self.image_runtime, provider="gvisor"),
-            cache,
-            stage_dir=self.scratch_root / "images" if stage_images else None,
-            pull_timeout_s=start_timeout_s,
-            prepare=self._make_scratch_directories,
-        )
+        stage_dir = self.scratch_root / "images" if stage_images else None
+        formats = {
+            "sif": SifImages(
+                self.image_runtime,
+                provider="gvisor",
+                hint=": give it images='enroot' for squashfs images",
+            ),
+            "enroot": SquashfsImages(
+                self.enroot_runtime,
+                provider="gvisor",
+                hint=": give it images='sif' for SIF images",
+            ),
+        }
+        # One store of each kind, which share the image cache and the stage directory: their
+        # files and pointers have suffixes of their own.
+        self._image_stores: dict[str, ImageStore] = {
+            kind: ImageStore(
+                image_format,
+                cache,
+                stage_dir=stage_dir,
+                pull_timeout_s=start_timeout_s,
+                prepare=self._make_scratch_directories,
+            )
+            for kind, image_format in formats.items()
+        }
+        #: Where pulled images are cached, and staged: the same for both kinds of images.
+        self.image_cache = cache
+        self.image_stage_dir = stage_dir
+        #: The ``images`` option: None to follow the runtimes found (:attr:`image_kind`).
+        self.images_option: GvisorImages | None = images
+        self._image_kind: GvisorImages | None = images
         self.platform = platform
         self.host_uds = host_uds
         self.net_raw = net_raw
@@ -375,13 +436,72 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
         """Where this provider's templates are: ``templates-gvisor/`` on the scratch root."""
         return self.scratch_root / TEMPLATE_DIR
 
+    @property
+    def image_kind(self) -> GvisorImages:
+        """What the provider's own sandboxes run: ``images`` as given, else ``"sif"`` where
+        Singularity CE or Apptainer is found, else ``"enroot"`` where enroot is, as found the first
+        time; :class:`SandboxStartError` where neither is."""
+        if self._image_kind is None:
+            if self._missing_runtime("sif") is None:
+                self._image_kind = "sif"
+            elif self._missing_runtime("enroot") is None:
+                self._image_kind = "enroot"
+            else:
+                raise SandboxStartError(
+                    "the gvisor provider needs Singularity CE or Apptainer (singularity, "
+                    "apptainer) for SIF images, or enroot for squashfs images, and found neither: "
+                    "install one, or name it with singularity_binary or enroot_binary"
+                )
+        return self._image_kind
+
+    @property
+    def images(self) -> ImageStore:  # type: ignore[override]
+        """The store of the provider's own images, those of :attr:`image_kind`."""
+        return self._image_stores[self.image_kind]
+
+    def image_store(self, kind: GvisorImages) -> ImageStore:
+        """The store of the images of ``kind``, ``"sif"`` or ``"enroot"``."""
+        return self._image_stores[kind]
+
+    def service_image_kind(self, provider: SessionProvider[Any]) -> GvisorImages:
+        """What the gVisor services of ``provider``'s pods run: ``images`` as given, else the kind
+        of images ``provider`` runs, so that an enroot pod's gVisor services need no Singularity."""
+        if self.images_option is not None:
+            return self.images_option
+        return "enroot" if isinstance(provider.images.format, SquashfsImages) else "sif"
+
+    def _missing_runtime(self, kind: GvisorImages) -> str | None:
+        """Why the runtime that pulls and extracts images of ``kind`` is not found, or None."""
+        runtime = self.enroot_runtime if kind == "enroot" else self.image_runtime
+        try:
+            runtime.path  # noqa: B018 - looks it up
+        except SandboxError as error:
+            return str(error)
+        return None
+
+    def _find_image_runtime(self, kind: GvisorImages) -> None:
+        """Refuse a start whose images' runtime is missing, before anything is pulled or made."""
+        if (missing := self._missing_runtime(kind)) is None:
+            return
+        if kind == "enroot":
+            needs, option, other = "enroot", "enroot_binary", "sif"
+        else:
+            needs, option, other = "Singularity CE or Apptainer", "singularity_binary", "enroot"
+        raise SandboxStartError(
+            f"the gvisor provider's {kind} images need {needs}: {missing}; give it {option}, or "
+            f"images={other!r}"
+        )
+
     async def start(self, spec: SandboxSpec) -> GvisorSandbox:
         self._check(spec)
         self._find_runsc()  # before an image is pulled or extracted
+        self._find_image_runtime(self.image_kind)
         return await super().start(spec)
 
-    def _check(self, spec: SandboxSpec, *, service: bool = False) -> None:
-        super()._check(spec, service=service)
+    def _check(
+        self, spec: SandboxSpec, *, service: bool = False, images: ImageStore | None = None
+    ) -> None:
+        super()._check(spec, service=service, images=images)
         reserved = PurePosixPath("/", PROVIDER_DIR)
         for mount in spec.mounts:
             target = PurePosixPath(mount.target)
@@ -409,28 +529,41 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
             "sandbox can give its files to other users itself"
         )
 
-    async def _extract(self, image: ResolvedImage, session: Session) -> None:
-        """The node's gVisor template of ``image`` becomes the sandbox's lower layer: nothing is
-        copied."""
-        lower = await rootfs_template(image, self.template_root, self._extract_into)
-        _write_record(session, lower, None)
+    async def _extract(
+        self, image: ResolvedImage, session: Session, *, kind: GvisorImages | None = None
+    ) -> None:
+        """The node's gVisor template of ``image``, of ``kind`` (by default the provider's),
+        becomes the sandbox's lower layer: nothing is copied."""
+        kind = kind or self.image_kind
+        lower = await rootfs_template(
+            image, self.template_root, partial(self._extract_into, kind=kind)
+        )
+        _write_record(session, lower, None, kind)
 
-    async def _extract_into(self, image: ResolvedImage, rootfs: Path) -> None:
-        await extract_image(self.image_runtime, image, rootfs, timeout_s=self.start_timeout_s)
+    async def _extract_into(
+        self, image: ResolvedImage, rootfs: Path, *, kind: GvisorImages
+    ) -> None:
+        if kind == "enroot":
+            await self.enroot_runtime.extract(image.path, rootfs, timeout_s=self.start_timeout_s)
+        else:
+            await extract_image(self.image_runtime, image, rootfs, timeout_s=self.start_timeout_s)
         await asyncio.to_thread(prepare_template, rootfs)
 
     async def restore(self, snapshot: SandboxSnapshot, spec: SandboxSpec) -> GvisorSandbox:
         """Start a sandbox for ``spec`` whose overlay starts from the snapshot's upper layer, over
-        the template that the snapshot's sandbox ran on."""
-        self._check(spec)
+        the template that the snapshot's sandbox ran on. It runs the snapshot's kind of images,
+        whatever the provider's, and needs neither runtime: nothing is pulled or extracted."""
         source = self._snapshot_dir(snapshot)
+        kind = _snapshot_images(snapshot)
+        self._check(spec, images=self.image_store(kind))
         if snapshot.image != spec.image:
             raise ValueError(f"snapshot {snapshot.id} is of {snapshot.image!r}, not {spec.image!r}")
         lower = self._snapshot_lower(snapshot)
         await self._check_file_owners(spec)
         self._find_runsc()
         await self._prepare()
-        return await self._launch(spec, partial(self._restore_upper, source, lower), restored=True)
+        restore = partial(self._restore_upper, source, lower, kind)
+        return await self._launch(spec, restore, restored=True)
 
     def _snapshot_lower(self, snapshot: SandboxSnapshot) -> Path:
         """The template a snapshot's upper layer lies over: one of this node's complete
@@ -448,10 +581,12 @@ class GvisorProvider(SessionProvider["GvisorSandbox"]):
             )
         return lower
 
-    async def _restore_upper(self, source: Path, lower: Path, session: Session) -> None:
+    async def _restore_upper(
+        self, source: Path, lower: Path, kind: GvisorImages, session: Session
+    ) -> None:
         upper = session.path / UPPER_ARCHIVE
         await self.copy_tree(source / UPPER_ARCHIVE, upper)
-        _write_record(session, lower, upper)
+        _write_record(session, lower, upper, kind)
 
     async def _sweep_node(self) -> list[str]:
         """Delete the template extractions that dead processes left."""
@@ -517,6 +652,7 @@ class GvisorSandbox(SessionSandbox):
         self._cpus: list[int] | None = None
         self._lower: Path | None = None
         self._upper: Path | None = None
+        self._image_kind: GvisorImages = "sif"  # the kind of its image, as rootfs.json says
         self._binds: list[Bind] = []
         self._template_lock: int | None = None
         self._memory_kill: memory.MemoryKill | None = None
@@ -669,6 +805,7 @@ class GvisorSandbox(SessionSandbox):
         record = json.loads((session.path / ROOTFS_RECORD).read_text())
         self._lower = Path(record["lower"])
         self._upper = Path(record["upper"]) if record.get("upper") else None
+        self._image_kind = record["images"]
         if any(c in str(session.path) for c in ",:"):  # --overlay2 and --root would misread it
             raise SandboxStartError(f"runsc cannot take a session path with ',' or ':': {session}")
         for directory in (STATE_DIR, OVERLAY_DIR, EXEC_DIR):
@@ -813,26 +950,34 @@ class GvisorSandbox(SessionSandbox):
             )
 
     async def _image_environment(self) -> dict[str, str]:
-        """The variables the image's environment scripts set, which every command gets."""
+        """The image's environment, which every command gets: the variables its Singularity
+        environment scripts set, or those enroot gives a container of an image it imported
+        (:func:`enroot_environment`)."""
+        enroot = self._image_kind == "enroot"
         result = await self._spawn(
-            ["/bin/sh", "-c", _IMAGE_ENVIRONMENT],
+            ["/bin/sh", "-c", _ENROOT_ENVIRONMENT if enroot else _IMAGE_ENVIRONMENT],
             stdin=None,
             timeout_s=_QUERY_TIMEOUT_S,
             on_start=lambda _pid: None,
         )
         environment = {}
-        for item in result.stdout.split(b"\0"):
-            key, separator, value = item.decode(errors="surrogateescape").partition("=")
-            if separator and key and key not in _SHELL_STATE:
-                environment[key] = value
-        if result.returncode != 0 or "PATH" not in environment:
+        if enroot:
+            text = result.stdout.decode(errors="surrogateescape")
+            environment = enroot_environment(text, RunscRuntime.environment())
+        else:
+            for item in result.stdout.split(b"\0"):
+                key, separator, value = item.decode(errors="surrogateescape").partition("=")
+                if separator and key and key not in _SHELL_STATE:
+                    environment[key] = value
+        # An image that enroot imported may set no PATH, as enroot then gives its containers none.
+        if result.returncode != 0 or ("PATH" not in environment and not enroot):
             log.warning(
                 "sandbox %s: could not read the image's environment (exit %s): %s",
                 self.id,
                 result.returncode,
                 result.stderr.decode(errors="replace").strip() or "no output",
             )
-            environment.setdefault("PATH", _HOST_PATH)
+        environment.setdefault("PATH", _HOST_PATH)
         return environment
 
     async def _spawn(
@@ -965,8 +1110,8 @@ class GvisorSandbox(SessionSandbox):
             self._template_lock = None
 
     async def _snapshot_rootfs(self, target: Path) -> tuple[str, dict[str, Any]]:
-        """The overlay's upper layer, as ``runsc tar rootfs-upper`` writes it, and the template
-        it lies over."""
+        """The overlay's upper layer, as ``runsc tar rootfs-upper`` writes it, the template it lies
+        over, and the kind of its image."""
         assert self._lower is not None
         archive = target / UPPER_ARCHIVE
         result = await self._gvisor.runtime.run(
@@ -979,7 +1124,7 @@ class GvisorSandbox(SessionSandbox):
         )
         if result.returncode != 0 or result.timed_out or not archive.is_file():
             raise SandboxError(f"could not archive the sandbox's files: {result.detail()}")
-        return SNAPSHOT_FORMAT, {"lower": str(self._lower)}
+        return SNAPSHOT_FORMAT, {"lower": str(self._lower), "images": self._image_kind}
 
     # The memory limit.
 
@@ -1056,6 +1201,7 @@ class GvisorService(PodService, GvisorSandbox):
     def _check_start(cls, pod: SessionPod, spec: ServiceSpec) -> None:
         gvisor = pod._provider.gvisor
         assert gvisor is not None
+        kind = gvisor.service_image_kind(pod._provider)
         if spec.run_as not in cls.run_modes:
             raise ValueError(
                 f"a gVisor service runs as root of gVisor's kernel, which can switch to any user: "
@@ -1063,14 +1209,16 @@ class GvisorService(PodService, GvisorSandbox):
             )
         if spec.sandbox.file_owners is not None:
             raise ValueError(gvisor._file_owners_refusal())
-        gvisor._check(spec.sandbox, service=True)
+        gvisor._check(spec.sandbox, service=True, images=gvisor.image_store(kind))
         gvisor._find_runsc()  # before an image is pulled or extracted
+        gvisor._find_image_runtime(kind)
 
     async def _populate(self) -> Callable[[Session], Coroutine[Any, Any, None]]:
         gvisor = self._gvisor
         await gvisor._prepare()
-        image = await gvisor.images.resolve(self.spec.image)
-        return partial(gvisor._extract, image)
+        kind = gvisor.service_image_kind(self._provider)
+        image = await gvisor.image_store(kind).resolve(self.spec.image)
+        return partial(gvisor._extract, image, kind=kind)
 
     # What the service's container is.
 
@@ -1258,6 +1406,29 @@ class GvisorService(PodService, GvisorSandbox):
     @property
     def _writes_as_other_users(self) -> bool:
         return False  # its users are gVisor's: on the host, everything it writes is yours
+
+
+def enroot_environment(text: str, substitutions: Mapping[str, str]) -> dict[str, str]:
+    """The variables that enroot gives a container whose ``/etc/environment`` holds ``text``, with
+    ``substitutions`` as enroot's own environment on the host.
+
+    As enroot does (``common::envsubst``, ``common::envfmt`` and ``enroot-switchroot``): every
+    ``${NAME}`` becomes NAME's value in ``substitutions``, or nothing; then, line by line, leading
+    blanks are dropped; comments, blank lines, lines that set no variable and ``ENROOT_`` variables
+    are skipped; a value between quotes (``"``, ``'``, or a backslash, as enroot's ``sed`` reads
+    them) loses them; and of a variable set twice, the last value counts.
+    """
+    environment = {}
+    for raw in text.split("\n"):
+        line = _ENROOT_REFERENCE.sub(lambda match: substitutions.get(match[1], ""), raw)
+        line = line.lstrip(" \t\v\f\r")
+        if not _ENROOT_VARIABLE.match(line) or line.startswith("ENROOT_"):
+            continue
+        if quoted := _ENROOT_QUOTED.fullmatch(line):
+            line = f"{quoted[1]}={quoted[2]}"
+        key, _, value = line.partition("=")
+        environment[key] = value
+    return environment
 
 
 def securebits_filter() -> dict[str, Any]:
@@ -1669,9 +1840,18 @@ def _bind(source: Path, target: str, read_only: bool) -> dict[str, Any]:
     }
 
 
-def _write_record(session: Session, lower: Path, upper: Path | None) -> None:
-    record = {"lower": str(lower), "upper": str(upper) if upper else None}
+def _write_record(session: Session, lower: Path, upper: Path | None, images: GvisorImages) -> None:
+    record = {"lower": str(lower), "upper": str(upper) if upper else None, "images": images}
     (session.path / ROOTFS_RECORD).write_text(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _snapshot_images(snapshot: SandboxSnapshot) -> GvisorImages:
+    """The kind of a snapshot's image, which its sandbox recorded: SIF where it recorded none, as
+    the gVisor provider of hpc-sandbox 0.6 ran only SIF images."""
+    kind = snapshot.metadata.get("images", "sif")
+    if kind not in IMAGES:
+        raise ValueError(f"snapshot {snapshot.id} is of images {kind!r}, not one of {IMAGES}")
+    return kind
 
 
 def _read_lines(path: Path) -> list[str]:

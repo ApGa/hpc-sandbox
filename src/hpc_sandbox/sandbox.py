@@ -595,9 +595,12 @@ class SessionProvider(Generic[S]):
         await sandbox._boot(populate)
         return sandbox
 
-    def _check(self, spec: SandboxSpec, *, service: bool = False) -> None:
-        """Validate ``spec``; a pod service's ``network`` is the pod's, not its own."""
-        self.images.format.check(spec.image)
+    def _check(
+        self, spec: SandboxSpec, *, service: bool = False, images: ImageStore | None = None
+    ) -> None:
+        """Validate ``spec``, whose image is one of ``images`` (by default the provider's); a pod
+        service's ``network`` is the pod's, not its own."""
+        (images or self.images).format.check(spec.image)
         if not service and spec.network not in ("host", "none"):
             raise ValueError(f"unknown network mode {spec.network!r}")
         if not service and spec.network == "none" and "network_none" not in self.capabilities:

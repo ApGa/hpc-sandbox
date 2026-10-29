@@ -184,8 +184,9 @@ class SingularityProvider(SessionProvider["SingularitySandbox"]):
     else on PATH, else as fetched by ``hpc-sandbox fetch-tools``; their
     services get ``service_stop_grace_s`` between SIGTERM and SIGKILL when
     their pod stops. ``gvisor``, a :class:`~hpc_sandbox.gvisor.GvisorProvider`,
-    runs the services whose spec says ``runtime="gvisor"`` in gVisor, and adds
-    the ``gvisor_services`` capability.
+    runs the services whose spec says ``runtime="gvisor"`` in gVisor, with SIF
+    images unless its ``images`` says otherwise, and adds the
+    ``gvisor_services`` capability.
     """
 
     name = "singularity"

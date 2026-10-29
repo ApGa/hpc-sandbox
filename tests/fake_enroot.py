@@ -249,8 +249,11 @@ def start(args: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    umask = os.umask(0)
+    os.umask(umask)
     record = {
         "argv": argv,
+        "umask": f"{umask:03o}",
         "env": {
             key: value
             for key, value in os.environ.items()

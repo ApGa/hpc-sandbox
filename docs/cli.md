@@ -39,9 +39,12 @@ the image cache can be reached, and `fetch-tools` wherever there is internet acc
 | `--image-cache IMAGE_CACHE` | `$HPC_SANDBOX_IMAGE_CACHE`, else `${XDG_CACHE_HOME:-~/.cache}/hpc-sandbox/images` | Where pulled images, SIF or squashfs files, are cached; see [The image cache](configuration.md#the-image-cache). |
 
 A command builds one provider from these options and leaves every other provider option at its
-default (`run --allow-network-none` aside). `HPC_SANDBOX_ROOTFS_LAYOUT` still chooses the layout of
-Singularity sandboxes; [Environment variables](configuration.md#environment-variables) lists every
-variable.
+default (`run --allow-network-none` aside). So with `--runtime gvisor`, the provider runs the
+images it picks by default, SIF images where Singularity CE or Apptainer is on `PATH`, else
+enroot's ([Images](gvisor.md#images)): no option chooses them, and on a node that has both, enroot's
+images run in gVisor only from Python, with `GvisorProvider(images="enroot")`.
+`HPC_SANDBOX_ROOTFS_LAYOUT` still chooses the layout of Singularity sandboxes;
+[Environment variables](configuration.md#environment-variables) lists every variable.
 
 ## `doctor`
 
@@ -61,7 +64,9 @@ compute node of a new site, with the image you plan to use.
 |---|---|---|
 | `runtime` | all | The runtime's path and version. `FAIL` when it cannot be run, which ends the report. |
 | `runsc helpers` | gVisor | The `gvisor-bin/` directory beside runsc, or `info` that there is none, which releases that ship `gvisor.tar` need. |
-| `images` | gVisor | The Singularity CE or Apptainer that pulls and extracts the images, and its version. `FAIL` when it cannot be run. |
+| `images` | gVisor | Which images the provider runs, SIF images or enroot's squashfs images, why (its `images` option, or the runtimes found), and the Singularity CE, Apptainer or enroot that pulls and extracts them, with its version. `FAIL` when neither is found, or it cannot be run. |
+| `image extraction` | gVisor, with enroot's images | The `unsquashfs` that `enroot create` extracts images with. `FAIL` if it is not on `PATH`. |
+| `image imports`, `user namespace` | gVisor, with enroot's images | As for enroot, below. |
 | `user namespaces` | gVisor | Whether unprivileged user namespaces can be created, as rootless runsc needs. `FAIL` if not. |
 | `rootless runsc` | gVisor | Whether `runsc --rootless do true` runs, on the default platform (`systrap`), with a state directory on the scratch root. `FAIL` with runsc's output if not. |
 | `nsenter` | enroot | util-linux `nsenter`, which every command uses. `FAIL` when it is missing. |

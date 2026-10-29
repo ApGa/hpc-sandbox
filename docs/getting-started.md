@@ -14,7 +14,7 @@ this table list; the other rows are needed only for what they name:
 | Requirement | Needed for |
 |---|---|
 | Linux and Python 3.11 or later | everything |
-| Singularity CE or Apptainer, installed setuid or in user-namespace mode, or enroot 3.x, or gVisor's `runsc` with Singularity CE or Apptainer for its images | every sandbox: one of these runtimes on the compute nodes ([Singularity CE and Apptainer](singularity.md#requirements), [enroot](enroot.md#requirements), [gVisor](gvisor.md#requirements)) |
+| Singularity CE or Apptainer, installed setuid or in user-namespace mode, or enroot 3.x or 4.x, or gVisor's `runsc` with Singularity CE, Apptainer or enroot for its images | every sandbox: one of these runtimes on the compute nodes ([Singularity CE and Apptainer](singularity.md#requirements), [enroot](enroot.md#requirements), [gVisor](gvisor.md#requirements)) |
 | a directory on the node's local disk | every sandbox: the scratch root, which holds each sandbox's root filesystem ([Put the sandboxes on local disk](#put-the-sandboxes-on-local-disk)) |
 | an image with `/bin/sh` and the basic tools `sleep`, `mkdir`, `rmdir`, `rm`, `cp` and `dirname` | every sandbox ([Image references](python-api.md#image-references)) |
 | GNU coreutils and `find` | every sandbox: deleting it once it stopped, with `find` and `rm --one-file-system`, in the background under `nice -n 19`; and copies with `cp -a --reflink=auto` (snapshots, restores and Singularity's templates) |

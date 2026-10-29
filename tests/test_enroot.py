@@ -401,11 +401,18 @@ async def test_images_are_imported_once_with_safe_settings(
     monkeypatch.setenv("PATH", f"{os.environ['PATH']}{os.pathsep}{converter_dir}")
     monkeypatch.setenv("TAR_OPTIONS", "--no-same-owner")
     spec = SandboxSpec(image="docker://docker.io/library/alpine:3.20")
-    first = await enroot_provider.start(spec)
-    second = await enroot_provider.start(spec)
+    umask = os.umask(0o077)  # a strict one, as some sites set
+    try:
+        first = await enroot_provider.start(spec)
+        second = await enroot_provider.start(spec)
+    finally:
+        os.umask(umask)
     assert first.id != second.id
     (call,) = fake_enroot.calls("import")
     assert call["argv"][-1] == "docker://library/alpine:3.20"
+    # What enroot writes into the image gets the usual modes, whatever the caller's umask.
+    assert call["umask"] == "022"
+    assert {create["umask"] for create in fake_enroot.calls("create")} == {"077"}
     env = call["env"]
     assert env["TAR_OPTIONS"] == "--no-same-owner --delay-directory-restore"
     wrapper_dir = enroot_provider.scratch_root / "enroot-tools"
@@ -579,6 +586,30 @@ async def test_imports_get_only_what_pulling_needs(tmp_path, fake_enroot, monkey
     assert "HPCS_CANARY" not in env and "SLURM_JOB_ID" not in env
     assert env["https_proxy"] == "http://proxy:3128"
     assert env["ENROOT_SQUASH_OPTIONS"] == "-comp zstd"
+
+
+async def test_imports_keep_enroots_directories_on_scratch(tmp_path, fake_enroot, monkeypatch):
+    # enroot makes its runtime and data directories before every command, by default in
+    # $XDG_RUNTIME_DIR, else /run, which a batch job or a CI runner may not let you write.
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    provider = make_enroot_provider(tmp_path)
+    await provider.images.resolve("docker://example/task:1")
+    await provider.runtime.version()
+    runtime = provider.runtime
+    calls = [*fake_enroot.calls("import"), *fake_enroot.calls("version")]
+    assert len(calls) == 2
+    for call in calls:
+        assert call["env"]["ENROOT_RUNTIME_PATH"] == str(runtime.temp_dir)
+        assert call["env"]["ENROOT_DATA_PATH"] == str(runtime.temp_dir)
+        assert call["env"]["ENROOT_CACHE_PATH"] == str(runtime.cache_dir)
+        assert call["env"]["ENROOT_TEMP_PATH"] == str(runtime.temp_dir)
+    # Yours count, as for the cache and temporary directories.
+    monkeypatch.setenv("ENROOT_RUNTIME_PATH", str(tmp_path / "runtime"))
+    monkeypatch.setenv("ENROOT_DATA_PATH", str(tmp_path / "data"))
+    await provider.images.resolve("docker://example/task:2")
+    env = fake_enroot.calls("import")[-1]["env"]
+    assert env["ENROOT_RUNTIME_PATH"] == str(tmp_path / "runtime")
+    assert env["ENROOT_DATA_PATH"] == str(tmp_path / "data")
 
 
 def test_singularity_option_names_are_accepted(tmp_path, fake_enroot):

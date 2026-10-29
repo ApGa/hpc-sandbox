@@ -2,16 +2,17 @@
 node. What every provider does is in ``test_integration.py``, which runs gVisor with
 ``HPC_SANDBOX_TEST_RUNTIME=gvisor``.
 
-Run on a compute node (never a login node), with runsc on ``PATH`` and Singularity CE or
-Apptainer for images::
+Run on a compute node (never a login node), with runsc on ``PATH``, and Singularity CE or
+Apptainer, or enroot, for images::
 
     HPC_SANDBOX_INTEGRATION=1 python -m pytest tests/test_gvisor_integration.py -v
 
-Without ``HPC_SANDBOX_INTEGRATION=1``, or without runsc or Singularity on ``PATH``, every test
-skips. ``HPC_SANDBOX_TEST_IMAGE`` picks the main image (default ``docker://alpine:3.20``) and
-``HPC_SANDBOX_TEST_APT_IMAGE`` the Debian-based one the tests of apt and Unix sockets use
-(default ``docker://python:3.12-slim``). ``HPC_SANDBOX_TEST_GVISOR_PLATFORM`` picks gVisor's
-platform (default ``systrap``).
+Without ``HPC_SANDBOX_INTEGRATION=1``, or without runsc or the runtime of the images on ``PATH``,
+every test skips. ``HPC_SANDBOX_TEST_GVISOR_IMAGES`` picks the images (``sif`` or ``enroot``; by
+default what the provider finds). ``HPC_SANDBOX_TEST_IMAGE`` picks the main image (default
+``docker://alpine:3.20``) and ``HPC_SANDBOX_TEST_APT_IMAGE`` the Debian-based one the tests of
+apt and Unix sockets use (default ``docker://python:3.12-slim``).
+``HPC_SANDBOX_TEST_GVISOR_PLATFORM`` picks gVisor's platform (default ``systrap``).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,6 +39,21 @@ from hpc_sandbox.procfs import owned_live_start_time
 from hpc_sandbox.runtime import RUNTIME_CANDIDATES
 from hpc_sandbox.sessions import remove_tree
 
+IMAGES: Any = os.environ.get("HPC_SANDBOX_TEST_GVISOR_IMAGES") or None
+IMAGES_RUNTIMES = {
+    "sif": "singularity or apptainer",
+    "enroot": "enroot",
+    "any": "singularity, apptainer or enroot",
+}
+
+
+def images_runtime_found(images: str | None) -> bool:
+    """Whether the runtime of ``images`` (``sif``, ``enroot``, or None for either) is on PATH."""
+    singularity = any(shutil.which(binary) for binary in RUNTIME_CANDIDATES)
+    enroot = shutil.which("enroot") is not None
+    return {"sif": singularity, "enroot": enroot}.get(images or "", singularity or enroot)
+
+
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
@@ -45,8 +62,8 @@ pytestmark = [
     ),
     pytest.mark.skipif(shutil.which("runsc") is None, reason="needs runsc on PATH"),
     pytest.mark.skipif(
-        not any(shutil.which(binary) for binary in RUNTIME_CANDIDATES),
-        reason="needs singularity or apptainer on PATH, for SIF images",
+        not images_runtime_found(IMAGES),
+        reason=f"needs on PATH {IMAGES_RUNTIMES[IMAGES or 'any']}, for the images",
     ),
 ]
 IMAGE = os.environ.get("HPC_SANDBOX_TEST_IMAGE", "docker://alpine:3.20")
@@ -54,8 +71,9 @@ APT_IMAGE = os.environ.get("HPC_SANDBOX_TEST_APT_IMAGE", "docker://python:3.12-s
 PLATFORM = os.environ.get("HPC_SANDBOX_TEST_GVISOR_PLATFORM", "systrap")
 
 
-def make_provider(scratch: Path, **options: object) -> GvisorProvider:
-    return GvisorProvider(scratch_root=scratch, platform=PLATFORM, **options)  # type: ignore[arg-type]
+def make_provider(scratch: Path, **options: Any) -> GvisorProvider:
+    options.setdefault("images", IMAGES)
+    return GvisorProvider(scratch_root=scratch, platform=PLATFORM, **options)
 
 
 @pytest.fixture

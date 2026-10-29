@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import shutil
@@ -39,6 +40,7 @@ from hpc_sandbox.gvisor import (
     UPPER_ANNOTATION,
     SentryMemory,
     command_groups,
+    enroot_environment,
     plan_binds,
     resolve_in_root,
     runsc_processes,
@@ -880,3 +882,242 @@ async def test_hpc_sandbox_run_and_doctor_on_gvisor(tmp_path, image, fake_runsc,
         cli_main, ["janitor", "--scratch-root", str(tmp_path / "with:colon")]
     )
     assert code == 0, capsys.readouterr()
+
+
+# Images that enroot imports.
+
+HOST_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"  # runsc's PATH
+
+
+@pytest.fixture
+def enroot_only(fake_runsc, fake_enroot, monkeypatch):
+    """A node with runsc and enroot, and neither Singularity CE nor Apptainer."""
+    hide_from_path(monkeypatch, "singularity", "apptainer")
+    return fake_enroot
+
+
+@pytest.fixture
+def sqsh_image(tmp_path, fake_enroot):
+    """A squashfs image whose /etc/environment holds what enroot reads its own way."""
+    environment = (
+        f"PATH={HOST_PATH}:/opt/bin\n"
+        'QUOTED="image value"\n'
+        "# a comment\n"
+        "  INDENTED=yes\n"
+        "ENROOT_SECRET=dropped\n"
+        "NOT-A-NAME=dropped\n"
+        "EXTENDED=${PATH}:/opt/more\n"
+        "FROM_HOST=${HOME}\n"
+        "TWICE=first\n"
+        "TWICE=last\n"
+    )
+    files = {
+        "app/hello.txt": "hello\n",
+        "etc/environment": environment,
+        ".hpc-sandbox/planted": "the image's own\n",
+    }
+    return fake_enroot.make_sqsh(tmp_path / "images" / "task.sqsh", files)
+
+
+def test_enroot_environment_reads_the_file_as_enroot_does():
+    text = (
+        'A="x"\nB=\'y\'\nC=\\z\\\n  D=" spaced " \nE="a"b"\nF="\n#G=1\n\nENROOT_H=1\nI-J=1\nK\n'
+        "L=${PATH}:${UNSET}/x ${HOME}\nM=1\nM=2"
+    )
+    assert enroot_environment(text, {"PATH": "/bin", "HOME": "/root"}) == {
+        "A": "x",
+        "B": "y",
+        "C": "z",  # enroot's sed takes a backslash for a quote
+        "D": " spaced ",
+        "E": 'a"b',
+        "F": '"',
+        "L": "/bin:/x /root",
+        "M": "2",
+    }
+    assert enroot_environment("", {}) == {}
+
+
+async def test_images_follow_the_runtimes_found(tmp_path, fake_runsc, fake_enroot, monkeypatch):
+    assert make_gvisor_provider(tmp_path).image_kind == "sif"  # with both, Singularity's
+    assert make_gvisor_provider(tmp_path, images="enroot").image_kind == "enroot"
+    with pytest.raises(ValueError, match="images must be None or one of"):
+        make_gvisor_provider(tmp_path, images="docker")
+    hide_from_path(monkeypatch, "singularity", "apptainer")
+    assert make_gvisor_provider(tmp_path).image_kind == "enroot"
+    spec = SandboxSpec(image="docker://example/task:1")
+    asked = make_gvisor_provider(tmp_path, images="sif")
+    message = (
+        r"sif images need Singularity CE or Apptainer: .*singularity_binary, or images='enroot'"
+    )
+    with pytest.raises(SandboxStartError, match=message):
+        await asked.start(spec)
+    hide_from_path(monkeypatch, "enroot")
+    with pytest.raises(
+        SandboxStartError, match="Singularity CE or Apptainer .* or enroot .*neither"
+    ):
+        await make_gvisor_provider(tmp_path).start(spec)
+    asked = make_gvisor_provider(tmp_path, images="enroot")
+    with pytest.raises(SandboxStartError, match=r"enroot images need enroot: .*enroot_binary"):
+        await asked.start(spec)
+    # Refused before anything was pulled or made, and a janitor needs neither.
+    assert not fake_enroot.calls() and not fake_runsc.calls()
+    provider = make_gvisor_provider(tmp_path)
+    assert not provider.template_root.exists() and not provider.image_cache.exists()
+    assert not (await provider.reap()).errors
+
+
+async def test_each_kind_of_images_refuses_the_other(tmp_path, fake_runsc, fake_enroot, image):
+    sqsh = fake_enroot.make_sqsh(tmp_path / "images" / "task.sqsh")
+    provider = make_gvisor_provider(tmp_path, images="enroot")
+    message = "is a SIF image; the gvisor provider runs squashfs images: give it images='sif' for"
+    for reference in (str(image), "docker://example/task.sif"):
+        with pytest.raises(ValueError, match=message):
+            await provider.start(SandboxSpec(image=reference))
+    # The kind that the provider picked itself, here SIF images, which images= did not say.
+    message = "is a squashfs image; the gvisor provider runs SIF images: give it images='enroot'"
+    with pytest.raises(ValueError, match=message) as refused:
+        await make_gvisor_provider(tmp_path).start(SandboxSpec(image=str(sqsh)))
+    assert "(images=" not in str(refused.value)
+    assert not fake_runsc.calls() and not fake_enroot.calls()
+
+
+async def test_enroot_images_become_templates_without_singularity(
+    tmp_path, enroot_only, fake_runtime, sqsh_image
+):
+    provider = make_gvisor_provider(tmp_path)
+    reference = "docker://example/task:1"
+    first = await provider.start(SandboxSpec(image=reference))
+    second = await provider.start(SandboxSpec(image=reference))
+    local = await provider.start(SandboxSpec(image=str(sqsh_image)))
+    # Imported once, and extracted once per image into a template that its sandboxes share.
+    (imported,) = enroot_only.calls("import")
+    assert imported["argv"][-1] == reference
+    (cached,) = provider.image_cache.glob("sha256-*.sqsh")
+    lower = lower_of(first)
+    assert lower_of(second) == lower and lower_of(local) != lower
+    assert lower.parent.parent == provider.template_root
+    created = {call["argv"][-1]: call for call in enroot_only.calls("create")}
+    assert sorted(created) == sorted([str(cached), str(sqsh_image)])
+    call = created[str(cached)]
+    assert call["argv"][1:3] == ["--name", "rootfs"]
+    assert call["umask"] == "000"  # the files keep the image's modes, which other users need
+    assert imported["umask"] == "022"
+    extraction = Path(call["env"]["ENROOT_DATA_PATH"])  # renamed to the template once complete
+    assert extraction.parent == provider.template_root
+    assert extraction.name.startswith(f".{lower.parent.name}.")
+    assert not extraction.exists() and (lower.parent / ".complete").is_file()
+    # A template as the provider makes every one: its own directory, a /tmp that is not empty,
+    # and everything the owner's to read.
+    assert sorted(path.name for path in (lower / ".hpc-sandbox").iterdir()) == [
+        "mounts",
+        "transfer",
+    ]
+    assert [path.name for path in (lower / "tmp").iterdir()] == [".hpc-sandbox"]
+    assert (lower / "private-cache" / "state").read_text() == "cached\n"
+    assert (await first.exec("cat /etc/os-release")).stdout == "fake\n"
+    assert (await local.exec("cat hello.txt")).stdout == "hello\n"
+    before = tree(lower)
+    assert (await first.exec("echo mine > /etc/os-release")).exit_code == 0
+    assert (await second.exec("cat /etc/os-release")).stdout == "fake\n"
+    assert tree(lower) == before
+    assert fake_runtime.calls() == []  # Singularity never ran
+
+
+async def test_enroot_images_get_the_environment_enroot_gives(
+    tmp_path, enroot_only, sqsh_image, caplog
+):
+    provider = make_gvisor_provider(tmp_path)
+    spec = SandboxSpec(image=str(sqsh_image), env={"GREETING": "hi"})
+    sandbox = await provider.start(spec)
+    show = (
+        'echo "$PATH|$QUOTED|$INDENTED|${ENROOT_SECRET-unset}|$EXTENDED|$FROM_HOST|$TWICE|'
+        '$GREETING"; pwd; cat hello.txt'
+    )
+    result = await sandbox.exec(show)
+    assert result.exit_code == 0, result.stderr
+    # ${NAME} is filled from runsc's environment: its PATH, and nothing of yours. The working
+    # directory is the spec's, as on the enroot provider, which skips the image's /etc/rc.
+    values = f"{HOST_PATH}:/opt/bin|image value|yes|unset|{HOST_PATH}:/opt/more||last|hi"
+    assert result.stdout.splitlines() == [values, "/app", "hello"]
+    snapshot = await sandbox.snapshot()
+    restored = await provider.restore(snapshot, spec)
+    assert (await restored.exec(show)).stdout == result.stdout
+    # An image that sets no PATH gets runsc's, as quietly as enroot gives its containers none.
+    bare = enroot_only.make_sqsh(tmp_path / "images" / "bare.sqsh", {"etc/environment": "A=1\n"})
+    sandbox = await provider.start(SandboxSpec(image=str(bare)))
+    assert (await sandbox.exec('echo "$PATH $A"')).stdout == f"{HOST_PATH} 1\n"
+    assert "could not read the image's environment" not in caplog.text
+
+
+async def test_a_restore_runs_the_snapshots_kind_of_images_without_its_runtime(
+    tmp_path, fake_runsc, fake_runtime, fake_enroot, sqsh_image, image, monkeypatch, caplog
+):
+    show = 'echo "$QUOTED|${FROM_IMAGE-}|$PATH"'
+    enroot_spec, sif_spec = SandboxSpec(image=str(sqsh_image)), SandboxSpec(image=str(image))
+    enroot_sandbox = await make_gvisor_provider(tmp_path, images="enroot").start(enroot_spec)
+    sif_sandbox = await make_gvisor_provider(tmp_path, images="sif").start(sif_spec)
+    shown = {
+        "enroot": (await enroot_sandbox.exec(show)).stdout,
+        "sif": (await sif_sandbox.exec(show)).stdout,
+    }
+    assert shown["enroot"].startswith(f"image value||{HOST_PATH}:/opt/bin")
+    assert shown["sif"].startswith("|image-value|")
+    snapshots = {
+        "enroot": (await enroot_sandbox.snapshot(), enroot_spec),
+        "sif": (await sif_sandbox.snapshot(), sif_spec),
+    }
+    # Each snapshot says its kind of images, and a restore runs that kind, whatever the restoring
+    # provider runs: the image's environment stays as it was.
+    for kind, (snapshot, spec) in snapshots.items():
+        assert snapshot.metadata["images"] == kind
+        for images in ("sif", "enroot"):
+            restored = await make_gvisor_provider(tmp_path, images=images).restore(snapshot, spec)
+            assert (await restored.exec(show)).stdout == shown[kind], (kind, images)
+    # Nothing is pulled or extracted, so a restore needs neither runtime.
+    hide_from_path(monkeypatch, "singularity", "apptainer", "enroot")
+    calls = len(fake_runtime.calls()), len(fake_enroot.calls())
+    provider = make_gvisor_provider(tmp_path)
+    for kind, (snapshot, spec) in snapshots.items():
+        restored = await provider.restore(snapshot, spec)
+        assert (await restored.exec(show)).stdout == shown[kind], kind
+    assert (len(fake_runtime.calls()), len(fake_enroot.calls())) == calls
+    # A snapshot that names no kind, as those of hpc-sandbox 0.6, is of a SIF image.
+    snapshot, spec = snapshots["sif"]
+    metadata = {key: value for key, value in snapshot.metadata.items() if key != "images"}
+    restored = await provider.restore(dataclasses.replace(snapshot, metadata=metadata), spec)
+    assert (await restored.exec(show)).stdout == shown["sif"]
+    unknown = dataclasses.replace(snapshot, metadata={**metadata, "images": "docker"})
+    with pytest.raises(ValueError, match="is of images 'docker'"):
+        await provider.restore(unknown, spec)
+    assert "could not read the image's environment" not in caplog.text
+
+
+async def test_doctor_names_the_images_and_checks_their_tools(
+    tmp_path, enroot_only, sqsh_image, capsys, monkeypatch
+):
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "unsquashfs").write_text("#!/bin/sh\nexit 0\n")
+    (tools / "unsquashfs").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
+    scratch = str(tmp_path / "scratch")
+    common = ["--runtime", "gvisor", "--scratch-root", scratch, "--image-cache", str(tmp_path)]
+    code = await asyncio.to_thread(cli_main, ["doctor", *common, "--image", str(sqsh_image)])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    expected = (
+        "[  ok] images: squashfs images, imported and extracted by enroot (enroot is here, and "
+        "neither Singularity CE nor Apptainer): "
+    )
+    assert expected in out and "3.5.0-fake" in out, out
+    assert f"[  ok] image extraction: enroot create, with {tools / 'unsquashfs'}" in out
+    assert "image imports:" in out and "sandbox stop: session deleted" in out
+    hide_from_path(monkeypatch, "unsquashfs")
+    code = await asyncio.to_thread(cli_main, ["doctor", *common])
+    out = capsys.readouterr().out
+    assert code == 1 and "[FAIL] image extraction: enroot create needs unsquashfs" in out, out
+    hide_from_path(monkeypatch, "enroot")
+    code = await asyncio.to_thread(cli_main, ["doctor", *common])
+    out = capsys.readouterr().out
+    assert code == 1 and "[FAIL] images: the gvisor provider needs Singularity CE" in out, out
+    assert "image staging:" in out  # the lines after it still come
